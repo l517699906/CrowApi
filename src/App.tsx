@@ -11,7 +11,7 @@ function App() {
 
     return (
         <main className="container">
-            <h1>WaLiAPI</h1>
+            <h1>CrowAPI</h1>
             <p>本地 LLM API 网关 — 工程初始化完成</p>
             <form
                 className="row"
