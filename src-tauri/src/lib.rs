@@ -1,4 +1,5 @@
 mod adaptor;
+mod core;
 mod commands;
 mod db;
 mod utils;
