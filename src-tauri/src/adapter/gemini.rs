@@ -29,6 +29,7 @@ impl Adaptor for GeminiAdaptor {
 
     async fn forward(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<(u16, serde_json::Value, Option<TokenUsage>), anyhow::Error> {
         let model = request.body.get("model").and_then(|m| m.as_str()).unwrap_or("gemini-2.0-flash");
+        // 非流式：:generateContent
         let url = format!("{}/v1beta/models/{}:generateContent?key={}", config.base_url.trim_end_matches('/'), model, config.api_key);
 
         let openai_body = &request.body;
@@ -51,6 +52,7 @@ impl Adaptor for GeminiAdaptor {
 
     async fn forward_stream(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<reqwest::Response, anyhow::Error> {
         let model = request.body.get("model").and_then(|m| m.as_str()).unwrap_or("gemini-2.0-flash");
+        // 流式：:streamGenerateContent + alt=sse
         let url = format!("{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse", config.base_url.trim_end_matches('/'), model, config.api_key);
 
         let openai_body = &request.body;
@@ -78,6 +80,7 @@ fn convert_openai_to_gemini(body: &serde_json::Value) -> serde_json::Value {
             }));
         } else {
             contents.push(serde_json::json!({
+                // assistant → model
                 "role": if role == "assistant" { "model" } else { "user" },
                 "parts": [{"text": content}]
             }));
@@ -92,6 +95,7 @@ fn convert_openai_to_gemini(body: &serde_json::Value) -> serde_json::Value {
         gemini_body["systemInstruction"] = si;
     }
 
+    // 生成参数收口到 generationConfig
     if let Some(temp) = body.get("temperature") {
         gemini_body["generationConfig"]["temperature"] = temp.clone();
     }
@@ -103,6 +107,7 @@ fn convert_openai_to_gemini(body: &serde_json::Value) -> serde_json::Value {
 }
 
 fn convert_gemini_to_openai(gemini_json: &serde_json::Value, model: &str) -> serde_json::Value {
+    // candidates[0].content.parts[].text 拼接
     let content = gemini_json.get("candidates")
         .and_then(|c| c.as_array())
         .and_then(|arr| arr.first())
@@ -117,6 +122,7 @@ fn convert_gemini_to_openai(gemini_json: &serde_json::Value, model: &str) -> ser
         })
         .unwrap_or_default();
 
+    // usageMetadata.promptTokenCount / candidatesTokenCount
     let prompt_tokens = gemini_json.get("usageMetadata").and_then(|u| u.get("promptTokenCount")).and_then(|t| t.as_u64()).unwrap_or(0);
     let completion_tokens = gemini_json.get("usageMetadata").and_then(|u| u.get("candidatesTokenCount")).and_then(|t| t.as_u64()).unwrap_or(0);
 

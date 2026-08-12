@@ -28,6 +28,7 @@ impl Adaptor for DeepSeekAdaptor {
 
     async fn forward(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<(u16, serde_json::Value, Option<TokenUsage>), anyhow::Error> {
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+        // 复用 OpenAI 的模型映射函数
         let body = super::openai::apply_model_mapping(&request.body, &config.model_mapping);
         let client = reqwest::Client::new();
         let resp = client.post(&url).header("Authorization", format!("Bearer {}", config.api_key)).header("Content-Type", "application/json").json(&body).send().await?;

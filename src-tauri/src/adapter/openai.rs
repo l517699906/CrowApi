@@ -11,6 +11,7 @@ impl Adaptor for OpenAIAdaptor {
 
     async fn test(&self, config: &ChannelConfig) -> Result<TestResult, anyhow::Error> {
         let start = std::time::Instant::now();
+        // 用 GET /models 接口测连通性，成本最低
         let url = format!("{}/models", config.base_url.trim_end_matches('/'));
 
         let client = reqwest::Client::new();
@@ -45,6 +46,7 @@ impl Adaptor for OpenAIAdaptor {
         config: &ChannelConfig,
     ) -> Result<(u16, serde_json::Value, Option<TokenUsage>), anyhow::Error> {
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+        // 应用模型映射：用户请求的模型名 → 上游真实模型名
         let body = apply_model_mapping(&request.body, &config.model_mapping);
 
         let client = reqwest::Client::new();
@@ -59,6 +61,7 @@ impl Adaptor for OpenAIAdaptor {
         let status = resp.status().as_u16();
         let json: serde_json::Value = resp.json().await?;
 
+        // 从响应中提取 Token 用量
         let usage = json.get("usage").and_then(|u| {
             Some(TokenUsage {
                 prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
@@ -87,7 +90,7 @@ impl Adaptor for OpenAIAdaptor {
             .send()
             .await?;
 
-        Ok(resp)
+            Ok(resp)    // 直接返回响应，字节流由上层透传
     }
 }
 

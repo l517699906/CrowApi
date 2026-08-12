@@ -34,6 +34,7 @@ impl Repository {
     pub async fn create_channel(&self, input: &CreateChannelInput) -> Result<Channel, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
+        // Vec<String> → JSON 字符串
         let models = serde_json::to_string(&input.models).unwrap_or_else(|_| "[]".to_string());
         let config = input.config.as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
