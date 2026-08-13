@@ -1,3 +1,6 @@
+mod adaptor;
+
+use tauri::Manager;
 mod commands;
 mod core;
 mod db;
@@ -22,9 +25,9 @@ fn greet(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -37,18 +40,18 @@ pub fn run() {
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
                 let db = db::Database::new(&app_handle).await;
-                                let state = Arc::new(AppState {
-                                    db: Arc::new(db),
-                                    server_port: Arc::new(RwLock::new(0)),
-                                    server_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                    server_handle: Arc::new(RwLock::new(None)),
-                                });
-                                app_handle.manage(state.clone());
+                let state = Arc::new(AppState {
+                    db: Arc::new(db),
+                    server_port: Arc::new(RwLock::new(0)),
+                    server_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    server_handle: Arc::new(RwLock::new(None)),
+                });
+                app_handle.manage(state.clone());
 
-                                let handle = app_handle.clone();
-                                tauri::async_runtime::spawn(async move {
-                                    let _ = server::start_server(handle, state).await;
-                                });
+                let handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = server::start_server(handle, state).await;
+                });
             });
             Ok(())
         })

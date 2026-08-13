@@ -343,8 +343,8 @@ a:focus-visible {
   animation-delay: 180ms;
 }
 
-.sidebar-close,
-.mobile-menu-button,
+.icon-button.sidebar-close,
+.icon-button.mobile-menu-button,
 .sidebar-scrim {
   display: none;
 }
@@ -438,7 +438,7 @@ a:focus-visible {
 }
 
 .page-enter {
-  animation: page-enter 220ms ease-out both;
+  animation: page-enter 220ms ease-out;
 }
 
 .icon-button {
@@ -1308,6 +1308,11 @@ a:focus-visible {
   font-size: 12px;
 }
 
+.filter-select-wrap {
+  display: flex;
+  align-items: center;
+}
+
 .filter-select:focus {
   color: var(--ink);
   border-color: var(--accent);
@@ -2079,8 +2084,8 @@ a:focus-visible {
     pointer-events: auto;
   }
 
-  .sidebar-close,
-  .mobile-menu-button {
+  .icon-button.sidebar-close,
+  .icon-button.mobile-menu-button {
     display: inline-grid;
   }
 

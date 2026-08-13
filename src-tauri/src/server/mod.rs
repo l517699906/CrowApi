@@ -12,7 +12,7 @@ pub async fn start_server(app: AppHandle, state: std::sync::Arc<AppState>) -> Re
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_addr = listener.local_addr()?;
-    let actual_port = listener.local_addr().port();
+    let actual_port = local_addr.port();
 
     // 更新共享状态（前端通过命令查询）
     *state.server_port.write().await = actual_port;
@@ -36,6 +36,7 @@ pub async fn start_server(app: AppHandle, state: std::sync::Arc<AppState>) -> Re
     axum::serve(listener, router).await?;
 
     state.server_running.store(false, std::sync::atomic::Ordering::SeqCst);
+
     Ok(())
 }
 

@@ -1,0 +1,168 @@
+import type { ApiKey, Channel, RequestLog, Settings } from "../types";
+
+const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+const daysFromNow = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString();
+
+export const initialChannels: Channel[] = [
+    {
+        id: "channel-openai-primary",
+        name: "OpenAI 主线路",
+        type: "OpenAI",
+        base_url: "https://api.openai.com/v1",
+        api_key: "sk-proj-demo-openai-key",
+        models: ["gpt-5.2", "gpt-5-mini", "o4-mini"],
+        status: 1,
+        priority: 10,
+        weight: 100,
+        config: {},
+        model_mapping: {},
+        created_at: minutesAgo(18_400),
+        updated_at: minutesAgo(42),
+        last_test_at: minutesAgo(8),
+        last_test_ok: 1,
+    },
+    {
+        id: "channel-deepseek",
+        name: "DeepSeek 默认",
+        type: "DeepSeek",
+        base_url: "https://api.deepseek.com/v1",
+        api_key: "sk-demo-deepseek-key",
+        models: ["deepseek-chat", "deepseek-reasoner"],
+        status: 1,
+        priority: 20,
+        weight: 80,
+        config: {},
+        model_mapping: {},
+        created_at: minutesAgo(12_800),
+        updated_at: minutesAgo(98),
+        last_test_at: minutesAgo(16),
+        last_test_ok: 1,
+    },
+    {
+        id: "channel-claude",
+        name: "Claude 生产线路",
+        type: "Claude",
+        base_url: "https://api.anthropic.com/v1",
+        api_key: "sk-ant-demo-claude-key",
+        models: ["claude-sonnet-4-5", "claude-haiku-4-5"],
+        status: 1,
+        priority: 30,
+        weight: 60,
+        config: {},
+        model_mapping: {},
+        created_at: minutesAgo(9_600),
+        updated_at: minutesAgo(67),
+        last_test_at: minutesAgo(21),
+        last_test_ok: 1,
+    },
+    {
+        id: "channel-gemini",
+        name: "Gemini 备用",
+        type: "Gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key: "AIza-demo-gemini-key",
+        models: ["gemini-2.5-pro", "gemini-2.5-flash"],
+        status: 0,
+        priority: 40,
+        weight: 40,
+        config: {},
+        model_mapping: {},
+        created_at: minutesAgo(7_200),
+        updated_at: minutesAgo(122),
+        last_test_at: minutesAgo(71),
+        last_test_ok: 0,
+    },
+];
+
+export const initialApiKeys: ApiKey[] = [
+    {
+        id: "key-development",
+        name: "本地开发",
+        key: "sk-waliapi-dev8c92c4df60a0479b",
+        status: 1,
+        allowed_models: ["全部模型"],
+        allowed_channels: ["全部渠道"],
+        quota_limit: 5_000_000,
+        quota_used: 1_824_600,
+        expires_at: daysFromNow(89),
+        created_at: minutesAgo(34_000),
+        updated_at: minutesAgo(320),
+    },
+    {
+        id: "key-cursor",
+        name: "Cursor",
+        key: "sk-waliapi-cur1ab90d71b41c23e",
+        status: 1,
+        allowed_models: ["gpt-5.2", "claude-sonnet-4-5"],
+        allowed_channels: ["全部渠道"],
+        quota_limit: 2_000_000,
+        quota_used: 1_336_400,
+        expires_at: null,
+        created_at: minutesAgo(20_000),
+        updated_at: minutesAgo(811),
+    },
+    {
+        id: "key-ci",
+        name: "CI 自动化",
+        key: "sk-waliapi-ci7a1f6c09096df2aa",
+        status: 0,
+        allowed_models: ["gpt-5-mini"],
+        allowed_channels: ["OpenAI 主线路"],
+        quota_limit: 500_000,
+        quota_used: 486_220,
+        expires_at: daysFromNow(12),
+        created_at: minutesAgo(8_000),
+        updated_at: minutesAgo(1_440),
+    },
+];
+
+const logSeed: Array<Omit<RequestLog, "created_at"> & { minutes_ago: number }> = [
+    { id: "log-12048", seq: 12048, api_key_name: "本地开发", channel_name: "OpenAI 主线路", model: "gpt-5.2", upstream_model: "gpt-5.2", mode: "chat", status_code: 200, prompt_tokens: 2840, completion_tokens: 962, total_tokens: 3802, duration_ms: 1248, error_message: null, is_stream: true, is_retry: false, request_body: "{\n  \"model\": \"gpt-5.2\",\n  \"stream\": true,\n  \"messages\": [\"...\"]\n}", risk_level: "low", risk_score: 3, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 1 },
+    { id: "log-12047", seq: 12047, api_key_name: "Cursor", channel_name: "Claude 生产线路", model: "claude-sonnet-4-5", upstream_model: "claude-sonnet-4-5", mode: "chat", status_code: 200, prompt_tokens: 5120, completion_tokens: 1484, total_tokens: 6604, duration_ms: 1865, error_message: null, is_stream: true, is_retry: false, request_body: null, risk_level: "low", risk_score: 4, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 4 },
+    { id: "log-12046", seq: 12046, api_key_name: "本地开发", channel_name: "DeepSeek 默认", model: "deepseek-reasoner", upstream_model: "deepseek-reasoner", mode: "chat", status_code: 200, prompt_tokens: 1650, completion_tokens: 3240, total_tokens: 4890, duration_ms: 3422, error_message: null, is_stream: false, is_retry: false, request_body: null, risk_level: "low", risk_score: 8, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 9 },
+    { id: "log-12045", seq: 12045, api_key_name: "Cursor", channel_name: "OpenAI 主线路", model: "gpt-5-mini", upstream_model: "gpt-5-mini", mode: "chat", status_code: 429, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, duration_ms: 312, error_message: "上游请求速率超限，已在 1.2 秒后重试", is_stream: true, is_retry: true, request_body: null, risk_level: "low", risk_score: 1, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 13 },
+    { id: "log-12044", seq: 12044, api_key_name: "本地开发", channel_name: "OpenAI 主线路", model: "o4-mini", upstream_model: "o4-mini", mode: "responses", status_code: 200, prompt_tokens: 4890, completion_tokens: 2210, total_tokens: 7100, duration_ms: 2487, error_message: null, is_stream: true, is_retry: true, request_body: null, risk_level: "medium", risk_score: 36, risk_summary: "请求包含网络访问工具", security_action: "audit", sanitized: true, blocked_reason: null, minutes_ago: 18 },
+    { id: "log-12043", seq: 12043, api_key_name: "本地开发", channel_name: "DeepSeek 默认", model: "deepseek-chat", upstream_model: "deepseek-chat", mode: "chat", status_code: 200, prompt_tokens: 922, completion_tokens: 784, total_tokens: 1706, duration_ms: 804, error_message: null, is_stream: true, is_retry: false, request_body: null, risk_level: "low", risk_score: 2, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 24 },
+    { id: "log-12042", seq: 12042, api_key_name: "Cursor", channel_name: "Claude 生产线路", model: "claude-haiku-4-5", upstream_model: "claude-haiku-4-5", mode: "chat", status_code: 500, prompt_tokens: 1504, completion_tokens: 0, total_tokens: 1504, duration_ms: 5042, error_message: "上游连接在响应前关闭", is_stream: false, is_retry: true, request_body: null, risk_level: "low", risk_score: 0, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 31 },
+    { id: "log-12041", seq: 12041, api_key_name: "本地开发", channel_name: "OpenAI 主线路", model: "gpt-5.2", upstream_model: "gpt-5.2", mode: "chat", status_code: 200, prompt_tokens: 3280, completion_tokens: 2048, total_tokens: 5328, duration_ms: 1521, error_message: null, is_stream: true, is_retry: false, request_body: null, risk_level: "low", risk_score: 5, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 46 },
+    { id: "log-12040", seq: 12040, api_key_name: "本地开发", channel_name: "DeepSeek 默认", model: "deepseek-chat", upstream_model: "deepseek-chat", mode: "chat", status_code: 200, prompt_tokens: 1210, completion_tokens: 620, total_tokens: 1830, duration_ms: 698, error_message: null, is_stream: true, is_retry: false, request_body: null, risk_level: "low", risk_score: 2, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 58 },
+    { id: "log-12039", seq: 12039, api_key_name: "Cursor", channel_name: "Claude 生产线路", model: "claude-sonnet-4-5", upstream_model: "claude-sonnet-4-5", mode: "chat", status_code: 200, prompt_tokens: 6240, completion_tokens: 1880, total_tokens: 8120, duration_ms: 2104, error_message: null, is_stream: true, is_retry: false, request_body: null, risk_level: "low", risk_score: 7, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 76 },
+];
+
+export const initialLogs: RequestLog[] = logSeed.map(({ minutes_ago, ...log }) => ({
+    ...log,
+    created_at: minutesAgo(minutes_ago),
+}));
+
+export const initialSettings: Settings = {
+    server_port: 8317,
+    server_host: "127.0.0.1",
+    ui_theme: "light",
+    ui_language: "zh-CN",
+    minimize_to_tray: true,
+    close_to_tray: true,
+    auto_start: false,
+    retry_enabled: true,
+    retry_times: 2,
+    security_enabled: true,
+    security_mode: "audit",
+    security_scan_unicode: true,
+    security_scan_tools: true,
+    security_scan_network: true,
+    security_scan_response: false,
+    security_redact_secrets: true,
+    security_block_on_critical: true,
+};
+
+export const requestSeries = {
+    "24h": [18, 14, 12, 9, 7, 8, 13, 25, 43, 58, 72, 66, 78, 84, 91, 86, 75, 82, 69, 61, 55, 49, 38, 31],
+    "7d": [286, 342, 318, 421, 468, 512, 494],
+    "30d": [178, 205, 224, 194, 268, 302, 287, 312, 340, 298, 376, 412, 390, 438, 464, 420, 486, 510, 472, 528, 556, 498, 532, 590, 614, 576, 638, 668, 624, 704],
+};
+
+export const modelUsage = [
+    { name: "gpt-5.2", requests: 1084, tokens: 1_284_600, color: "var(--accent)" },
+    { name: "claude-sonnet-4-5", requests: 726, tokens: 892_400, color: "var(--data-blue)" },
+    { name: "deepseek-chat", requests: 584, tokens: 482_100, color: "var(--warning)" },
+    { name: "gpt-5-mini", requests: 447, tokens: 286_900, color: "var(--coral)" },
+];

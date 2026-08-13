@@ -68,7 +68,7 @@ impl Adaptor for ClaudeAdaptor {
 
         let client = reqwest::Client::new();
         let resp = client.post(&url)
-            .header("x-api-key", &config.api_key).           // Claude 特有的认证头
+            .header("x-api-key", &config.api_key)           // Claude 特有的认证头
             .header("anthropic-version", "2023-06-01")       // 必填的版本头
             .header("Content-Type", "application/json")
             .json(&claude_body)
