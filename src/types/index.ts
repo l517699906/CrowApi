@@ -62,6 +62,11 @@ export interface CreateApiKeyInput {
     expires_at: string | null;
 }
 
+export interface UpdateApiKeyInput {
+    id: string;
+    status: number;
+}
+
 export interface RequestLog {
     id: string;
     seq: number | null;

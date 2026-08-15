@@ -1,6 +1,8 @@
 use super::models::*;
 use sqlx::SqlitePool;
 
+const REQUEST_LOG_COLUMNS: &str = "request_logs.rowid AS seq, request_logs.*";
+
 pub struct Repository {
     pool: SqlitePool,
 }
@@ -159,6 +161,7 @@ impl Repository {
     pub async fn create_api_key(&self, input: &CreateApiKeyInput) -> Result<ApiKey, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
+        // 密钥生成：sk-crowapi- + UUID simple（无横线）
         let key = format!("sk-crowapi-{}", uuid::Uuid::new_v4().simple());
         let allowed_models = serde_json::to_string(&input.allowed_models.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
         let allowed_channels = serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
@@ -172,7 +175,7 @@ impl Repository {
         .bind(&key)
         .bind(&allowed_models)
         .bind(&allowed_channels)
-        .bind(input.quota_limit.unwrap_or(-1))
+        .bind(input.quota_limit.unwrap_or(-1))    // -1 表示无限制
         .bind(&input.expires_at)
         .bind(&now)
         .bind(&now)
@@ -246,11 +249,6 @@ impl Repository {
         .bind(&log.blocked_reason)
         .execute(&self.pool)
         .await?;
-        // Backfill seq with rowid for new rows
-        sqlx::query("UPDATE request_logs SET seq = rowid WHERE id = ? AND seq IS NULL")
-            .bind(&log.id)
-            .execute(&self.pool)
-            .await?;
         Ok(())
     }
 
@@ -287,7 +285,8 @@ impl Repository {
     }
 
     pub async fn get_log(&self, id: &str) -> Result<RequestLog, sqlx::Error> {
-        sqlx::query_as::<_, RequestLog>("SELECT * FROM request_logs WHERE id = ?")
+        let query = format!("SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE id = ?");
+        sqlx::query_as::<_, RequestLog>(&query)
             .bind(id)
             .fetch_one(&self.pool)
             .await
@@ -317,9 +316,8 @@ impl Repository {
     }
 
     pub async fn get_logs(&self, limit: i64, offset: i64) -> Result<Vec<RequestLog>, sqlx::Error> {
-        sqlx::query_as::<_, RequestLog>(
-            "SELECT * FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?"
-        )
+        let query = format!("SELECT {REQUEST_LOG_COLUMNS} FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?");
+        sqlx::query_as::<_, RequestLog>(&query)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -337,7 +335,7 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RequestLog>, sqlx::Error> {
-        let mut q = sqlx::QueryBuilder::new("SELECT * FROM request_logs WHERE 1=1");
+        let mut q = sqlx::QueryBuilder::new(format!("SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE 1=1"));
 
         if let Some(kw) = keyword {
             let pattern = format!("%{}%", kw);
@@ -511,6 +509,56 @@ mod tests {
             repo.get_api_key_by_key(&created.key).await,
             Err(sqlx::Error::RowNotFound)
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_logs_use_rowid_as_sequence_without_schema_column() -> anyhow::Result<()> {
+        let repo = create_test_repository().await?;
+        let created_at = "2026-08-15T08:13:26.293Z".to_string();
+        let log = RequestLog {
+            id: "request-1".to_string(),
+            seq: None,
+            api_key_id: Some("key-1".to_string()),
+            api_key_name: Some("local".to_string()),
+            channel_id: Some("channel-1".to_string()),
+            channel_name: Some("DeepSeek".to_string()),
+            model: "deepseek-chat".to_string(),
+            upstream_model: Some("deepseek-chat".to_string()),
+            mode: "chat".to_string(),
+            status_code: 200,
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+            duration_ms: 120,
+            error_message: None,
+            is_stream: 1,
+            is_retry: 0,
+            created_at: created_at.clone(),
+            request_body: None,
+            risk_level: "low".to_string(),
+            risk_score: 0,
+            risk_summary: None,
+            security_action: "allow".to_string(),
+            sanitized: 0,
+            blocked_reason: None,
+        };
+
+        repo.create_log(&log).await?;
+
+        let direct = repo.get_log(&log.id).await?;
+        assert_eq!(direct.seq, Some(1));
+
+        let recent = repo.get_logs(10, 0).await?;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].total_tokens, 30);
+
+        let filtered = repo
+            .search_logs(None, None, None, None, Some(&created_at), None, 10, 0)
+            .await?;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].seq, Some(1));
 
         Ok(())
     }

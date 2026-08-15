@@ -78,7 +78,10 @@ export function ApiKeysPage() {
         },
     });
     const toggleMutation = useMutation({
-        mutationFn: (apiKey: ApiKey) => apiKeyApi.update(apiKey.id, apiKey.status === 1 ? 0 : 1),
+        mutationFn: (apiKey: ApiKey) => apiKeyApi.update({
+            id: apiKey.id,
+            status: apiKey.status === 1 ? 0 : 1,
+        }),
         onSuccess: refreshKeys,
         onError: (mutationError) => showToast(errorMessage(mutationError)),
     });
