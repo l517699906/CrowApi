@@ -7,7 +7,7 @@ export const initialChannels: Channel[] = [
     {
         id: "channel-openai-primary",
         name: "OpenAI 主线路",
-        type: "OpenAI",
+        type: "openai",
         base_url: "https://api.openai.com/v1",
         api_key: "sk-proj-demo-openai-key",
         models: ["gpt-5.2", "gpt-5-mini", "o4-mini"],
@@ -24,7 +24,7 @@ export const initialChannels: Channel[] = [
     {
         id: "channel-deepseek",
         name: "DeepSeek 默认",
-        type: "DeepSeek",
+        type: "deepseek",
         base_url: "https://api.deepseek.com/v1",
         api_key: "sk-demo-deepseek-key",
         models: ["deepseek-chat", "deepseek-reasoner"],
@@ -41,7 +41,7 @@ export const initialChannels: Channel[] = [
     {
         id: "channel-claude",
         name: "Claude 生产线路",
-        type: "Claude",
+        type: "claude",
         base_url: "https://api.anthropic.com/v1",
         api_key: "sk-ant-demo-claude-key",
         models: ["claude-sonnet-4-5", "claude-haiku-4-5"],
@@ -58,7 +58,7 @@ export const initialChannels: Channel[] = [
     {
         id: "channel-gemini",
         name: "Gemini 备用",
-        type: "Gemini",
+        type: "gemini",
         base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
         api_key: "AIza-demo-gemini-key",
         models: ["gemini-2.5-pro", "gemini-2.5-flash"],
@@ -78,7 +78,7 @@ export const initialApiKeys: ApiKey[] = [
     {
         id: "key-development",
         name: "本地开发",
-        key: "sk-waliapi-dev8c92c4df60a0479b",
+        key: "sk-crowapi-dev8c92c4df60a0479b",
         status: 1,
         allowed_models: ["全部模型"],
         allowed_channels: ["全部渠道"],
@@ -91,7 +91,7 @@ export const initialApiKeys: ApiKey[] = [
     {
         id: "key-cursor",
         name: "Cursor",
-        key: "sk-waliapi-cur1ab90d71b41c23e",
+        key: "sk-crowapi-cur1ab90d71b41c23e",
         status: 1,
         allowed_models: ["gpt-5.2", "claude-sonnet-4-5"],
         allowed_channels: ["全部渠道"],
@@ -104,7 +104,7 @@ export const initialApiKeys: ApiKey[] = [
     {
         id: "key-ci",
         name: "CI 自动化",
-        key: "sk-waliapi-ci7a1f6c09096df2aa",
+        key: "sk-crowapi-ci7a1f6c09096df2aa",
         status: 0,
         allowed_models: ["gpt-5-mini"],
         allowed_channels: ["OpenAI 主线路"],

@@ -1,7 +1,7 @@
 export interface Channel {
     id: string;
     name: string;
-    type: string;
+    type: ChannelType;
     base_url: string;
     api_key: string;
     models: string[];
@@ -16,7 +16,7 @@ export interface Channel {
     last_test_ok: number | null;
 }
 
-export type ChannelType = "OpenAI" | "DeepSeek" | "Claude" | "Gemini" | "Custom";
+export type ChannelType = "openai" | "deepseek" | "claude" | "gemini" | "custom";
 
 export interface CreateChannelInput {
     name: string;
@@ -90,18 +90,19 @@ export interface RequestLog {
 
 export interface GetLogsInput {
     keyword?: string;
-    channel?: string;
+    api_key_name?: string;
+    channel_name?: string;
     model?: string;
-    status_code?: number;
+    date_from?: string;
+    date_to?: string;
     limit?: number;
+    offset?: number;
 }
 
 export interface LogStats {
     date: string;
-    request_count: number;
+    count: number;
     total_tokens: number;
-    avg_latency_ms: number;
-    error_count: number;
 }
 
 export interface DashboardStats {
@@ -133,4 +134,10 @@ export interface Settings {
     security_scan_response: boolean;
     security_redact_secrets: boolean;
     security_block_on_critical: boolean;
+}
+
+export interface ServerStatus {
+    running: boolean;
+    port: number;
+    url: string;
 }

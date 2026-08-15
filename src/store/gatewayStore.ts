@@ -33,7 +33,7 @@ function createId(prefix: string): string {
 function createWaliApiKey(): string {
     const bytes = crypto.getRandomValues(new Uint8Array(18));
     const suffix = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-    return `sk-waliapi-${suffix}`;
+    return `sk-crowapi-${suffix}`;
 }
 
 export const useGatewayStore = create<GatewayState>()(

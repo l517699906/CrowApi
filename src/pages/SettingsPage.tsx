@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
     Check,
     CircleHelp,
@@ -11,7 +11,10 @@ import {
     Settings2,
     ShieldCheck,
 } from "lucide-react";
-import { useGatewayStore } from "../store/gatewayStore";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { DEFAULT_SETTINGS } from "../config/defaults";
+import { settingsApi } from "../lib/api";
+import { errorMessage, queryKeys } from "../lib/query";
 import type { Settings } from "../types";
 import { PageTitle, SegmentedControl, Toast, Toggle } from "../components/ui";
 
@@ -31,20 +34,39 @@ const themeOptions = [
 ] as const;
 
 export function SettingsPage() {
-    const settings = useGatewayStore((state) => state.settings);
-    const saveSettings = useGatewayStore((state) => state.saveSettings);
+    const queryClient = useQueryClient();
+    const { data: settings, isPending, error } = useQuery({
+        queryKey: queryKeys.settings,
+        queryFn: settingsApi.get,
+    });
     const [activeTab, setActiveTab] = useState<SettingsTab>("service");
-    const [draft, setDraft] = useState<Settings>(() => ({ ...settings }));
+    const [draft, setDraft] = useState<Settings>(() => ({ ...DEFAULT_SETTINGS }));
     const [toast, setToast] = useState("");
+    const saveMutation = useMutation({
+        mutationFn: settingsApi.save,
+        onSuccess: (_, savedSettings) => {
+            queryClient.setQueryData(queryKeys.settings, savedSettings);
+            setToast("设置已保存");
+            window.setTimeout(() => setToast(""), 1800);
+        },
+    });
+
+    useEffect(() => {
+        if (settings) {
+            setDraft({ ...settings });
+        }
+    }, [settings]);
 
     function updateSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
         setDraft((current) => ({ ...current, [key]: value }));
     }
 
-    const save = () => {
-        saveSettings(draft);
-        setToast("设置已保存");
-        window.setTimeout(() => setToast(""), 1800);
+    const save = async () => {
+        try {
+            await saveMutation.mutateAsync(draft);
+        } catch {
+            // Mutation error is rendered with the settings form.
+        }
     };
 
     return (
@@ -53,8 +75,8 @@ export function SettingsPage() {
                 title="设置"
                 meta="本地网关配置"
                 action={(
-                    <button type="button" className="button-primary" onClick={save}>
-                        <Save size={16} />保存更改
+                    <button type="button" className="button-primary" onClick={save} disabled={saveMutation.isPending || isPending}>
+                        <Save size={16} />{saveMutation.isPending ? "保存中..." : "保存更改"}
                     </button>
                 )}
             />
@@ -226,6 +248,9 @@ export function SettingsPage() {
                     ) : null}
                 </section>
             </div>
+            {error || saveMutation.error ? (
+                <p className="form-error mt-4" role="alert">{errorMessage(error ?? saveMutation.error)}</p>
+            ) : null}
             {toast ? <Toast message={toast} /> : null}
         </div>
     );

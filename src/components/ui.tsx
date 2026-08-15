@@ -184,18 +184,18 @@ interface ProviderMarkProps {
 }
 
 const providerInitials: Record<string, string> = {
-    OpenAI: "OA",
-    DeepSeek: "DS",
-    Claude: "CL",
-    Gemini: "GE",
-    Custom: "API",
+    openai: "OA",
+    deepseek: "DS",
+    claude: "CL",
+    gemini: "GE",
+    custom: "API",
 };
 
 export function ProviderMark({ type, size = "md" }: ProviderMarkProps) {
-    const normalizedType = providerInitials[type] ? type : "Custom";
+    const normalizedType = providerInitials[type.toLowerCase()] ? type.toLowerCase() : "custom";
 
     return (
-        <span className={`provider-mark provider-${normalizedType.toLowerCase()} provider-${size}`} aria-hidden="true">
+        <span className={`provider-mark provider-${normalizedType} provider-${size}`} aria-hidden="true">
             {providerInitials[normalizedType]}
         </span>
     );

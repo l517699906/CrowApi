@@ -7,9 +7,12 @@ import {
     ShieldCheck,
     Trash2,
     WalletCards,
+    XCircle,
 } from "lucide-react";
-import { formatCompactNumber, formatDateTime, formatQuota, maskSecret } from "../lib/format";
-import { useGatewayStore } from "../store/gatewayStore";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { formatCompactNumber, formatDateTime, formatQuota } from "../lib/format";
+import { apiKeyApi, channelApi, statsApi } from "../lib/api";
+import { errorMessage, queryKeys } from "../lib/query";
 import type { ApiKey } from "../types";
 import { IconButton, Modal, PageTitle, StatusBadge, Toast, Toggle } from "../components/ui";
 
@@ -24,18 +27,25 @@ interface KeyFormState {
 const initialForm: KeyFormState = {
     name: "",
     quotaLimit: 1_000_000,
-    modelScope: "全部模型",
-    channelScope: "全部渠道",
+    modelScope: "",
+    channelScope: "",
     expiresAt: "",
 };
 
 export function ApiKeysPage() {
-    const apiKeys = useGatewayStore((state) => state.apiKeys);
-    const channels = useGatewayStore((state) => state.channels);
-    const logs = useGatewayStore((state) => state.logs);
-    const createApiKey = useGatewayStore((state) => state.createApiKey);
-    const toggleApiKey = useGatewayStore((state) => state.toggleApiKey);
-    const deleteApiKey = useGatewayStore((state) => state.deleteApiKey);
+    const queryClient = useQueryClient();
+    const { data: apiKeys = [], isPending, error } = useQuery({
+        queryKey: queryKeys.apiKeys,
+        queryFn: apiKeyApi.getAll,
+    });
+    const { data: channels = [] } = useQuery({
+        queryKey: queryKeys.channels,
+        queryFn: channelApi.getAll,
+    });
+    const { data: dashboard } = useQuery({
+        queryKey: queryKeys.dashboard,
+        queryFn: statsApi.getDashboard,
+    });
     const [createOpen, setCreateOpen] = useState(false);
     const [form, setForm] = useState<KeyFormState>(initialForm);
     const [createdKey, setCreatedKey] = useState<ApiKey | null>(null);
@@ -44,14 +54,46 @@ export function ApiKeysPage() {
     const [toast, setToast] = useState("");
 
     const models = useMemo(() => Array.from(new Set(channels.flatMap((channel) => channel.models))), [channels]);
-    const totalQuota = apiKeys.reduce((sum, key) => sum + key.quota_limit, 0);
+    const totalQuota = apiKeys.reduce((sum, key) => sum + Math.max(key.quota_limit, 0), 0);
     const totalUsed = apiKeys.reduce((sum, key) => sum + key.quota_used, 0);
     const totalQuotaPercentage = totalQuota > 0 ? Math.min((totalUsed / totalQuota) * 100, 100) : 0;
+    const hasUnlimitedQuota = apiKeys.some((key) => key.quota_limit <= 0);
+    const now = Date.now();
+    const activeKeys = apiKeys.filter((key) => key.status === 1 && (!key.expires_at || new Date(key.expires_at).getTime() > now));
 
     const showToast = (message: string) => {
         setToast(message);
         window.setTimeout(() => setToast(""), 1800);
     };
+
+    const refreshKeys = () => queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
+    const createMutation = useMutation({
+        mutationFn: apiKeyApi.create,
+        onSuccess: async (apiKey) => {
+            setCreatedKey(apiKey);
+            await Promise.all([
+                refreshKeys(),
+                queryClient.invalidateQueries({ queryKey: queryKeys.dashboard }),
+            ]);
+        },
+    });
+    const toggleMutation = useMutation({
+        mutationFn: (apiKey: ApiKey) => apiKeyApi.update(apiKey.id, apiKey.status === 1 ? 0 : 1),
+        onSuccess: refreshKeys,
+        onError: (mutationError) => showToast(errorMessage(mutationError)),
+    });
+    const deleteMutation = useMutation({
+        mutationFn: apiKeyApi.delete,
+        onSuccess: async () => {
+            await Promise.all([
+                refreshKeys(),
+                queryClient.invalidateQueries({ queryKey: queryKeys.dashboard }),
+            ]);
+            setDeletingKey(null);
+            showToast("密钥已删除");
+        },
+        onError: (mutationError) => showToast(errorMessage(mutationError)),
+    });
 
     const copyKey = async (apiKey: ApiKey) => {
         try {
@@ -69,27 +111,30 @@ export function ApiKeysPage() {
         setForm(initialForm);
     };
 
-    const submitCreate = (event: FormEvent<HTMLFormElement>) => {
+    const submitCreate = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
         if (!form.name.trim()) {
             return;
         }
 
-        const apiKey = createApiKey({
-            name: form.name.trim(),
-            quota_limit: Number(form.quotaLimit),
-            allowed_models: [form.modelScope],
-            allowed_channels: [form.channelScope],
-            expires_at: form.expiresAt ? new Date(`${form.expiresAt}T23:59:59`).toISOString() : null,
-        });
-        setCreatedKey(apiKey);
+        try {
+            await createMutation.mutateAsync({
+                name: form.name.trim(),
+                quota_limit: Number(form.quotaLimit),
+                allowed_models: form.modelScope ? [form.modelScope] : [],
+                allowed_channels: form.channelScope ? [form.channelScope] : [],
+                expires_at: form.expiresAt ? new Date(`${form.expiresAt}T23:59:59`).toISOString() : null,
+            });
+        } catch (mutationError) {
+            showToast(errorMessage(mutationError));
+        }
     };
 
     return (
         <div className="page-enter">
             <PageTitle
                 title="密钥"
-                meta={`${apiKeys.filter((key) => key.status === 1).length} 个有效密钥`}
+                meta={`${activeKeys.length} 个有效密钥`}
                 action={(
                     <button type="button" className="button-primary" onClick={() => setCreateOpen(true)}>
                         <Plus size={16} />创建密钥
@@ -102,15 +147,15 @@ export function ApiKeysPage() {
                     <span className="overview-icon"><WalletCards size={20} /></span>
                     <div>
                         <p>总配额用量</p>
-                        <strong>{formatCompactNumber(totalUsed)} <span>/ {totalQuota > 0 ? formatCompactNumber(totalQuota) : "不限"}</span></strong>
+                        <strong>{formatCompactNumber(totalUsed)} <span>/ {hasUnlimitedQuota || totalQuota === 0 ? "不限" : formatCompactNumber(totalQuota)}</span></strong>
                     </div>
                 </div>
                 <div className="key-quota-track">
                     <span style={{ width: `${totalQuotaPercentage}%` }} />
                 </div>
                 <div className="key-overview-meta">
-                    <span>{totalQuota > 0 ? `已使用 ${Math.round(totalQuotaPercentage)}%` : "配额不限"}</span>
-                    <span>今日调用 {logs.length + 2831}</span>
+                    <span>{hasUnlimitedQuota || totalQuota === 0 ? "包含不限额密钥" : `已使用 ${Math.round(totalQuotaPercentage)}%`}</span>
+                    <span>今日调用 {dashboard?.today_requests ?? 0}</span>
                 </div>
             </section>
 
@@ -118,7 +163,7 @@ export function ApiKeysPage() {
                 <div className="panel-header">
                     <div>
                         <h2>访问密钥</h2>
-                        <p>前缀统一为 sk-waliapi-</p>
+                        <p>前缀统一为 sk-crowapi-</p>
                     </div>
                     <StatusBadge status="info"><ShieldCheck size={13} />本地存储</StatusBadge>
                 </div>
@@ -137,7 +182,10 @@ export function ApiKeysPage() {
                         </thead>
                         <tbody>
                             {apiKeys.map((apiKey) => {
-                                const percentage = apiKey.quota_limit === 0 ? 0 : Math.min((apiKey.quota_used / apiKey.quota_limit) * 100, 100);
+                                const percentage = apiKey.quota_limit <= 0 ? 0 : Math.min((apiKey.quota_used / apiKey.quota_limit) * 100, 100);
+                                const isExpired = apiKey.expires_at
+                                    ? new Date(apiKey.expires_at).getTime() <= now
+                                    : false;
                                 return (
                                     <tr key={apiKey.id}>
                                         <td>
@@ -151,15 +199,16 @@ export function ApiKeysPage() {
                                         </td>
                                         <td>
                                             <div className="flex items-center gap-1">
-                                                <code className="secret-code">{maskSecret(apiKey.key)}</code>
-                                                <IconButton label={`复制 ${apiKey.name} 的密钥`} onClick={() => copyKey(apiKey)}>
-                                                    {copiedKey === apiKey.id ? <Check size={15} /> : <Copy size={15} />}
-                                                </IconButton>
+                                                <code className="secret-code">{apiKey.key}</code>
                                             </div>
                                         </td>
                                         <td>
-                                            <p className="text-xs text-ink">{apiKey.allowed_models[0]}</p>
-                                            <p className="mt-0.5 text-[11px] text-subtle">{apiKey.allowed_channels[0]}</p>
+                                            <p className="text-xs text-ink">{apiKey.allowed_models.length > 0 ? apiKey.allowed_models.join(", ") : "全部模型"}</p>
+                                            <p className="mt-0.5 text-[11px] text-subtle">
+                                                {apiKey.allowed_channels.length > 0
+                                                    ? apiKey.allowed_channels.map((id) => channels.find((channel) => channel.id === id)?.name ?? id).join(", ")
+                                                    : "全部渠道"}
+                                            </p>
                                         </td>
                                         <td>
                                             <div className="w-32">
@@ -180,9 +229,12 @@ export function ApiKeysPage() {
                                                 <Toggle
                                                     checked={apiKey.status === 1}
                                                     label={`${apiKey.status === 1 ? "停用" : "启用"}${apiKey.name}`}
-                                                    onChange={() => toggleApiKey(apiKey.id)}
+                                                    disabled={toggleMutation.isPending}
+                                                    onChange={() => toggleMutation.mutate(apiKey)}
                                                 />
-                                                <span className="text-xs text-muted">{apiKey.status === 1 ? "有效" : "停用"}</span>
+                                                <span className="text-xs text-muted">
+                                                    {apiKey.status !== 1 ? "停用" : isExpired ? "已过期" : "有效"}
+                                                </span>
                                             </div>
                                         </td>
                                         <td>
@@ -198,6 +250,13 @@ export function ApiKeysPage() {
                         </tbody>
                     </table>
                 </div>
+                {isPending ? (
+                    <div className="empty-state"><span className="button-spinner" /><strong>正在读取密钥</strong></div>
+                ) : error ? (
+                    <div className="empty-state"><XCircle size={22} /><strong>密钥读取失败</strong><span>{errorMessage(error)}</span></div>
+                ) : apiKeys.length === 0 ? (
+                    <div className="empty-state"><KeyRound size={22} /><strong>尚未创建访问密钥</strong><span>创建后即可调用本地网关</span></div>
+                ) : null}
             </section>
 
             {createOpen ? (
@@ -210,7 +269,9 @@ export function ApiKeysPage() {
                     ) : (
                         <>
                             <button type="button" className="button-secondary" onClick={closeCreateDialog}>取消</button>
-                            <button type="submit" form="key-form" className="button-primary">创建密钥</button>
+                            <button type="submit" form="key-form" className="button-primary" disabled={createMutation.isPending}>
+                                {createMutation.isPending ? "创建中..." : "创建密钥"}
+                            </button>
                         </>
                     )}
                 >
@@ -260,8 +321,8 @@ export function ApiKeysPage() {
                                         value={form.modelScope}
                                         onChange={(event) => setForm((current) => ({ ...current, modelScope: event.target.value }))}
                                     >
-                                        <option>全部模型</option>
-                                        {models.map((model) => <option key={model}>{model}</option>)}
+                                        <option value="">全部模型</option>
+                                        {models.map((model) => <option key={model} value={model}>{model}</option>)}
                                     </select>
                                 </label>
                                 <label className="field-label">
@@ -271,8 +332,8 @@ export function ApiKeysPage() {
                                         value={form.channelScope}
                                         onChange={(event) => setForm((current) => ({ ...current, channelScope: event.target.value }))}
                                     >
-                                        <option>全部渠道</option>
-                                        {channels.map((channel) => <option key={channel.id}>{channel.name}</option>)}
+                                        <option value="">全部渠道</option>
+                                        {channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.name}</option>)}
                                     </select>
                                 </label>
                             </div>
@@ -305,10 +366,9 @@ export function ApiKeysPage() {
                                 type="button"
                                 className="button-danger"
                                 onClick={() => {
-                                    deleteApiKey(deletingKey.id);
-                                    setDeletingKey(null);
-                                    showToast("密钥已删除");
+                                    deleteMutation.mutate(deletingKey.id);
                                 }}
+                                disabled={deleteMutation.isPending}
                             >
                                 <Trash2 size={16} />删除密钥
                             </button>

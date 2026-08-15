@@ -9,9 +9,12 @@ import {
     Trash2,
     XCircle,
 } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { PROVIDERS, PROVIDER_DEFAULTS, providerLabel } from "../config/providers";
 import { formatDateTime } from "../lib/format";
-import { useGatewayStore } from "../store/gatewayStore";
-import type { Channel, ChannelType, CreateChannelInput } from "../types";
+import { channelApi } from "../lib/api";
+import { errorMessage, queryKeys } from "../lib/query";
+import type { Channel, ChannelType, CreateChannelInput, UpdateChannelInput } from "../types";
 import {
     IconButton,
     Modal,
@@ -21,16 +24,6 @@ import {
     Toast,
     Toggle,
 } from "../components/ui";
-
-const channelTypes: ChannelType[] = ["OpenAI", "DeepSeek", "Claude", "Gemini", "Custom"];
-
-const providerDefaults: Record<ChannelType, { baseUrl: string; models: string }> = {
-    OpenAI: { baseUrl: "https://api.openai.com/v1", models: "gpt-5.2, gpt-5-mini" },
-    DeepSeek: { baseUrl: "https://api.deepseek.com/v1", models: "deepseek-chat, deepseek-reasoner" },
-    Claude: { baseUrl: "https://api.anthropic.com/v1", models: "claude-sonnet-4-5, claude-haiku-4-5" },
-    Gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", models: "gemini-2.5-pro, gemini-2.5-flash" },
-    Custom: { baseUrl: "http://127.0.0.1:11434/v1", models: "" },
-};
 
 interface ChannelFormState {
     name: string;
@@ -46,9 +39,9 @@ function getInitialForm(channel?: Channel): ChannelFormState {
     if (channel) {
         return {
             name: channel.name,
-            type: channel.type as ChannelType,
+            type: channel.type,
             baseUrl: channel.base_url,
-            apiKey: channel.api_key,
+            apiKey: "",
             models: channel.models.join(", "),
             priority: channel.priority,
             weight: channel.weight,
@@ -57,10 +50,10 @@ function getInitialForm(channel?: Channel): ChannelFormState {
 
     return {
         name: "",
-        type: "OpenAI",
-        baseUrl: providerDefaults.OpenAI.baseUrl,
+        type: "openai",
+        baseUrl: PROVIDER_DEFAULTS.openai.baseUrl,
         apiKey: "",
-        models: providerDefaults.OpenAI.models,
+        models: PROVIDER_DEFAULTS.openai.models,
         priority: 10,
         weight: 100,
     };
@@ -72,16 +65,31 @@ interface ChannelDialogProps {
 }
 
 function ChannelDialog({ channel, onClose }: ChannelDialogProps) {
-    const addChannel = useGatewayStore((state) => state.addChannel);
-    const updateChannel = useGatewayStore((state) => state.updateChannel);
+    const queryClient = useQueryClient();
     const [form, setForm] = useState<ChannelFormState>(() => getInitialForm(channel));
     const [error, setError] = useState("");
+    const saveMutation = useMutation({
+        mutationFn: (input: CreateChannelInput | UpdateChannelInput) => (
+            "id" in input ? channelApi.update(input) : channelApi.create(input)
+        ),
+        onSuccess: async () => {
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: queryKeys.channels }),
+                queryClient.invalidateQueries({ queryKey: queryKeys.dashboard }),
+            ]);
+            onClose();
+        },
+    });
 
-    const submit = (event: FormEvent<HTMLFormElement>) => {
+    const submit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
         const models = form.models.split(",").map((model) => model.trim()).filter(Boolean);
         if (!form.name.trim() || !form.baseUrl.trim() || models.length === 0) {
             setError("请填写渠道名称、API 地址和至少一个模型");
+            return;
+        }
+        if (!channel && form.type !== "custom" && !form.apiKey.trim()) {
+            setError("请填写上游 API Key");
             return;
         }
 
@@ -95,12 +103,26 @@ function ChannelDialog({ channel, onClose }: ChannelDialogProps) {
             weight: Number(form.weight),
         };
 
-        if (channel) {
-            updateChannel(channel.id, input);
-        } else {
-            addChannel(input);
+        setError("");
+        try {
+            if (channel) {
+                const updateInput: UpdateChannelInput = {
+                    id: channel.id,
+                    name: input.name,
+                    type: input.type,
+                    base_url: input.base_url,
+                    models: input.models,
+                    priority: input.priority,
+                    weight: input.weight,
+                    ...(input.api_key ? { api_key: input.api_key } : {}),
+                };
+                await saveMutation.mutateAsync(updateInput);
+            } else {
+                await saveMutation.mutateAsync(input);
+            }
+        } catch (mutationError) {
+            setError(errorMessage(mutationError));
         }
-        onClose();
     };
 
     return (
@@ -112,8 +134,8 @@ function ChannelDialog({ channel, onClose }: ChannelDialogProps) {
             footer={(
                 <>
                     <button type="button" className="button-secondary" onClick={onClose}>取消</button>
-                    <button type="submit" form="channel-form" className="button-primary">
-                        {channel ? "保存更改" : "添加渠道"}
+                    <button type="submit" form="channel-form" className="button-primary" disabled={saveMutation.isPending}>
+                        {saveMutation.isPending ? "保存中..." : channel ? "保存更改" : "添加渠道"}
                     </button>
                 </>
             )}
@@ -140,12 +162,12 @@ function ChannelDialog({ channel, onClose }: ChannelDialogProps) {
                                 setForm((current) => ({
                                     ...current,
                                     type,
-                                    baseUrl: providerDefaults[type].baseUrl,
-                                    models: providerDefaults[type].models,
+                                    baseUrl: PROVIDER_DEFAULTS[type].baseUrl,
+                                    models: PROVIDER_DEFAULTS[type].models,
                                 }));
                             }}
                         >
-                            {channelTypes.map((type) => <option key={type}>{type}</option>)}
+                            {PROVIDERS.map((provider) => <option key={provider.value} value={provider.value}>{provider.label}</option>)}
                         </select>
                     </label>
                 </div>
@@ -166,7 +188,7 @@ function ChannelDialog({ channel, onClose }: ChannelDialogProps) {
                         className="field-input font-mono"
                         type="password"
                         value={form.apiKey}
-                        placeholder="sk-..."
+                        placeholder={channel ? "已保存，留空则不修改" : "sk-..."}
                         autoComplete="off"
                         onChange={(event) => setForm((current) => ({ ...current, apiKey: event.target.value }))}
                     />
@@ -213,10 +235,11 @@ function ChannelDialog({ channel, onClose }: ChannelDialogProps) {
 }
 
 export function ChannelsPage() {
-    const channels = useGatewayStore((state) => state.channels);
-    const toggleChannel = useGatewayStore((state) => state.toggleChannel);
-    const deleteChannel = useGatewayStore((state) => state.deleteChannel);
-    const recordChannelTest = useGatewayStore((state) => state.recordChannelTest);
+    const queryClient = useQueryClient();
+    const { data: channels = [], isPending, error } = useQuery({
+        queryKey: queryKeys.channels,
+        queryFn: channelApi.getAll,
+    });
     const [query, setQuery] = useState("");
     const [typeFilter, setTypeFilter] = useState("全部");
     const [editingChannel, setEditingChannel] = useState<Channel | null | undefined>(undefined);
@@ -238,13 +261,38 @@ export function ChannelsPage() {
         window.setTimeout(() => setToast(""), 1800);
     };
 
-    const testChannel = (channel: Channel) => {
+    const refreshChannels = () => queryClient.invalidateQueries({ queryKey: queryKeys.channels });
+    const toggleMutation = useMutation({
+        mutationFn: (channel: Channel) => channelApi.toggle(channel.id, channel.status === 1 ? 0 : 1),
+        onSuccess: refreshChannels,
+        onError: (mutationError) => showToast(errorMessage(mutationError)),
+    });
+    const deleteMutation = useMutation({
+        mutationFn: channelApi.delete,
+        onSuccess: async () => {
+            await Promise.all([
+                refreshChannels(),
+                queryClient.invalidateQueries({ queryKey: queryKeys.dashboard }),
+            ]);
+            setDeletingChannel(null);
+            showToast("渠道已删除");
+        },
+        onError: (mutationError) => showToast(errorMessage(mutationError)),
+    });
+    const testMutation = useMutation({
+        mutationFn: channelApi.test,
+        onSuccess: async (result, channelId) => {
+            await refreshChannels();
+            const channel = channels.find((item) => item.id === channelId);
+            showToast(`${channel?.name ?? "渠道"}: ${result.message} (${result.latency_ms} ms)`);
+        },
+        onError: (mutationError) => showToast(errorMessage(mutationError)),
+        onSettled: () => setTestingId(null),
+    });
+
+    const testChannel = async (channel: Channel) => {
         setTestingId(channel.id);
-        window.setTimeout(() => {
-            recordChannelTest(channel.id, true);
-            setTestingId(null);
-            showToast(`${channel.name} 连接正常`);
-        }, 900);
+        await testMutation.mutateAsync(channel.id).catch(() => undefined);
     };
 
     const activeCount = channels.filter((channel) => channel.status === 1).length;
@@ -270,12 +318,12 @@ export function ChannelsPage() {
                     <span className="sr-only">渠道类型</span>
                     <select className="filter-select" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}>
                         <option>全部</option>
-                        {channelTypes.map((type) => <option key={type}>{type}</option>)}
+                        {PROVIDERS.map((provider) => <option key={provider.value} value={provider.value}>{provider.label}</option>)}
                     </select>
                 </label>
                 <div className="ml-auto flex items-center gap-2 text-xs text-muted">
                     <span className="live-dot" />
-                    自动健康检查已开启
+                    数据来自本机 SQLite
                 </div>
             </section>
 
@@ -301,7 +349,7 @@ export function ChannelsPage() {
                                             <ProviderMark type={channel.type} />
                                             <div className="min-w-0">
                                                 <p className="font-medium text-ink">{channel.name}</p>
-                                                <p className="mt-0.5 text-xs text-subtle">{channel.type}</p>
+                                                <p className="mt-0.5 text-xs text-subtle">{providerLabel(channel.type)}</p>
                                             </div>
                                         </div>
                                     </td>
@@ -331,7 +379,8 @@ export function ChannelsPage() {
                                         <Toggle
                                             checked={channel.status === 1}
                                             label={`${channel.status === 1 ? "停用" : "启用"}${channel.name}`}
-                                            onChange={() => toggleChannel(channel.id)}
+                                            disabled={toggleMutation.isPending}
+                                            onChange={() => toggleMutation.mutate(channel)}
                                         />
                                     </td>
                                     <td>
@@ -356,11 +405,15 @@ export function ChannelsPage() {
                         </tbody>
                     </table>
                 </div>
-                {filteredChannels.length === 0 ? (
+                {isPending ? (
+                    <div className="empty-state"><span className="button-spinner" /><strong>正在读取渠道</strong></div>
+                ) : error ? (
+                    <div className="empty-state"><XCircle size={22} /><strong>渠道读取失败</strong><span>{errorMessage(error)}</span></div>
+                ) : filteredChannels.length === 0 ? (
                     <div className="empty-state">
                         <Radio size={22} />
-                        <strong>没有匹配的渠道</strong>
-                        <span>调整搜索关键词或渠道类型</span>
+                        <strong>{channels.length === 0 ? "尚未配置渠道" : "没有匹配的渠道"}</strong>
+                        <span>{channels.length === 0 ? "添加上游渠道后即可测试连接" : "调整搜索关键词或渠道类型"}</span>
                     </div>
                 ) : null}
             </section>
@@ -368,7 +421,7 @@ export function ChannelsPage() {
             <section className="mt-4 grid gap-3 sm:grid-cols-3">
                 <div className="summary-tile"><CheckCircle2 size={18} className="text-accent" /><div><span>运行中</span><strong>{activeCount}</strong></div></div>
                 <div className="summary-tile"><XCircle size={18} className="text-danger" /><div><span>异常</span><strong>{channels.filter((channel) => channel.last_test_ok === 0).length}</strong></div></div>
-                <div className="summary-tile"><FlaskConical size={18} className="text-data-blue" /><div><span>自动检查</span><strong>5 min</strong></div></div>
+                <div className="summary-tile"><FlaskConical size={18} className="text-data-blue" /><div><span>已测试</span><strong>{channels.filter((channel) => channel.last_test_ok !== null).length}</strong></div></div>
             </section>
 
             {editingChannel !== undefined ? (
@@ -392,10 +445,9 @@ export function ChannelsPage() {
                                 type="button"
                                 className="button-danger"
                                 onClick={() => {
-                                    deleteChannel(deletingChannel.id);
-                                    setDeletingChannel(null);
-                                    showToast("渠道已删除");
+                                    deleteMutation.mutate(deletingChannel.id);
                                 }}
+                                disabled={deleteMutation.isPending}
                             >
                                 <Trash2 size={16} />删除渠道
                             </button>

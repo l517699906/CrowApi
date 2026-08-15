@@ -32,7 +32,7 @@ impl Database {
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await
-            .ok();
+            .expect("failed to run database migrations");
 
         Self { pool }
     }

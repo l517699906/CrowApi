@@ -128,8 +128,20 @@ impl Default for SecuritySettings {
     }
 }
 
-pub fn get_security_settings(_app: &AppHandle) -> SecuritySettings {
-    SecuritySettings::default()
+pub fn get_security_settings(app: &AppHandle) -> SecuritySettings {
+    let settings = crate::config::load_settings(app);
+    SecuritySettings {
+        enabled: settings.security_enabled,
+        mode: settings.security_mode,
+        scan_request: true,
+        scan_response: settings.security_scan_response,
+        scan_unicode: settings.security_scan_unicode,
+        scan_tools: settings.security_scan_tools,
+        scan_network: settings.security_scan_network,
+        redact_secrets: settings.security_redact_secrets,
+        block_on_critical: settings.security_block_on_critical,
+        max_scan_bytes: SecuritySettings::default().max_scan_bytes,
+    }
 }
 
 pub fn scan_request(_body: &serde_json::Value, _settings: &SecuritySettings) -> SecurityScanResult {

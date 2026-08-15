@@ -1,4 +1,5 @@
 mod adaptor;
+mod config;
 
 use tauri::Manager;
 mod commands;
@@ -48,10 +49,14 @@ pub fn run() {
                 });
                 app_handle.manage(state.clone());
 
-                let handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = server::start_server(handle, state).await;
+                let server_app = app_handle.clone();
+                let server_state = state.clone();
+                let server_handle = tokio::spawn(async move {
+                    if let Err(error) = server::start_server(server_app, server_state).await {
+                        tracing::error!("CrowAPI server stopped: {}", error);
+                    }
                 });
+                *state.server_handle.write().await = Some(server_handle);
             });
             Ok(())
         })
@@ -64,6 +69,10 @@ pub fn run() {
             commands::channel::toggle_channel,
             commands::channel::delete_channel,
             commands::channel::test_channel,
+            commands::api_key::get_api_keys,
+            commands::api_key::create_api_key,
+            commands::api_key::update_api_key,
+            commands::api_key::delete_api_key,
             commands::log::get_logs,
             commands::log::get_log,
             commands::log::get_log_security_findings,
@@ -74,6 +83,8 @@ pub fn run() {
             commands::stats::get_dashboard_stats,
             commands::server::get_server_status,
             commands::server::restart_server,
+            commands::settings::get_settings,
+            commands::settings::save_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running WaLiAPI");

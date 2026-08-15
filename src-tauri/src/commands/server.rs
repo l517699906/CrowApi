@@ -10,13 +10,14 @@ pub struct ServerStatus {
 }
 
 #[tauri::command]
-pub async fn get_server_status(state: tauri::State<'_, Arc<AppState>>) -> Result<ServerStatus, String> {
+pub async fn get_server_status(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<ServerStatus, String> {
     let running = state.server_running.load(std::sync::atomic::Ordering::SeqCst);
     let port = *state.server_port.read().await;
+    let host = crate::config::load_settings(&app).server_host;
     Ok(ServerStatus {
         running,
         port,
-        url: format!("http://127.0.0.1:{}", port),
+        url: format!("http://{}:{}", host, port),
     })
 }
 
@@ -26,15 +27,19 @@ pub async fn restart_server(app: tauri::AppHandle, state: tauri::State<'_, Arc<A
     let mut handle_guard = state.server_handle.write().await;
     if let Some(handle) = handle_guard.take() {
         handle.abort();
+        let _ = handle.await;
     }
     state.server_running.store(false, std::sync::atomic::Ordering::SeqCst);
 
     // Start new server
     let app_clone = app.clone();
     let state_clone = state.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = crate::server::start_server(app_clone, state_clone).await;
+    let new_handle = tokio::spawn(async move {
+        if let Err(error) = crate::server::start_server(app_clone, state_clone).await {
+            tracing::error!("CrowAPI server restart failed: {}", error);
+        }
     });
+    *handle_guard = Some(new_handle);
 
     Ok(())
 }

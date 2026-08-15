@@ -15,7 +15,10 @@ import {
     X,
 } from "lucide-react";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
-import { useGatewayStore } from "../store/gatewayStore";
+import { useQuery } from "@tanstack/react-query";
+import { DEFAULT_SETTINGS } from "../config/defaults";
+import { channelApi, serverApi, settingsApi } from "../lib/api";
+import { queryKeys } from "../lib/query";
 import { ApiKeysPage } from "../pages/ApiKeysPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
 import { DashboardPage } from "../pages/DashboardPage";
@@ -37,20 +40,49 @@ const pageNames = new Map<string, string>(navItems.map((item) => [item.to, item.
 
 export function AppShell() {
     const location = useLocation();
-    const settings = useGatewayStore((state) => state.settings);
-    const channels = useGatewayStore((state) => state.channels);
+    const { data: settings = DEFAULT_SETTINGS } = useQuery({
+        queryKey: queryKeys.settings,
+        queryFn: settingsApi.get,
+    });
+    const { data: channels = [] } = useQuery({
+        queryKey: queryKeys.channels,
+        queryFn: channelApi.getAll,
+    });
+    const { data: serverStatus } = useQuery({
+        queryKey: queryKeys.serverStatus,
+        queryFn: serverApi.getStatus,
+        refetchInterval: 2_000,
+    });
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [endpointCopied, setEndpointCopied] = useState(false);
     const pageName = pageNames.get(location.pathname) ?? "仪表盘";
-    const endpoint = `http://${settings.server_host}:${settings.server_port}/v1`;
+    const isRunning = serverStatus?.running ?? false;
+    const endpointBase = serverStatus?.port ? serverStatus.url : `http://${settings.server_host}:${settings.server_port}`;
+    const endpoint = `${endpointBase}/v1`;
     const activeChannels = useMemo(
         () => channels.filter((channel) => channel.status === 1).length,
         [channels],
     );
 
     useEffect(() => {
-        document.documentElement.dataset.theme = settings.ui_theme;
+        const media = window.matchMedia("(prefers-color-scheme: dark)");
+        const applyTheme = () => {
+            document.documentElement.dataset.theme = settings.ui_theme === "system"
+                ? (media.matches ? "dark" : "light")
+                : settings.ui_theme;
+        };
+        applyTheme();
+        media.addEventListener("change", applyTheme);
+        return () => media.removeEventListener("change", applyTheme);
     }, [settings.ui_theme]);
+
+    useEffect(() => {
+        try {
+            window.localStorage.removeItem("crowapi.console.v1");
+        } catch {
+            // WebView storage may be unavailable; no runtime data depends on it anymore.
+        }
+    }, []);
 
     useEffect(() => {
         setSidebarOpen(false);
@@ -111,8 +143,8 @@ export function AppShell() {
                 <div className="sidebar-runtime">
                     <div className="flex items-center justify-between gap-3">
                         <span className="flex items-center gap-2 text-xs font-medium text-sidebar-ink">
-                            <span className="live-dot" />
-                            网关运行中
+                            <span className={`live-dot ${isRunning ? "" : "is-offline"}`} />
+                            {isRunning ? "网关运行中" : "网关未连接"}
                         </span>
                         <span className="font-mono text-[10px] text-sidebar-muted">v0.1.0</span>
                     </div>
@@ -121,7 +153,7 @@ export function AppShell() {
                             <div className="font-mono text-xl font-semibold text-sidebar-ink">{activeChannels}/{channels.length}</div>
                             <div className="text-[11px] text-sidebar-muted">渠道在线</div>
                         </div>
-                        <div className="signal-bars" aria-label="网关信号正常">
+                        <div className="signal-bars" aria-label={isRunning ? "网关运行正常" : "网关未连接"}>
                             {[42, 63, 52, 78, 66, 91, 72, 82].map((height, index) => (
                                 <span key={`${height}-${index}`} style={{ height: `${height}%` }} />
                             ))}
@@ -151,7 +183,7 @@ export function AppShell() {
                             title="复制 API 地址"
                             onClick={copyEndpoint}
                         >
-                            <span className="live-dot" />
+                            <span className={`live-dot ${isRunning ? "" : "is-offline"}`} />
                             <span className="endpoint-text">{endpoint}</span>
                             {endpointCopied ? <Check size={14} /> : <Copy size={14} />}
                         </button>

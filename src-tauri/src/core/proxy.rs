@@ -1,4 +1,5 @@
 use crate::adaptor::{get_adaptor, ProxyRequest, TokenUsage};
+use crate::core::access::scope_allows;
 use crate::core::dispatcher::Dispatcher;
 use crate::db::models::{Channel, RequestLog};
 use crate::db::repository::Repository;
@@ -7,7 +8,6 @@ use crate::security;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::AppHandle;
-use tauri_plugin_store::StoreExt;
 
 pub struct ProxyResult {
     pub status: u16,
@@ -22,6 +22,7 @@ pub async fn handle_request(
     app: &AppHandle,
     api_key_id: &str,
     api_key_name: &str,
+    allowed_channel_ids: &[String],
     body: serde_json::Value,
     is_stream: bool,
     request_body: Option<String>,
@@ -80,7 +81,13 @@ pub async fn handle_request(
         return Err((451, security_result.summary));
     }
 
-    let channels = repo.get_enabled_channels().await.map_err(|e| (500, format!("DB error: {}", e)))?;
+    let channels: Vec<Channel> = repo
+        .get_enabled_channels()
+        .await
+        .map_err(|e| (500, format!("DB error: {}", e)))?
+        .into_iter()
+        .filter(|channel| scope_allows(allowed_channel_ids, &channel.id, "全部渠道"))
+        .collect();
     if channels.is_empty() {
         return Err((503, "No available channels".to_string()));
     }
@@ -236,16 +243,6 @@ pub async fn handle_request(
 }
 
 pub fn get_retry_settings(app: &AppHandle) -> (bool, i32) {
-    if let Ok(store) = app.store("settings.json") {
-        let enabled = store
-            .get("retry.enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let times = store
-            .get("retry.times")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(2) as i32;
-        return (enabled, times);
-    }
-    (true, 2)
+    let settings = crate::config::load_settings(app);
+    (settings.retry_enabled, settings.retry_times)
 }

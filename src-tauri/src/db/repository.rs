@@ -159,13 +159,13 @@ impl Repository {
     pub async fn create_api_key(&self, input: &CreateApiKeyInput) -> Result<ApiKey, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
-        let key = format!("sk-waliapi-{}", uuid::Uuid::new_v4().simple());
+        let key = format!("sk-crowapi-{}", uuid::Uuid::new_v4().simple());
         let allowed_models = serde_json::to_string(&input.allowed_models.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
         let allowed_channels = serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
 
         sqlx::query(
-            "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, quota_limit, quota_used, created_at, updated_at)
-             VALUES (?, ?, ?, 1, ?, ?, ?, 0, ?, ?)"
+            "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, quota_limit, quota_used, expires_at, created_at, updated_at)
+             VALUES (?, ?, ?, 1, ?, ?, ?, 0, ?, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
@@ -173,6 +173,7 @@ impl Repository {
         .bind(&allowed_models)
         .bind(&allowed_channels)
         .bind(input.quota_limit.unwrap_or(-1))
+        .bind(&input.expires_at)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -464,5 +465,93 @@ impl Repository {
         .bind(&since)
         .fetch_all(&self.pool)
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn create_test_repository() -> anyhow::Result<Repository> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Repository::new(pool))
+    }
+
+    #[tokio::test]
+    async fn api_key_lifecycle_persists_access_rules() -> anyhow::Result<()> {
+        let repo = create_test_repository().await?;
+        let expires_at = "2099-12-31T23:59:59Z".to_string();
+        let created = repo
+            .create_api_key(&CreateApiKeyInput {
+                name: "integration-test".to_string(),
+                allowed_models: Some(vec!["deepseek-chat".to_string()]),
+                allowed_channels: Some(vec!["channel-1".to_string()]),
+                quota_limit: Some(10_000),
+                expires_at: Some(expires_at.clone()),
+            })
+            .await?;
+
+        assert!(created.key.starts_with("sk-crowapi-"));
+        assert_eq!(created.allowed_models, r#"["deepseek-chat"]"#);
+        assert_eq!(created.allowed_channels, r#"["channel-1"]"#);
+        assert_eq!(created.quota_limit, 10_000);
+        assert_eq!(created.expires_at.as_deref(), Some(expires_at.as_str()));
+
+        repo.increment_quota(&created.id, 128).await?;
+        let active = repo.get_api_key_by_key(&created.key).await?;
+        assert_eq!(active.quota_used, 128);
+
+        repo.update_api_key_status(&created.id, 0).await?;
+        assert!(matches!(
+            repo.get_api_key_by_key(&created.key).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn channel_update_without_api_key_preserves_secret() -> anyhow::Result<()> {
+        let repo = create_test_repository().await?;
+        let created = repo
+            .create_channel(&CreateChannelInput {
+                name: "DeepSeek".to_string(),
+                channel_type: "deepseek".to_string(),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                api_key: "upstream-secret".to_string(),
+                models: vec!["deepseek-chat".to_string()],
+                priority: Some(10),
+                weight: Some(100),
+                config: None,
+                model_mapping: None,
+            })
+            .await?;
+
+        let updated = repo
+            .update_channel(&UpdateChannelInput {
+                id: created.id,
+                name: Some("DeepSeek primary".to_string()),
+                channel_type: None,
+                base_url: None,
+                api_key: None,
+                models: None,
+                status: None,
+                priority: Some(20),
+                weight: None,
+                config: None,
+                model_mapping: None,
+            })
+            .await?;
+
+        assert_eq!(updated.name, "DeepSeek primary");
+        assert_eq!(updated.api_key, "upstream-secret");
+        assert_eq!(updated.priority, 20);
+
+        Ok(())
     }
 }

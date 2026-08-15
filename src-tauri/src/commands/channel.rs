@@ -71,12 +71,26 @@ pub async fn get_channel(id: String, state: tauri::State<'_, std::sync::Arc<AppS
 
 #[tauri::command]
 pub async fn create_channel(input: CreateChannelInput, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<ChannelDto, String> {
+    let mut input = input;
+    input.name = input.name.trim().to_string();
+    input.base_url = input.base_url.trim().to_string();
+    input.channel_type = input.channel_type.to_ascii_lowercase();
+    if input.name.is_empty() || input.base_url.is_empty() || input.models.is_empty() {
+        return Err("请填写渠道名称、API 地址和至少一个模型".to_string());
+    }
     let repo = Repository::new(state.db.pool.clone());
     repo.create_channel(&input).await.map_err(|e| e.to_string()).map(to_dto)
 }
 
 #[tauri::command]
 pub async fn update_channel(input: UpdateChannelInput, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<ChannelDto, String> {
+    let mut input = input;
+    if let Some(channel_type) = input.channel_type.as_mut() {
+        *channel_type = channel_type.to_ascii_lowercase();
+    }
+    if matches!(input.api_key.as_deref(), Some("")) {
+        input.api_key = None;
+    }
     let repo = Repository::new(state.db.pool.clone());
     repo.update_channel(&input).await.map_err(|e| e.to_string()).map(to_dto)
 }

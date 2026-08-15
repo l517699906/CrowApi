@@ -13,42 +13,43 @@ import {
     Zap,
 } from "lucide-react";
 import { Link } from "react-router-dom";
-import { requestSeries } from "../data/mockData";
+import { useQuery } from "@tanstack/react-query";
 import { formatCompactNumber, formatDateTime, formatDuration, formatNumber } from "../lib/format";
-import { useGatewayStore } from "../store/gatewayStore";
+import { apiKeyApi, channelApi, logApi, serverApi, statsApi } from "../lib/api";
+import { errorMessage, queryKeys } from "../lib/query";
 import type { RequestLog } from "../types";
 import { PageTitle, ProviderMark, StatusBadge } from "../components/ui";
 
 const statDefinitions = [
     {
+        key: "requests",
         label: "今日请求数",
-        value: "2,841",
-        note: "较昨日 12.8%",
-        trend: "up",
+        note: "来自本地请求日志",
+        trend: "neutral",
         icon: MessageSquare,
         tone: "green",
     },
     {
+        key: "tokens",
         label: "Token 消耗",
-        value: "2.95M",
-        note: "输入 68% · 输出 32%",
+        note: "今日累计用量",
         trend: "neutral",
         icon: Cpu,
         tone: "blue",
     },
     {
+        key: "channels",
         label: "活跃渠道数",
-        value: "dynamic",
         note: "可参与路由",
         trend: "neutral",
         icon: Radio,
         tone: "amber",
     },
     {
+        key: "latency",
         label: "平均延迟",
-        value: "1.24 s",
-        note: "较昨日降低 86 ms",
-        trend: "up",
+        note: "今日请求平均值",
+        trend: "neutral",
         icon: CircleGauge,
         tone: "coral",
     },
@@ -92,15 +93,63 @@ function RequestStatus({ log }: { log: RequestLog }) {
 }
 
 export function DashboardPage() {
-    const channels = useGatewayStore((state) => state.channels);
-    const logs = useGatewayStore((state) => state.logs);
-    const apiKeys = useGatewayStore((state) => state.apiKeys);
+    const { data: stats, error: statsError } = useQuery({
+        queryKey: queryKeys.dashboard,
+        queryFn: statsApi.getDashboard,
+        refetchInterval: 5_000,
+    });
+    const { data: channels = [], error: channelsError } = useQuery({
+        queryKey: queryKeys.channels,
+        queryFn: channelApi.getAll,
+    });
+    const { data: logs = [], error: logsError } = useQuery({
+        queryKey: queryKeys.logs,
+        queryFn: () => logApi.getAll({ limit: 500 }),
+        refetchInterval: 3_000,
+    });
+    const { data: apiKeys = [], error: keysError } = useQuery({
+        queryKey: queryKeys.apiKeys,
+        queryFn: apiKeyApi.getAll,
+    });
+    const { data: serverStatus, error: serverError } = useQuery({
+        queryKey: queryKeys.serverStatus,
+        queryFn: serverApi.getStatus,
+        refetchInterval: 2_000,
+    });
     const activeChannels = useMemo(
         () => channels.filter((channel) => channel.status === 1).length,
         [channels],
     );
     const recentLogs = logs.slice(0, 6);
-    const chartMax = Math.max(...requestSeries["24h"]);
+    const requestSeries = useMemo(() => {
+        const values = Array.from({ length: 24 }, () => 0);
+        const now = Date.now();
+        logs.forEach((log) => {
+            const elapsedHours = Math.floor((now - new Date(log.created_at).getTime()) / 3_600_000);
+            if (elapsedHours >= 0 && elapsedHours < 24) {
+                values[23 - elapsedHours] += 1;
+            }
+        });
+        return values;
+    }, [logs]);
+    const chartMax = Math.max(...requestSeries, 1);
+    const failures = logs.filter((log) => log.status_code >= 400).length;
+    const successRate = logs.length > 0 ? ((logs.length - failures) / logs.length) * 100 : 100;
+    const testedChannels = channels.filter((channel) => channel.last_test_ok !== null);
+    const healthyChannels = testedChannels.filter((channel) => channel.last_test_ok === 1).length;
+    const healthRate = testedChannels.length > 0 ? (healthyChannels / testedChannels.length) * 100 : 0;
+    const activeKeys = apiKeys.filter((key) => key.status === 1 && (!key.expires_at || new Date(key.expires_at).getTime() > Date.now())).length;
+    const queryError = statsError ?? channelsError ?? logsError ?? keysError ?? serverError;
+
+    const statValue = (key: string) => {
+        switch (key) {
+            case "requests": return formatNumber(stats?.today_requests ?? 0);
+            case "tokens": return formatCompactNumber(stats?.today_total_tokens ?? 0);
+            case "channels": return `${activeChannels} / ${channels.length}`;
+            case "latency": return formatDuration(Math.round(stats?.avg_latency_ms ?? 0));
+            default: return "0";
+        }
+    };
 
     return (
         <div className="page-enter">
@@ -108,8 +157,8 @@ export function DashboardPage() {
                 title="仪表盘"
                 meta={`今天 · ${new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "short" }).format(new Date())}`}
                 action={(
-                    <StatusBadge status="success" dot>
-                        服务正常
+                    <StatusBadge status={serverStatus?.running ? "success" : "danger"} dot>
+                        {serverStatus?.running ? "服务正常" : "服务未连接"}
                     </StatusBadge>
                 )}
             />
@@ -119,7 +168,7 @@ export function DashboardPage() {
                     <span className="flow-icon"><Server size={17} /></span>
                     <div>
                         <strong>本地入口</strong>
-                        <span>127.0.0.1:8317</span>
+                        <span>{serverStatus?.url?.replace(/^https?:\/\//, "") ?? "127.0.0.1:8777"}</span>
                     </div>
                 </div>
                 <div className="flow-connector"><span /><span /><span /></div>
@@ -135,21 +184,21 @@ export function DashboardPage() {
                     <span className="flow-icon flow-icon-amber"><Zap size={17} /></span>
                     <div>
                         <strong>{activeChannels} 条上游</strong>
-                        <span>平均健康度 96%</span>
+                        <span>{testedChannels.length > 0 ? `测试通过率 ${healthRate.toFixed(0)}%` : "尚未测试"}</span>
                     </div>
                 </div>
                 <div className="ml-auto hidden items-center gap-5 xl:flex">
-                    <div className="flow-metric"><span>成功率</span><strong>99.2%</strong></div>
+                    <div className="flow-metric"><span>成功率</span><strong>{successRate.toFixed(1)}%</strong></div>
                     <div className="flow-metric"><span>队列</span><strong>0</strong></div>
                 </div>
             </section>
 
             <section className="kpi-grid" aria-label="今日概览">
-                {statDefinitions.map((stat) => (
+                {statDefinitions.map(({ key, ...stat }) => (
                     <KpiCard
-                        key={stat.label}
+                        key={key}
                         {...stat}
-                        value={stat.value === "dynamic" ? `${activeChannels} / ${channels.length}` : stat.value}
+                        value={statValue(key)}
                     />
                 ))}
             </section>
@@ -163,16 +212,16 @@ export function DashboardPage() {
                         </div>
                         <div className="flex items-center gap-4 text-xs text-muted">
                             <span className="flex items-center gap-1.5"><span className="legend-dot legend-green" />请求</span>
-                            <span className="font-mono font-semibold text-ink">2,841</span>
+                            <span className="font-mono font-semibold text-ink">{formatNumber(stats?.today_requests ?? 0)}</span>
                         </div>
                     </div>
                     <div className="traffic-chart" aria-label="24 小时请求趋势柱状图">
-                        {requestSeries["24h"].map((value, index) => (
+                        {requestSeries.map((value, index) => (
                             <div className="chart-column" key={`${value}-${index}`}>
                                 <span
                                     className="chart-bar"
                                     style={{ height: `${Math.max((value / chartMax) * 100, 7)}%` }}
-                                    title={`${String(index).padStart(2, "0")}:00 · ${value} 次`}
+                                    title={`${23 - index} 小时前 · ${value} 次`}
                                 />
                             </div>
                         ))}
@@ -200,10 +249,10 @@ export function DashboardPage() {
                                 </div>
                                 <div className="text-right">
                                     <p className="font-mono text-xs font-medium text-ink">
-                                        {channel.status === 1 ? `${420 + channel.priority * 11} ms` : "--"}
+                                        {channel.last_test_at ? formatDateTime(channel.last_test_at) : "--"}
                                     </p>
-                                    <p className={`text-[11px] ${channel.status === 1 ? "text-accent" : "text-subtle"}`}>
-                                        {channel.status === 1 ? "正常" : "已停用"}
+                                    <p className={`text-[11px] ${channel.last_test_ok === 1 ? "text-accent" : "text-subtle"}`}>
+                                        {channel.status !== 1 ? "已停用" : channel.last_test_ok === 1 ? "测试通过" : channel.last_test_ok === 0 ? "测试失败" : "未测试"}
                                     </p>
                                 </div>
                             </div>
@@ -216,7 +265,7 @@ export function DashboardPage() {
                 <div className="panel-header">
                     <div>
                         <h2>最近请求</h2>
-                        <p>{apiKeys.filter((key) => key.status === 1).length} 个密钥正在使用</p>
+                        <p>{activeKeys} 个有效密钥</p>
                     </div>
                     <Link className="panel-link" to="/logs">查看全部</Link>
                 </div>
@@ -246,13 +295,17 @@ export function DashboardPage() {
                         </tbody>
                     </table>
                 </div>
+                {recentLogs.length === 0 ? (
+                    <div className="empty-state"><Activity size={22} /><strong>暂无请求记录</strong><span>完成一次网关调用后会在这里显示</span></div>
+                ) : null}
             </section>
 
             <div className="mt-4 grid gap-4 sm:grid-cols-3">
-                <div className="mini-stat"><Activity size={17} /><span>总请求</span><strong>{formatCompactNumber(128_460)}</strong></div>
-                <div className="mini-stat"><KeyRound size={17} /><span>有效密钥</span><strong>{apiKeys.filter((key) => key.status === 1).length}</strong></div>
-                <div className="mini-stat"><Clock3 size={17} /><span>运行时间</span><strong>18d 7h</strong></div>
+                <div className="mini-stat"><Activity size={17} /><span>总请求</span><strong>{formatCompactNumber(stats?.total_requests ?? 0)}</strong></div>
+                <div className="mini-stat"><KeyRound size={17} /><span>有效密钥</span><strong>{activeKeys}</strong></div>
+                <div className="mini-stat"><Clock3 size={17} /><span>网关状态</span><strong>{serverStatus?.running ? "运行中" : "未连接"}</strong></div>
             </div>
+            {queryError ? <p className="form-error mt-4" role="alert">{errorMessage(queryError)}</p> : null}
         </div>
     );
 }

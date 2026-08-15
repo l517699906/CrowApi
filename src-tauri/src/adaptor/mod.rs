@@ -69,7 +69,7 @@ pub trait Adaptor: Send + Sync {
 }
 
 pub fn get_adaptor(channel_type: &str) -> Box<dyn Adaptor> {
-    match channel_type {
+    match channel_type.to_ascii_lowercase().as_str() {
         "openai" => Box::new(openai::OpenAIAdaptor),
         "deepseek" => Box::new(deepseek::DeepSeekAdaptor),
         "claude" => Box::new(claude::ClaudeAdaptor),

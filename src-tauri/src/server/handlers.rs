@@ -7,6 +7,7 @@ use axum::{
 use futures_util::StreamExt;
 use super::router::SharedState;
 use crate::core::proxy;
+use crate::core::access::{parse_scope, scope_allows};
 use crate::db::repository::Repository;
 use crate::adaptor::{get_adaptor, ProxyRequest};
 use crate::core::dispatcher::Dispatcher;
@@ -40,6 +41,31 @@ pub async fn handle_chat_completions(
         Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
     };
 
+    if key_record
+        .expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|expires_at| expires_at <= chrono::Utc::now())
+    {
+        return (StatusCode::UNAUTHORIZED, "API key expired").into_response();
+    }
+
+    let model = json.get("model").and_then(|value| value.as_str()).unwrap_or("");
+    if model.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Missing model").into_response();
+    }
+    let allowed_models = match parse_scope(&key_record.allowed_models) {
+        Ok(scope) => scope,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid API key model scope").into_response(),
+    };
+    if !scope_allows(&allowed_models, model, "全部模型") {
+        return (StatusCode::FORBIDDEN, "Model not allowed for this API key").into_response();
+    }
+    let allowed_channels = match parse_scope(&key_record.allowed_channels) {
+        Ok(scope) => scope,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid API key channel scope").into_response(),
+    };
+
     // 3. 配额检查
     if key_record.quota_limit > 0 && key_record.quota_used >= key_record.quota_limit {
         return (StatusCode::TOO_MANY_REQUESTS, "Quota exceeded").into_response();
@@ -50,9 +76,9 @@ pub async fn handle_chat_completions(
 
     // 5. 分流：流式 vs 非流式
     if is_stream {
-        handle_stream(shared, json, key_record.id, key_record.name, request_body_str).await
+        handle_stream(shared, json, key_record.id, key_record.name, allowed_channels, request_body_str).await
     } else {
-        match proxy::handle_request(&repo, &shared.app, &key_record.id, &key_record.name, json, false, Some(request_body_str)).await {
+        match proxy::handle_request(&repo, &shared.app, &key_record.id, &key_record.name, &allowed_channels, json, false, Some(request_body_str)).await {
             Ok(result) => (StatusCode::OK, Json(result.body)).into_response(),
             Err((code, msg)) => {
                 // 错误也返回 OpenAI 兼容格式
@@ -96,6 +122,7 @@ async fn handle_stream(
     json: serde_json::Value,
     api_key_id: String,
     api_key_name: String,
+    allowed_channel_ids: Vec<String>,
     request_body: String,
 ) -> Response {
     // ── 前置流程与非流式相同：安全扫描、阻断、调度（代码略，同 proxy.rs 逻辑）──
@@ -152,7 +179,10 @@ async fn handle_stream(
         return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
     }
     let channels = match repo.get_enabled_channels().await {
-        Ok(c) => c,
+        Ok(channels) => channels
+            .into_iter()
+            .filter(|channel| scope_allows(&allowed_channel_ids, &channel.id, "全部渠道"))
+            .collect::<Vec<_>>(),
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "No channels available").into_response(),
     };
 
@@ -423,4 +453,16 @@ pub async fn handle_health(State(shared): State<SharedState>) -> Response {
         "port": port,
         "url": format!("http://127.0.0.1:{}", port),
     })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_usage_is_read_from_sse_payload() {
+        let chunk = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8,\"total_tokens\":20}}\n\n";
+        assert_eq!(parse_usage_from_chunk(chunk), Some((12, 8, 20)));
+        assert_eq!(parse_usage_from_chunk("data: [DONE]\n\n"), None);
+    }
 }

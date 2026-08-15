@@ -8,8 +8,10 @@ import {
     ShieldAlert,
     TriangleAlert,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { formatDateTime, formatDuration, formatNumber } from "../lib/format";
-import { useGatewayStore } from "../store/gatewayStore";
+import { logApi } from "../lib/api";
+import { errorMessage, queryKeys } from "../lib/query";
 import type { RequestLog } from "../types";
 import { IconButton, Modal, PageTitle, StatusBadge } from "../components/ui";
 
@@ -31,7 +33,11 @@ function RiskStatus({ log }: { log: RequestLog }) {
 }
 
 export function LogsPage() {
-    const logs = useGatewayStore((state) => state.logs);
+    const { data: logs = [], isPending, error } = useQuery({
+        queryKey: queryKeys.logs,
+        queryFn: () => logApi.getAll({ limit: 500 }),
+        refetchInterval: 3_000,
+    });
     const [keyword, setKeyword] = useState("");
     const [channel, setChannel] = useState("全部渠道");
     const [model, setModel] = useState("全部模型");
@@ -75,7 +81,7 @@ export function LogsPage() {
         <div className="page-enter">
             <PageTitle
                 title="请求日志"
-                meta={`${formatNumber(logs.length + 128_450)} 条历史记录`}
+                meta={`${formatNumber(logs.length)} 条最近记录`}
             />
 
             <section className="log-stats-strip">
@@ -154,7 +160,11 @@ export function LogsPage() {
                         </tbody>
                     </table>
                 </div>
-                {filteredLogs.length === 0 ? (
+                {isPending ? (
+                    <div className="empty-state"><span className="button-spinner" /><strong>正在读取日志</strong></div>
+                ) : error ? (
+                    <div className="empty-state"><TriangleAlert size={22} /><strong>日志读取失败</strong><span>{errorMessage(error)}</span></div>
+                ) : filteredLogs.length === 0 ? (
                     <div className="empty-state">
                         <Search size={22} />
                         <strong>没有匹配的请求</strong>
