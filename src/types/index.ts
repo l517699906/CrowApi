@@ -67,6 +67,8 @@ export interface UpdateApiKeyInput {
     status: number;
 }
 
+export type RiskLevel = "clean" | "info" | "low" | "medium" | "high" | "critical";
+
 export interface RequestLog {
     id: string;
     seq: number | null;
@@ -85,12 +87,27 @@ export interface RequestLog {
     is_retry: boolean;
     created_at: string;
     request_body: string | null;
-    risk_level: string;
+    risk_level: RiskLevel;
     risk_score: number;
     risk_summary: string | null;
     security_action: string;
     sanitized: boolean;
     blocked_reason: string | null;
+}
+
+export interface RequestSecurityFinding {
+    id: string;
+    log_id: string;
+    phase: string;
+    category: string;
+    rule_id: string;
+    severity: RiskLevel;
+    title: string;
+    description: string | null;
+    location: string | null;
+    evidence_masked: string | null;
+    action: string | null;
+    created_at: string;
 }
 
 export interface GetLogsInput {

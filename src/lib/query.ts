@@ -2,6 +2,7 @@ export const queryKeys = {
     channels: ["channels"] as const,
     apiKeys: ["api-keys"] as const,
     logs: ["logs"] as const,
+    logSecurityFindings: (logId: string) => ["logs", logId, "security-findings"] as const,
     dashboard: ["dashboard"] as const,
     settings: ["settings"] as const,
     serverStatus: ["server-status"] as const,

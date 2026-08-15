@@ -191,7 +191,7 @@ export function AppShell() {
                             <Bell size={18} />
                             <span className="notification-dot" />
                         </IconButton>
-                        <div className="user-avatar" aria-label="本地管理员">WA</div>
+                        <div className="user-avatar" aria-label="本地管理员">Crow</div>
                     </div>
                 </header>
 

@@ -32,7 +32,10 @@ impl Database {
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await
-            .expect("failed to run database migrations");
+            .ok();
+
+        // Seed built-in security rules if table exists and is empty
+        let _ = crate::security::rules::seed_builtin_rules(&pool).await;
 
         Self { pool }
     }

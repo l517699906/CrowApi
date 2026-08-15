@@ -30,7 +30,7 @@ pub async fn start_server(app: AppHandle, state: std::sync::Arc<AppState>) -> Re
     )
     .ok();
 
-    tracing::info!("WaLiAPI server listening on http://{}:{}", host, actual_port);
+    tracing::info!("CrowAPI server listening on http://{}:{}", host, actual_port);
 
     // 启动 Axum 服务（阻塞直到服务器停止）
     axum::serve(listener, router).await?;

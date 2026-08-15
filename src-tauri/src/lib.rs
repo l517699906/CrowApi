@@ -21,7 +21,7 @@ pub struct AppState {
 
 #[tauri::command]
 fn greet(name: &str) -> String {
-    format!("Hello, {}! WaLiAPI 工程已就绪。", name)
+    format!("Hello, {}! CrowAPI 工程已就绪。", name)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -83,9 +83,17 @@ pub fn run() {
             commands::stats::get_dashboard_stats,
             commands::server::get_server_status,
             commands::server::restart_server,
+            commands::security::get_builtin_security_rules,
+            commands::security::update_builtin_security_rule,
+            commands::security::delete_builtin_security_rule,
+            commands::security::reset_builtin_security_rules,
+            commands::security::get_custom_security_rules,
+            commands::security::create_custom_security_rule,
+            commands::security::toggle_custom_security_rule,
+            commands::security::delete_custom_security_rule,
             commands::settings::get_settings,
             commands::settings::save_settings,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running WaLiAPI");
+        .expect("error while running CrowAPI");
 }

@@ -1,19 +1,71 @@
-import { useDeferredValue, useMemo, useState } from "react";
+import { type FormEvent, type KeyboardEvent, useMemo, useState } from "react";
 import {
+    CalendarRange,
     CheckCircle2,
+    ChevronDown,
+    ChevronRight,
     Clock3,
-    Eye,
     FilterX,
     Search,
     ShieldAlert,
     TriangleAlert,
 } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { formatDateTime, formatDuration, formatNumber } from "../lib/format";
-import { logApi } from "../lib/api";
+import { apiKeyApi, channelApi, logApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
-import type { RequestLog } from "../types";
-import { IconButton, Modal, PageTitle, StatusBadge } from "../components/ui";
+import type { GetLogsInput, RequestLog } from "../types";
+import { LogDetailDrawer } from "../components/LogDetailDrawer";
+import { LogRiskBadge } from "../components/LogRiskBadge";
+import { PageTitle, StatusBadge } from "../components/ui";
+
+const PAGE_SIZE = 50;
+
+interface LogFilterState {
+    apiKeyName: string;
+    channelName: string;
+    dateFrom: string;
+    dateTo: string;
+    keyword: string;
+    model: string;
+}
+
+const EMPTY_FILTERS: LogFilterState = {
+    apiKeyName: "",
+    channelName: "",
+    dateFrom: "",
+    dateTo: "",
+    keyword: "",
+    model: "",
+};
+
+function uniqueSorted(values: Array<string | null | undefined>): string[] {
+    return Array.from(new Set(values.filter((value): value is string => Boolean(value))))
+        .sort((left, right) => left.localeCompare(right, "zh-CN"));
+}
+
+function toDateBoundary(value: string, endOfDay: boolean): string | undefined {
+    if (!value) {
+        return undefined;
+    }
+
+    const time = endOfDay ? "23:59:59.999" : "00:00:00.000";
+    const date = new Date(`${value}T${time}`);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function toGetLogsInput(filters: LogFilterState, offset: number): GetLogsInput {
+    return {
+        limit: PAGE_SIZE,
+        offset,
+        ...(filters.keyword ? { keyword: filters.keyword } : {}),
+        ...(filters.apiKeyName ? { api_key_name: filters.apiKeyName } : {}),
+        ...(filters.channelName ? { channel_name: filters.channelName } : {}),
+        ...(filters.model ? { model: filters.model } : {}),
+        ...(filters.dateFrom ? { date_from: toDateBoundary(filters.dateFrom, false) } : {}),
+        ...(filters.dateTo ? { date_to: toDateBoundary(filters.dateTo, true) } : {}),
+    };
+}
 
 function LogStatus({ statusCode }: { statusCode: number }) {
     if (statusCode >= 500) {
@@ -25,197 +77,277 @@ function LogStatus({ statusCode }: { statusCode: number }) {
     return <StatusBadge status="success">{statusCode}</StatusBadge>;
 }
 
-function RiskStatus({ log }: { log: RequestLog }) {
-    if (log.risk_level === "medium") {
-        return <StatusBadge status="warning"><ShieldAlert size={12} />审计</StatusBadge>;
-    }
-    return <span className="text-xs text-subtle">低风险</span>;
-}
-
 export function LogsPage() {
-    const { data: logs = [], isPending, error } = useQuery({
-        queryKey: queryKeys.logs,
-        queryFn: () => logApi.getAll({ limit: 500 }),
-        refetchInterval: 3_000,
-    });
-    const [keyword, setKeyword] = useState("");
-    const [channel, setChannel] = useState("全部渠道");
-    const [model, setModel] = useState("全部模型");
-    const [status, setStatus] = useState("全部状态");
+    const [draftFilters, setDraftFilters] = useState<LogFilterState>(EMPTY_FILTERS);
+    const [appliedFilters, setAppliedFilters] = useState<LogFilterState>(EMPTY_FILTERS);
+    const [filterError, setFilterError] = useState("");
     const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null);
-    const deferredKeyword = useDeferredValue(keyword.trim().toLowerCase());
-    const channels = useMemo(() => Array.from(new Set(logs.map((log) => log.channel_name).filter(Boolean))) as string[], [logs]);
-    const models = useMemo(() => Array.from(new Set(logs.map((log) => log.model))), [logs]);
+    const logsQuery = useInfiniteQuery({
+        queryKey: [...queryKeys.logs, "paged", appliedFilters],
+        queryFn: ({ pageParam }) => logApi.getAll(toGetLogsInput(appliedFilters, pageParam)),
+        initialPageParam: 0,
+        getNextPageParam: (lastPage, pages) => {
+            if (lastPage.length < PAGE_SIZE) {
+                return undefined;
+            }
+            return pages.reduce((count, page) => count + page.length, 0);
+        },
+    });
+    const { data: apiKeys = [] } = useQuery({
+        queryKey: queryKeys.apiKeys,
+        queryFn: apiKeyApi.getAll,
+    });
+    const { data: channels = [] } = useQuery({
+        queryKey: queryKeys.channels,
+        queryFn: channelApi.getAll,
+    });
+    const logs = useMemo(() => logsQuery.data?.pages.flat() ?? [], [logsQuery.data]);
+    const apiKeyOptions = useMemo(() => uniqueSorted([
+        ...apiKeys.map((apiKey) => apiKey.name),
+        ...logs.map((log) => log.api_key_name),
+    ]), [apiKeys, logs]);
+    const channelOptions = useMemo(() => uniqueSorted([
+        ...channels.map((channel) => channel.name),
+        ...logs.map((log) => log.channel_name),
+    ]), [channels, logs]);
+    const modelOptions = useMemo(() => uniqueSorted([
+        ...channels.flatMap((channel) => channel.models),
+        ...logs.flatMap((log) => [log.model, log.upstream_model]),
+    ]), [channels, logs]);
+    const metrics = useMemo(() => {
+        const totals = logs.reduce((result, log) => {
+            result.latency += log.duration_ms;
+            result.failures += log.status_code >= 400 ? 1 : 0;
+            result.audited += log.risk_level === "clean" ? 0 : 1;
+            return result;
+        }, { latency: 0, failures: 0, audited: 0 });
 
-    const filteredLogs = useMemo(() => logs.filter((log) => {
-        const matchesKeyword = !deferredKeyword || [
-            log.api_key_name,
-            log.channel_name,
-            log.model,
-            log.error_message,
-            log.seq?.toString(),
-        ].some((value) => value?.toLowerCase().includes(deferredKeyword));
-        const matchesChannel = channel === "全部渠道" || log.channel_name === channel;
-        const matchesModel = model === "全部模型" || log.model === model;
-        const matchesStatus = status === "全部状态"
-            || (status === "成功" && log.status_code < 400)
-            || (status === "失败" && log.status_code >= 400);
-        return matchesKeyword && matchesChannel && matchesModel && matchesStatus;
-    }), [channel, deferredKeyword, logs, model, status]);
+        return {
+            ...totals,
+            averageLatency: logs.length > 0 ? Math.round(totals.latency / logs.length) : 0,
+            successRate: logs.length > 0 ? (1 - totals.failures / logs.length) * 100 : null,
+        };
+    }, [logs]);
+    const hasDraftFilters = Object.values(draftFilters).some(Boolean);
+    const loadedPageCount = logs.length > 0 ? Math.ceil(logs.length / PAGE_SIZE) : 0;
 
-    const failures = logs.filter((log) => log.status_code >= 400).length;
-    const avgLatency = logs.length > 0
-        ? Math.round(logs.reduce((sum, log) => sum + log.duration_ms, 0) / logs.length)
-        : 0;
-    const successRate = logs.length > 0 ? (1 - failures / logs.length) * 100 : 100;
-    const hasFilters = keyword || channel !== "全部渠道" || model !== "全部模型" || status !== "全部状态";
+    const updateDraftFilter = <Key extends keyof LogFilterState>(key: Key, value: LogFilterState[Key]) => {
+        setDraftFilters((current) => ({ ...current, [key]: value }));
+        if (key === "dateFrom" || key === "dateTo") {
+            setFilterError("");
+        }
+    };
+
+    const applyFilters = (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        if (draftFilters.dateFrom && draftFilters.dateTo && draftFilters.dateFrom > draftFilters.dateTo) {
+            setFilterError("开始日期不能晚于结束日期");
+            return;
+        }
+
+        const nextFilters = { ...draftFilters, keyword: draftFilters.keyword.trim() };
+        setFilterError("");
+        setSelectedLog(null);
+        if (JSON.stringify(nextFilters) === JSON.stringify(appliedFilters)) {
+            void logsQuery.refetch();
+            return;
+        }
+        setAppliedFilters(nextFilters);
+    };
 
     const resetFilters = () => {
-        setKeyword("");
-        setChannel("全部渠道");
-        setModel("全部模型");
-        setStatus("全部状态");
+        setDraftFilters(EMPTY_FILTERS);
+        setFilterError("");
+        setSelectedLog(null);
+        if (JSON.stringify(appliedFilters) === JSON.stringify(EMPTY_FILTERS)) {
+            void logsQuery.refetch();
+        } else {
+            setAppliedFilters(EMPTY_FILTERS);
+        }
+    };
+
+    const openLogFromKeyboard = (event: KeyboardEvent<HTMLTableRowElement>, log: RequestLog) => {
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setSelectedLog(log);
+        }
     };
 
     return (
         <div className="page-enter">
             <PageTitle
                 title="请求日志"
-                meta={`${formatNumber(logs.length)} 条最近记录`}
+                meta={`已加载 ${formatNumber(logs.length)} 条 · 每页 ${PAGE_SIZE} 条`}
             />
 
-            <section className="log-stats-strip">
-                <div><CheckCircle2 size={17} className="text-accent" /><span>成功率</span><strong>{successRate.toFixed(1)}%</strong></div>
-                <div><Clock3 size={17} className="text-data-blue" /><span>平均延迟</span><strong>{formatDuration(avgLatency)}</strong></div>
-                <div><TriangleAlert size={17} className="text-warning" /><span>失败请求</span><strong>{failures}</strong></div>
-                <div><ShieldAlert size={17} className="text-coral" /><span>安全审计</span><strong>{logs.filter((log) => log.security_action === "audit").length}</strong></div>
-            </section>
-
-            <section className="toolbar-row mt-4">
+            <form className="toolbar-row log-filter-bar" onSubmit={applyFilters}>
                 <label className="search-field log-search">
+                    <span className="sr-only">关键词</span>
                     <Search size={16} />
-                    <input value={keyword} placeholder="搜索请求 ID、渠道、模型" onChange={(event) => setKeyword(event.target.value)} />
+                    <input
+                        value={draftFilters.keyword}
+                        placeholder="搜索请求 ID、密钥、渠道或模型"
+                        onChange={(event) => updateDraftFilter("keyword", event.target.value)}
+                    />
                 </label>
-                <select className="filter-select" aria-label="按渠道筛选" value={channel} onChange={(event) => setChannel(event.target.value)}>
-                    <option>全部渠道</option>
-                    {channels.map((item) => <option key={item}>{item}</option>)}
+                <select
+                    className="filter-select"
+                    aria-label="按密钥筛选"
+                    value={draftFilters.apiKeyName}
+                    onChange={(event) => updateDraftFilter("apiKeyName", event.target.value)}
+                >
+                    <option value="">全部密钥</option>
+                    {apiKeyOptions.map((item) => <option key={item} value={item}>{item}</option>)}
                 </select>
-                <select className="filter-select" aria-label="按模型筛选" value={model} onChange={(event) => setModel(event.target.value)}>
-                    <option>全部模型</option>
-                    {models.map((item) => <option key={item}>{item}</option>)}
+                <select
+                    className="filter-select"
+                    aria-label="按渠道筛选"
+                    value={draftFilters.channelName}
+                    onChange={(event) => updateDraftFilter("channelName", event.target.value)}
+                >
+                    <option value="">全部渠道</option>
+                    {channelOptions.map((item) => <option key={item} value={item}>{item}</option>)}
                 </select>
-                <select className="filter-select" aria-label="按状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}>
-                    <option>全部状态</option>
-                    <option>成功</option>
-                    <option>失败</option>
+                <select
+                    className="filter-select"
+                    aria-label="按模型筛选"
+                    value={draftFilters.model}
+                    onChange={(event) => updateDraftFilter("model", event.target.value)}
+                >
+                    <option value="">全部模型</option>
+                    {modelOptions.map((item) => <option key={item} value={item}>{item}</option>)}
                 </select>
-                {hasFilters ? (
-                    <button type="button" className="button-ghost" onClick={resetFilters}><FilterX size={15} />清除</button>
+                <div className="date-range-filter" role="group" aria-label="日期范围">
+                    <CalendarRange size={15} />
+                    <label>
+                        <span className="sr-only">开始日期</span>
+                        <input
+                            type="date"
+                            value={draftFilters.dateFrom}
+                            max={draftFilters.dateTo || undefined}
+                            onChange={(event) => updateDraftFilter("dateFrom", event.target.value)}
+                        />
+                    </label>
+                    <span aria-hidden="true">至</span>
+                    <label>
+                        <span className="sr-only">结束日期</span>
+                        <input
+                            type="date"
+                            value={draftFilters.dateTo}
+                            min={draftFilters.dateFrom || undefined}
+                            onChange={(event) => updateDraftFilter("dateTo", event.target.value)}
+                        />
+                    </label>
+                </div>
+                <button type="submit" className="button-primary log-query-button">
+                    {logsQuery.isFetching && !logsQuery.isFetchingNextPage ? <span className="button-spinner is-inverse" /> : <Search size={15} />}
+                    查询
+                </button>
+                {hasDraftFilters ? (
+                    <button type="button" className="button-ghost" onClick={resetFilters}>
+                        <FilterX size={15} />清除
+                    </button>
                 ) : null}
+            </form>
+            {filterError ? <p className="filter-error" role="alert">{filterError}</p> : null}
+
+            <section className="log-stats-strip mt-4" aria-label="已加载日志概览">
+                <div><CheckCircle2 size={17} className="text-accent" /><span>成功率</span><strong>{metrics.successRate === null ? "--" : `${metrics.successRate.toFixed(1)}%`}</strong></div>
+                <div><Clock3 size={17} className="text-data-blue" /><span>平均延迟</span><strong>{formatDuration(metrics.averageLatency)}</strong></div>
+                <div><TriangleAlert size={17} className="text-warning" /><span>失败请求</span><strong>{metrics.failures}</strong></div>
+                <div><ShieldAlert size={17} className="text-coral" /><span>安全审计</span><strong>{metrics.audited}</strong></div>
             </section>
 
             <section className="panel mt-4 min-w-0">
                 <div className="panel-header panel-header-compact">
-                    <p className="text-xs text-muted">显示 {filteredLogs.length} 条</p>
-                    <span className="flex items-center gap-1.5 text-xs text-muted"><span className="live-dot" />实时记录</span>
+                    <p className="text-xs text-muted">已加载 {formatNumber(logs.length)} 条 · {loadedPageCount} 页</p>
+                    <span className="flex items-center gap-1.5 text-xs text-muted"><span className="live-dot" />最新请求优先</span>
                 </div>
                 <div className="table-scroll">
-                    <table className="data-table log-table min-w-[980px]">
+                    <table className="data-table log-table min-w-[840px]">
                         <thead>
                             <tr>
-                                <th>请求</th>
+                                <th>序号</th>
                                 <th>时间</th>
+                                <th>密钥名</th>
+                                <th>渠道名</th>
                                 <th>模型</th>
-                                <th>渠道 / 密钥</th>
-                                <th>状态</th>
                                 <th>Token</th>
                                 <th>延迟</th>
-                                <th>安全</th>
-                                <th aria-label="详情" />
+                                <th>状态码</th>
+                                <th>安全等级</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {filteredLogs.map((log) => (
-                                <tr key={log.id}>
-                                    <td className="font-mono text-xs font-semibold text-ink">#{log.seq}</td>
+                            {logs.map((log) => (
+                                <tr
+                                    key={log.id}
+                                    className="log-row"
+                                    tabIndex={0}
+                                    aria-haspopup="dialog"
+                                    aria-label={`查看请求 ${log.seq ?? log.id} 详情`}
+                                    onClick={() => setSelectedLog(log)}
+                                    onKeyDown={(event) => openLogFromKeyboard(event, log)}
+                                >
+                                    <td className="font-mono text-xs font-semibold text-ink">{log.seq === null ? "--" : `#${log.seq}`}</td>
                                     <td className="font-mono text-[11px] text-muted">{formatDateTime(log.created_at)}</td>
+                                    <td className="text-xs text-ink">{log.api_key_name ?? "未识别"}</td>
+                                    <td className="text-xs text-ink">{log.channel_name ?? "未路由"}</td>
                                     <td>
                                         <span className="model-name">{log.model}</span>
                                         {log.is_stream ? <span className="ml-1.5 text-[10px] text-subtle">STREAM</span> : null}
                                     </td>
                                     <td>
-                                        <p className="text-xs text-ink">{log.channel_name}</p>
-                                        <p className="mt-0.5 text-[11px] text-subtle">{log.api_key_name}</p>
+                                        <span className="log-token-pair">
+                                            <span>{formatNumber(log.prompt_tokens)}</span>
+                                            <b>+</b>
+                                            <span>{formatNumber(log.completion_tokens)}</span>
+                                        </span>
                                     </td>
+                                    <td className="font-mono text-xs text-ink">{formatDuration(log.duration_ms)}</td>
                                     <td>
                                         <LogStatus statusCode={log.status_code} />
                                         {log.is_retry ? <span className="ml-1.5 text-[10px] text-warning">重试</span> : null}
                                     </td>
-                                    <td className="font-mono text-xs text-ink">{formatNumber(log.total_tokens)}</td>
-                                    <td className="font-mono text-xs text-ink">{formatDuration(log.duration_ms)}</td>
-                                    <td><RiskStatus log={log} /></td>
-                                    <td><IconButton label={`查看请求 ${log.seq}`} onClick={() => setSelectedLog(log)}><Eye size={16} /></IconButton></td>
+                                    <td>
+                                        <span className="log-risk-cell">
+                                            <LogRiskBadge level={log.risk_level} />
+                                            <ChevronRight size={15} aria-hidden="true" />
+                                        </span>
+                                    </td>
                                 </tr>
                             ))}
                         </tbody>
                     </table>
                 </div>
-                {isPending ? (
+                {logsQuery.isPending ? (
                     <div className="empty-state"><span className="button-spinner" /><strong>正在读取日志</strong></div>
-                ) : error ? (
-                    <div className="empty-state"><TriangleAlert size={22} /><strong>日志读取失败</strong><span>{errorMessage(error)}</span></div>
-                ) : filteredLogs.length === 0 ? (
+                ) : logsQuery.error && logs.length === 0 ? (
+                    <div className="empty-state"><TriangleAlert size={22} /><strong>日志读取失败</strong><span>{errorMessage(logsQuery.error)}</span></div>
+                ) : logs.length === 0 ? (
                     <div className="empty-state">
                         <Search size={22} />
                         <strong>没有匹配的请求</strong>
-                        <span>调整筛选条件后再试</span>
+                        <span>调整筛选条件后重新查询</span>
                     </div>
-                ) : null}
+                ) : (
+                    <footer className="log-pagination">
+                        <span>每次加载 {PAGE_SIZE} 条，当前共 {formatNumber(logs.length)} 条</span>
+                        {logsQuery.isFetchNextPageError ? <span className="text-danger">{errorMessage(logsQuery.error)}</span> : null}
+                        <button
+                            type="button"
+                            className="button-secondary"
+                            disabled={!logsQuery.hasNextPage || logsQuery.isFetchingNextPage}
+                            onClick={() => void logsQuery.fetchNextPage()}
+                        >
+                            {logsQuery.isFetchingNextPage ? <span className="button-spinner" /> : <ChevronDown size={15} />}
+                            {logsQuery.isFetchingNextPage ? "加载中" : logsQuery.hasNextPage ? "加载更多" : "已加载全部"}
+                        </button>
+                    </footer>
+                )}
             </section>
 
-            {selectedLog ? (
-                <Modal
-                    title={`请求 #${selectedLog.seq}`}
-                    description={formatDateTime(selectedLog.created_at)}
-                    size="lg"
-                    onClose={() => setSelectedLog(null)}
-                    footer={<button type="button" className="button-secondary" onClick={() => setSelectedLog(null)}>关闭</button>}
-                >
-                    <div className="log-detail-grid">
-                        <div><span>模型</span><strong>{selectedLog.model}</strong></div>
-                        <div><span>上游渠道</span><strong>{selectedLog.channel_name}</strong></div>
-                        <div><span>状态</span><strong><LogStatus statusCode={selectedLog.status_code} /></strong></div>
-                        <div><span>延迟</span><strong>{formatDuration(selectedLog.duration_ms)}</strong></div>
-                        <div><span>输入 Token</span><strong>{formatNumber(selectedLog.prompt_tokens)}</strong></div>
-                        <div><span>输出 Token</span><strong>{formatNumber(selectedLog.completion_tokens)}</strong></div>
-                    </div>
-                    {selectedLog.error_message ? (
-                        <div className="log-error-box" role="alert">
-                            <TriangleAlert size={17} />
-                            <span>{selectedLog.error_message}</span>
-                        </div>
-                    ) : null}
-                    <div className="mt-5">
-                        <div className="mb-2 flex items-center justify-between">
-                            <h3 className="text-sm font-semibold text-ink">请求体</h3>
-                            <span className="font-mono text-[10px] text-subtle">application/json</span>
-                        </div>
-                        <pre className="request-code">{selectedLog.request_body ?? "请求体未保留"}</pre>
-                    </div>
-                    <div className="mt-5 border-t border-line pt-5">
-                        <h3 className="mb-3 text-sm font-semibold text-ink">安全扫描</h3>
-                        <div className="flex flex-wrap gap-2">
-                            <StatusBadge status={selectedLog.risk_level === "medium" ? "warning" : "success"}>
-                                风险分 {selectedLog.risk_score}
-                            </StatusBadge>
-                            <StatusBadge status={selectedLog.sanitized ? "info" : "neutral"}>
-                                {selectedLog.sanitized ? "已脱敏" : "无需脱敏"}
-                            </StatusBadge>
-                            <StatusBadge status="neutral">{selectedLog.security_action}</StatusBadge>
-                        </div>
-                    </div>
-                </Modal>
-            ) : null}
+            {selectedLog ? <LogDetailDrawer log={selectedLog} onClose={() => setSelectedLog(null)} /> : null}
         </div>
     );
 }

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Channel, CreateChannelInput, UpdateChannelInput, TestChannelResult,
-    ApiKey, CreateApiKeyInput, UpdateApiKeyInput, RequestLog, LogStats, DashboardStats, Settings,
-    GetLogsInput, ServerStatus } from "../types";
+    ApiKey, CreateApiKeyInput, UpdateApiKeyInput, RequestLog, RequestSecurityFinding, LogStats,
+    DashboardStats, Settings, GetLogsInput, ServerStatus } from "../types";
 
 // 渠道管理 API
 export const channelApi = {
@@ -26,6 +26,7 @@ export const apiKeyApi = {
 export const logApi = {
     getAll: (input?: GetLogsInput) => invoke<RequestLog[]>("get_logs", { input: input || {} }),
     get: (id: string) => invoke<RequestLog>("get_log", { id }),
+    getSecurityFindings: (logId: string) => invoke<RequestSecurityFinding[]>("get_log_security_findings", { logId }),
     delete: (id: string) => invoke<void>("delete_log", { id }),
     getStats: (days?: number) => invoke<LogStats[]>("get_log_stats", { days }),
 };

@@ -24,7 +24,7 @@ fn redact_value_in_place(value: &mut serde_json::Value) {
         }
         serde_json::Value::Object(map) => {
             for (k, v) in map.iter_mut() {
-                // Also check if the key itself indicates a secret field
+                // 键名敏感的直接打码整个值
                 let lower_key = k.to_ascii_lowercase();
                 if is_secret_field(&lower_key) {
                     if let Some(s) = v.as_str() {
@@ -42,7 +42,7 @@ fn redact_value_in_place(value: &mut serde_json::Value) {
 
 fn redact_string(s: &str) -> String {
     let mut result = s.to_string();
-    // Redact API keys
+    // 脱敏各类 API key（前缀匹配模式）
     result = redact_pattern(&result, |t| {
         (t.starts_with("sk-") && t.len() >= 24)
             || (t.starts_with("sk-ant-") && t.len() >= 30)
@@ -52,11 +52,11 @@ fn redact_string(s: &str) -> String {
             || (t.starts_with("AKIA") && t.len() >= 16)
             || (t.starts_with("AIza") && t.len() >= 20)
     });
-    // Redact JWT
+    // 脱敏 JWT
     result = redact_pattern(&result, |t| {
         t.starts_with("eyJ") && t.len() >= 30 && t.contains('.')
     });
-    // Redact Bearer tokens
+    // 脱敏 Bearer tokens（保留前2字符示意）
     let lower = result.to_ascii_lowercase();
     if lower.contains("bearer ") {
         // Replace "Bearer xxx" with "Bearer [REDACTED]"
@@ -92,7 +92,7 @@ fn redact_string(s: &str) -> String {
         }
         result = out;
     }
-    // Redact private keys
+    // 脱敏私钥
     if result.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
         || result.contains("-----BEGIN RSA PRIVATE KEY-----")
         || result.contains("-----BEGIN PRIVATE KEY-----")
@@ -128,6 +128,7 @@ fn redact_string(s: &str) -> String {
     result
 }
 
+// 通用模式脱敏：按分隔符切词，命中模式的词全部替换成 mask
 fn redact_pattern<F>(text: &str, matcher: F) -> String
 where
     F: Fn(&str) -> bool,
@@ -164,11 +165,13 @@ fn mask_string(s: &str) -> String {
     if chars.len() <= 8 {
         return "****".to_string();
     }
+    // 保留头4尾4：sk-1****cdef
     let prefix: String = chars.iter().take(4).collect();
     let suffix: String = chars.iter().rev().take(4).copied().collect::<Vec<_>>().iter().rev().copied().collect();
     format!("{}****{}", prefix, suffix)
 }
 
+// 敏感键名列表
 fn is_secret_field(key: &str) -> bool {
     matches!(
         key,

@@ -30,7 +30,7 @@ function createId(prefix: string): string {
     return `${prefix}-${randomPart}`;
 }
 
-function createWaliApiKey(): string {
+function createCrowApiKey(): string {
     const bytes = crypto.getRandomValues(new Uint8Array(18));
     const suffix = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
     return `sk-crowapi-${suffix}`;
@@ -82,7 +82,7 @@ export const useGatewayStore = create<GatewayState>()(
                 const apiKey: ApiKey = {
                     ...input,
                     id: createId("key"),
-                    key: createWaliApiKey(),
+                    key: createCrowApiKey(),
                     status: 1,
                     quota_used: 0,
                     created_at: now,
