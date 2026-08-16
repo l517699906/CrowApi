@@ -1,27 +1,26 @@
-mod adaptor;
 mod config;
-
-use tauri::Manager;
 mod commands;
 mod core;
-mod db;
-mod security;
+mod adaptor;
 mod server;
+mod db;
 mod utils;
+mod security;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, RunEvent,
+};
+use tauri_plugin_store::StoreExt;
 
 pub struct AppState {
     pub db: Arc<db::Database>,
     pub server_port: Arc<RwLock<u16>>,
     pub server_running: Arc<std::sync::atomic::AtomicBool>,
     pub server_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-}
-
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! CrowAPI 工程已就绪。", name)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -34,10 +33,70 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_sql::Builder::default()
+                .add_migrations(
+                    "sqlite:crowapi.db",
+                    vec![tauri_plugin_sql::Migration {
+                        version: 1,
+                        description: "init database",
+                        sql: include_str!("../migrations/001_init.sql"),
+                        kind: tauri_plugin_sql::MigrationKind::Up,
+                    }],
+                )
+                .build(),
+        )
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None::<Vec<&str>>,
+        ))
         .setup(|app| {
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let show_item = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .tooltip("CrowAPI - Local LLM API Gateway")
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let _ = restore_main_window(tray.app_handle());
+                    }
+                })
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => app.exit(0),
+                    "show" => {
+                        let _ = restore_main_window(app);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                let app_handle = app.handle().clone();
+                window.on_window_event(move |event| match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        if should_close_to_tray(&app_handle) {
+                            api.prevent_close();
+                            if let Some(main_window) = app_handle.get_webview_window("main") {
+                                let _ = main_window.hide();
+                            }
+                        }
+                    }
+                    _ => {}
+                });
+            }
+
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
                 let db = db::Database::new(&app_handle).await;
@@ -49,19 +108,15 @@ pub fn run() {
                 });
                 app_handle.manage(state.clone());
 
-                let server_app = app_handle.clone();
-                let server_state = state.clone();
-                let server_handle = tokio::spawn(async move {
-                    if let Err(error) = server::start_server(server_app, server_state).await {
-                        tracing::error!("CrowAPI server stopped: {}", error);
-                    }
+                let handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = server::start_server(handle, state).await;
                 });
-                *state.server_handle.write().await = Some(server_handle);
             });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             commands::channel::get_channels,
             commands::channel::get_channel,
             commands::channel::create_channel,
@@ -81,6 +136,10 @@ pub fn run() {
             commands::log::delete_all_logs,
             commands::log::get_log_stats,
             commands::stats::get_dashboard_stats,
+            commands::settings::get_settings,
+            commands::settings::save_settings,
+            commands::settings::apply_theme,
+            commands::settings::set_auto_start,
             commands::server::get_server_status,
             commands::server::restart_server,
             commands::security::get_builtin_security_rules,
@@ -91,9 +150,46 @@ pub fn run() {
             commands::security::create_custom_security_rule,
             commands::security::toggle_custom_security_rule,
             commands::security::delete_custom_security_rule,
-            commands::settings::get_settings,
-            commands::settings::save_settings,
+            commands::import_export::export_channels,
+            commands::import_export::import_walicode_backup,
+            commands::import_export::import_crowapi_export,
+            commands::import_export::scan_local_ai_configs,
+            commands::import_export::import_scanned_sources,
+            commands::import_export::pick_import_file,
+            commands::import_export::save_export_file,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running CrowAPI");
+        .build(tauri::generate_context!())
+        .expect("error while building CrowAPI")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            {
+                if let RunEvent::Reopen { .. } = event {
+                    let _ = restore_main_window(app);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app, &event);
+            }
+        });
+}
+
+fn restore_main_window(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = app.show();
+        }
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
+fn should_close_to_tray(app: &tauri::AppHandle) -> bool {
+    app.store("settings.json")
+        .ok()
+        .and_then(|store| store.get("general.close_to_tray").and_then(|v| v.as_bool()))
+        .unwrap_or(true)
 }
