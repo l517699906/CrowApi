@@ -119,6 +119,7 @@ export interface GetLogsInput {
     date_to?: string;
     limit?: number;
     offset?: number;
+    after_seq?: number;
 }
 
 export interface LogStats {

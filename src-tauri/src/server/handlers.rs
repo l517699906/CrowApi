@@ -172,9 +172,13 @@ async fn handle_stream(
             sanitized: if security_result.sanitized { 1 } else { 0 },
             blocked_reason: security_result.blocked_reason.clone(),
         };
-        let log_id = log.id.clone();
-        let _ = repo.create_log(&log).await;
-        let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+        let _ = crate::core::log_events::persist_log(
+            repo.as_ref(),
+            &shared.app,
+            &log,
+            &security_result.findings,
+            security_result.action.as_str(),
+        ).await;
         let err_body = serde_json::json!({"error": {"message": security_result.summary, "type": "security_blocked", "code": "security.blocked"}});
         return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
     }
@@ -241,6 +245,7 @@ async fn handle_stream(
                 let upstream_model_clone = upstream_model.clone();
                 let request_body_clone = request_body.clone();
                 let security_result_clone = security_result.clone();
+                let app_for_log = shared.app.clone();
                 let is_retry = if attempt > 0 { 1 } else { 0 };
 
                 // ── 核心：字节透传 + 旁路解析 ──────────────────
@@ -314,9 +319,13 @@ async fn handle_stream(
                         sanitized: if security_result_clone.sanitized { 1 } else { 0 },
                         blocked_reason: security_result_clone.blocked_reason.clone(),
                     };
-                    let log_id = log.id.clone();
-                    let _ = repo_clone.create_log(&log).await;
-                    let _ = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await;
+                    let _ = crate::core::log_events::persist_log(
+                        repo_clone.as_ref(),
+                        &app_for_log,
+                        &log,
+                        &security_result_clone.findings,
+                        security_result_clone.action.as_str(),
+                    ).await;
 
                     // Increment quota if we got token counts
                     if quota_to_add > 0 {
@@ -363,9 +372,13 @@ async fn handle_stream(
                     sanitized: if security_result.sanitized { 1 } else { 0 },
                     blocked_reason: security_result.blocked_reason.clone(),
                 };
-                let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                let _ = crate::core::log_events::persist_log(
+                    repo.as_ref(),
+                    &shared.app,
+                    &log,
+                    &security_result.findings,
+                    security_result.action.as_str(),
+                ).await;
                 last_error = Some(format!("{}: {}", channel.name, error_message));
             }
         }

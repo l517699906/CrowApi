@@ -21,6 +21,7 @@ pub struct AppState {
     pub server_port: Arc<RwLock<u16>>,
     pub server_running: Arc<std::sync::atomic::AtomicBool>,
     pub server_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    pub log_events: Arc<core::log_events::LogEventState>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -105,8 +106,10 @@ pub fn run() {
                     server_port: Arc::new(RwLock::new(0)),
                     server_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     server_handle: Arc::new(RwLock::new(None)),
+                    log_events: Arc::new(core::log_events::LogEventState::default()),
                 });
                 app_handle.manage(state.clone());
+                state.log_events.clone().spawn(app_handle.clone());
 
                 let handle = app_handle.clone();
                 tauri::async_runtime::spawn(async move {

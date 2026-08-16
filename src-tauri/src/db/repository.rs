@@ -218,8 +218,8 @@ impl Repository {
 
     // ==================== Request Log ====================
 
-    pub async fn create_log(&self, log: &RequestLog) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    pub async fn create_log(&self, log: &RequestLog) -> Result<i64, sqlx::Error> {
+        let result = sqlx::query(
             "INSERT INTO request_logs (id, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
@@ -249,7 +249,7 @@ impl Repository {
         .bind(&log.blocked_reason)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.last_insert_rowid())
     }
 
     pub async fn create_security_findings(&self, log_id: &str, findings: &[crate::security::SecurityFinding], action: &str) -> Result<(), sqlx::Error> {
@@ -324,6 +324,17 @@ impl Repository {
         .await
     }
 
+    pub async fn get_logs_after(&self, after_seq: i64, limit: i64) -> Result<Vec<RequestLog>, sqlx::Error> {
+        let query = format!(
+            "SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE request_logs.rowid > ? ORDER BY request_logs.rowid ASC LIMIT ?"
+        );
+        sqlx::query_as::<_, RequestLog>(&query)
+            .bind(after_seq)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+    }
+
     pub async fn search_logs(
         &self,
         keyword: Option<&str>,
@@ -376,6 +387,62 @@ impl Repository {
         q.push(" ORDER BY created_at DESC LIMIT ").push_bind(limit);
         q.push(" OFFSET ").push_bind(offset);
 
+        q.build_query_as::<RequestLog>().fetch_all(&self.pool).await
+    }
+
+    pub async fn search_logs_after(
+        &self,
+        keyword: Option<&str>,
+        api_key_name: Option<&str>,
+        channel_name: Option<&str>,
+        model: Option<&str>,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<RequestLog>, sqlx::Error> {
+        let mut q = sqlx::QueryBuilder::new(format!(
+            "SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE request_logs.rowid > "
+        ));
+        q.push_bind(after_seq);
+
+        if let Some(kw) = keyword {
+            let pattern = format!("%{}%", kw);
+            q.push(" AND (api_key_name LIKE ").push_bind(pattern.clone());
+            q.push(" OR channel_name LIKE ").push_bind(pattern.clone());
+            q.push(" OR model LIKE ").push_bind(pattern.clone());
+            q.push(" OR upstream_model LIKE ").push_bind(pattern.clone());
+            q.push(" OR api_key_id LIKE ").push_bind(pattern.clone());
+            q.push(" OR id LIKE ").push_bind(pattern);
+            q.push(")");
+        }
+
+        if let Some(name) = api_key_name {
+            let pattern = format!("%{}%", name);
+            q.push(" AND api_key_name LIKE ").push_bind(pattern);
+        }
+
+        if let Some(name) = channel_name {
+            let pattern = format!("%{}%", name);
+            q.push(" AND channel_name LIKE ").push_bind(pattern);
+        }
+
+        if let Some(m) = model {
+            let pattern = format!("%{}%", m);
+            q.push(" AND (model LIKE ").push_bind(pattern.clone());
+            q.push(" OR upstream_model LIKE ").push_bind(pattern);
+            q.push(")");
+        }
+
+        if let Some(from) = date_from {
+            q.push(" AND created_at >= ").push_bind(from);
+        }
+
+        if let Some(to) = date_to {
+            q.push(" AND created_at <= ").push_bind(to);
+        }
+
+        q.push(" ORDER BY request_logs.rowid ASC LIMIT ").push_bind(limit);
         q.build_query_as::<RequestLog>().fetch_all(&self.pool).await
     }
 
@@ -559,6 +626,23 @@ mod tests {
             .await?;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].seq, Some(1));
+
+        let mut next_log = log.clone();
+        next_log.id = "request-2".to_string();
+        next_log.status_code = 500;
+        next_log.created_at = "2026-08-15T08:13:27.293Z".to_string();
+        repo.create_log(&next_log).await?;
+
+        let delta = repo.get_logs_after(1, 10).await?;
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].id, "request-2");
+        assert_eq!(delta[0].seq, Some(2));
+
+        let filtered_delta = repo
+            .search_logs_after(Some("request-2"), None, None, None, None, None, 1, 10)
+            .await?;
+        assert_eq!(filtered_delta.len(), 1);
+        assert_eq!(filtered_delta[0].id, "request-2");
 
         Ok(())
     }

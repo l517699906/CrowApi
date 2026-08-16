@@ -1,4 +1,4 @@
-import { type FormEvent, type KeyboardEvent, useMemo, useState } from "react";
+import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
     CalendarRange,
     CheckCircle2,
@@ -10,7 +10,8 @@ import {
     ShieldAlert,
     TriangleAlert,
 } from "lucide-react";
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { listen } from "@tauri-apps/api/event";
 import { formatDateTime, formatDuration, formatNumber } from "../lib/format";
 import { apiKeyApi, channelApi, logApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
@@ -20,6 +21,16 @@ import { LogRiskBadge } from "../components/LogRiskBadge";
 import { PageTitle, StatusBadge } from "../components/ui";
 
 const PAGE_SIZE = 50;
+const LIVE_BATCH_SIZE = 200;
+const MAX_LIVE_BATCHES_PER_SYNC = 5;
+const LIVE_SYNC_DELAY_MS = 200;
+const LOG_CHANGED_EVENT = "request-logs-changed";
+
+interface LogChangedEvent {
+    latest_seq: number;
+    pending: number;
+    reset: boolean;
+}
 
 interface LogFilterState {
     apiKeyName: string;
@@ -54,16 +65,42 @@ function toDateBoundary(value: string, endOfDay: boolean): string | undefined {
     return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
 }
 
-function toGetLogsInput(filters: LogFilterState, offset: number): GetLogsInput {
+function toGetLogsInput(filters: LogFilterState, offset?: number): GetLogsInput {
     return {
         limit: PAGE_SIZE,
-        offset,
+        ...(offset === undefined ? {} : { offset }),
         ...(filters.keyword ? { keyword: filters.keyword } : {}),
         ...(filters.apiKeyName ? { api_key_name: filters.apiKeyName } : {}),
         ...(filters.channelName ? { channel_name: filters.channelName } : {}),
         ...(filters.model ? { model: filters.model } : {}),
         ...(filters.dateFrom ? { date_from: toDateBoundary(filters.dateFrom, false) } : {}),
         ...(filters.dateTo ? { date_to: toDateBoundary(filters.dateTo, true) } : {}),
+    };
+}
+
+type LogsQueryData = InfiniteData<RequestLog[], number>;
+
+function maxLogSeq(logs: RequestLog[]): number {
+    return logs.reduce((max, log) => Math.max(max, log.seq ?? 0), 0);
+}
+
+function mergeLiveLogs(data: LogsQueryData, incoming: RequestLog[]): LogsQueryData {
+    if (incoming.length === 0 || data.pages.length === 0) {
+        return data;
+    }
+
+    const existingIds = new Set(data.pages.flatMap((page) => page.map((log) => log.id)));
+    const fresh = incoming
+        .filter((log) => !existingIds.has(log.id))
+        .sort((left, right) => (right.seq ?? 0) - (left.seq ?? 0));
+
+    if (fresh.length === 0) {
+        return data;
+    }
+
+    return {
+        ...data,
+        pages: [[...fresh, ...data.pages[0]], ...data.pages.slice(1)],
     };
 }
 
@@ -82,8 +119,23 @@ export function LogsPage() {
     const [appliedFilters, setAppliedFilters] = useState<LogFilterState>(EMPTY_FILTERS);
     const [filterError, setFilterError] = useState("");
     const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null);
+    const [pendingLiveLogs, setPendingLiveLogs] = useState(0);
+    const queryClient = useQueryClient();
+    const logsQueryKey = useMemo(
+        () => [...queryKeys.logs, "paged", appliedFilters] as const,
+        [appliedFilters],
+    );
+    const logsQueryKeyRef = useRef(logsQueryKey);
+    const syncedSeqRef = useRef(0);
+    const targetSeqRef = useRef(0);
+    const liveSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const liveSyncingRef = useRef(false);
+    const liveSyncAgainRef = useRef(false);
+    const queueLiveSyncRef = useRef<() => void>(() => undefined);
+    logsQueryKeyRef.current = logsQueryKey;
+
     const logsQuery = useInfiniteQuery({
-        queryKey: [...queryKeys.logs, "paged", appliedFilters],
+        queryKey: logsQueryKey,
         queryFn: ({ pageParam }) => logApi.getAll(toGetLogsInput(appliedFilters, pageParam)),
         initialPageParam: 0,
         getNextPageParam: (lastPage, pages) => {
@@ -130,6 +182,151 @@ export function LogsPage() {
     }, [logs]);
     const hasDraftFilters = Object.values(draftFilters).some(Boolean);
     const loadedPageCount = logs.length > 0 ? Math.ceil(logs.length / PAGE_SIZE) : 0;
+
+    const syncLiveLogs = useCallback(async () => {
+        if (liveSyncingRef.current) {
+            liveSyncAgainRef.current = true;
+            return;
+        }
+
+        const queryData = queryClient.getQueryData<LogsQueryData>(logsQueryKey);
+        if (!queryData) {
+            liveSyncAgainRef.current = true;
+            return;
+        }
+
+        const target = targetSeqRef.current;
+        if (target <= syncedSeqRef.current) {
+            setPendingLiveLogs(0);
+            return;
+        }
+
+        liveSyncingRef.current = true;
+        let failed = false;
+        try {
+            let cursor = syncedSeqRef.current;
+            let batchCount = 0;
+
+            while (cursor < target && batchCount < MAX_LIVE_BATCHES_PER_SYNC) {
+                const rows = await logApi.getAll({
+                    ...toGetLogsInput(appliedFilters),
+                    limit: LIVE_BATCH_SIZE,
+                    after_seq: cursor,
+                });
+
+                if (rows.length === 0) {
+                    cursor = target;
+                    break;
+                }
+
+                const nextCursor = maxLogSeq(rows);
+                if (nextCursor <= cursor) {
+                    cursor = target;
+                    break;
+                }
+
+                queryClient.setQueryData<LogsQueryData>(logsQueryKey, (current) => (
+                    current ? mergeLiveLogs(current, rows) : current
+                ));
+                cursor = nextCursor;
+                batchCount += 1;
+
+                if (rows.length < LIVE_BATCH_SIZE) {
+                    // SQL 按 seq 升序返回，短页说明已经追上当前游标。
+                    cursor = Math.max(cursor, target);
+                    break;
+                }
+            }
+
+            syncedSeqRef.current = Math.max(syncedSeqRef.current, cursor);
+            if (syncedSeqRef.current >= targetSeqRef.current) {
+                setPendingLiveLogs(0);
+            } else {
+                setPendingLiveLogs(Math.max(1, targetSeqRef.current - syncedSeqRef.current));
+            }
+        } catch {
+            // 保留目标游标，下一次事件或窗口聚焦时可以安全重试。
+            failed = true;
+        } finally {
+            liveSyncingRef.current = false;
+            if (!failed && (liveSyncAgainRef.current || targetSeqRef.current > syncedSeqRef.current)) {
+                liveSyncAgainRef.current = false;
+                queueLiveSyncRef.current();
+            }
+        }
+    }, [appliedFilters, logsQueryKey, queryClient]);
+
+    const queueLiveSync = useCallback(() => {
+        if (liveSyncTimerRef.current !== null) {
+            return;
+        }
+
+        liveSyncTimerRef.current = setTimeout(() => {
+            liveSyncTimerRef.current = null;
+            void syncLiveLogs();
+        }, LIVE_SYNC_DELAY_MS);
+    }, [syncLiveLogs]);
+    queueLiveSyncRef.current = queueLiveSync;
+
+    useEffect(() => {
+        const loadedSeq = maxLogSeq(logs);
+        if (loadedSeq > syncedSeqRef.current) {
+            syncedSeqRef.current = loadedSeq;
+        }
+        if (targetSeqRef.current > syncedSeqRef.current) {
+            queueLiveSync();
+        }
+    }, [logs, queueLiveSync]);
+
+    useEffect(() => {
+        let disposed = false;
+        let unlisten: (() => void) | undefined;
+
+        const registerListener = async () => {
+            try {
+                const cleanup = await listen<LogChangedEvent>(LOG_CHANGED_EVENT, ({ payload }) => {
+                    if (payload.reset) {
+                        syncedSeqRef.current = 0;
+                        targetSeqRef.current = 0;
+                        liveSyncAgainRef.current = false;
+                        setPendingLiveLogs(0);
+                        void queryClient.invalidateQueries({
+                            queryKey: logsQueryKeyRef.current,
+                            exact: true,
+                        });
+                        return;
+                    }
+
+                    const latestSeq = Number(payload.latest_seq);
+                    if (!Number.isFinite(latestSeq) || latestSeq <= targetSeqRef.current) {
+                        return;
+                    }
+
+                    targetSeqRef.current = latestSeq;
+                    setPendingLiveLogs((current) => Math.max(current, payload.pending || 1));
+                    queueLiveSyncRef.current();
+                });
+
+                if (disposed) {
+                    cleanup();
+                } else {
+                    unlisten = cleanup;
+                }
+            } catch {
+                // Web 预览没有 Tauri 事件桥，初始查询仍然可以正常工作。
+            }
+        };
+
+        void registerListener();
+        return () => {
+            disposed = true;
+            if (liveSyncTimerRef.current !== null) {
+                clearTimeout(liveSyncTimerRef.current);
+                liveSyncTimerRef.current = null;
+            }
+            unlisten?.();
+        };
+    }, [queryClient]);
 
     const updateDraftFilter = <Key extends keyof LogFilterState>(key: Key, value: LogFilterState[Key]) => {
         setDraftFilters((current) => ({ ...current, [key]: value }));
@@ -261,7 +458,10 @@ export function LogsPage() {
             <section className="panel mt-4 min-w-0">
                 <div className="panel-header panel-header-compact">
                     <p className="text-xs text-muted">已加载 {formatNumber(logs.length)} 条 · {loadedPageCount} 页</p>
-                    <span className="flex items-center gap-1.5 text-xs text-muted"><span className="live-dot" />最新请求优先</span>
+                    <span className="flex items-center gap-1.5 text-xs text-muted">
+                        <span className="live-dot" />
+                        {pendingLiveLogs > 0 ? `同步中 ${formatNumber(pendingLiveLogs)} 条` : "最新请求优先"}
+                    </span>
                 </div>
                 <div className="table-scroll">
                     <table className="data-table log-table min-w-[840px]">

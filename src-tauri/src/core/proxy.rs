@@ -74,10 +74,13 @@ pub async fn handle_request(
             sanitized: if security_result.sanitized { 1 } else { 0 },
             blocked_reason: security_result.blocked_reason.clone(),
         };
-        let log_id = log.id.clone();
-        let _ = repo.create_log(&log).await;
-        // 同时保存风险明细（哪些规则被触发了）
-        let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+        let _ = crate::core::log_events::persist_log(
+            repo,
+            app,
+            &log,
+            &security_result.findings,
+            security_result.action.as_str(),
+        ).await;
         return Err((451, security_result.summary));
     }
 
@@ -175,9 +178,13 @@ pub async fn handle_request(
                     sanitized: if security_result.sanitized { 1 } else { 0 },
                     blocked_reason: security_result.blocked_reason.clone(),
                 };
-                let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                let _ = crate::core::log_events::persist_log(
+                    repo,
+                    app,
+                    &log,
+                    &security_result.findings,
+                    security_result.action.as_str(),
+                ).await;
 
                 // 配额扣减
                 if let Some(ref u) = usage {
@@ -222,9 +229,13 @@ pub async fn handle_request(
                     sanitized: if security_result.sanitized { 1 } else { 0 },
                     blocked_reason: security_result.blocked_reason.clone(),
                 };
-                let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                let _ = crate::core::log_events::persist_log(
+                    repo,
+                    app,
+                    &log,
+                    &security_result.findings,
+                    security_result.action.as_str(),
+                ).await;
                 last_error = Some(error_message);
             }
         }
