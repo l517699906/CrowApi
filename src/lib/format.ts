@@ -9,6 +9,31 @@ export function formatCompactNumber(value: number): string {
     return compactNumberFormatter.format(value);
 }
 
+export function formatTokenCount(value: number): string {
+    if (!Number.isFinite(value)) {
+        return "--";
+    }
+
+    const units = ["", "k", "M", "B", "T"] as const;
+    const sign = value < 0 ? "-" : "";
+    let unitIndex = 0;
+    let scaledValue = Math.abs(value);
+
+    while (scaledValue >= 1000 && unitIndex < units.length - 1) {
+        scaledValue /= 1000;
+        unitIndex += 1;
+    }
+
+    let roundedValue = Number(scaledValue.toFixed(1));
+    if (roundedValue >= 1000 && unitIndex < units.length - 1) {
+        roundedValue = Number((roundedValue / 1000).toFixed(1));
+        unitIndex += 1;
+    }
+
+    const formattedValue = roundedValue.toFixed(1).replace(/\.0$/, "");
+    return `${sign}${unitIndex === 0 ? Number(formattedValue).toLocaleString("en-US") : formattedValue}${units[unitIndex]}`;
+}
+
 export function formatNumber(value: number): string {
     return numberFormatter.format(value);
 }

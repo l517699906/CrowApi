@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
-import { formatDateTime, formatDuration, formatNumber } from "../lib/format";
+import { formatDateTime, formatDuration, formatNumber, formatTokenCount } from "../lib/format";
 import { apiKeyApi, channelApi, logApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
 import type { GetLogsInput, RequestLog } from "../types";
@@ -498,11 +498,7 @@ export function LogsPage() {
                                         {log.is_stream ? <span className="ml-1.5 text-[10px] text-subtle">STREAM</span> : null}
                                     </td>
                                     <td>
-                                        <span className="log-token-pair">
-                                            <span>{formatNumber(log.prompt_tokens)}</span>
-                                            <b>+</b>
-                                            <span>{formatNumber(log.completion_tokens)}</span>
-                                        </span>
+                                        <span className="log-token-value">{formatTokenCount(log.total_tokens)}</span>
                                     </td>
                                     <td className="font-mono text-xs text-ink">{formatDuration(log.duration_ms)}</td>
                                     <td>

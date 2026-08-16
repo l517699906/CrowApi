@@ -1798,19 +1798,13 @@ a:focus-visible {
   background: color-mix(in srgb, var(--soft) 72%, var(--surface));
 }
 
-.log-token-pair {
+.log-token-value {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
   color: var(--ink);
   font-family: var(--font-mono);
   font-size: 11px;
   white-space: nowrap;
-}
-
-.log-token-pair b {
-  color: var(--subtle);
-  font-weight: 500;
 }
 
 .log-risk-cell {
