@@ -3,6 +3,8 @@ pub mod repository;
 pub mod parser;
 pub mod code_parser;
 pub mod splitter;
+pub mod embedder;
+pub mod index;
 
 use async_trait::async_trait;
 use axum::Router;
