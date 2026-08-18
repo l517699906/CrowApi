@@ -5,6 +5,12 @@ pub mod code_parser;
 pub mod splitter;
 pub mod embedder;
 pub mod index;
+pub mod retriever;
+pub mod rag;
+pub mod processor;
+pub mod handlers;
+pub mod routes;
+pub mod importer;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -44,9 +50,7 @@ impl Service for KnowledgeService {
         }
     }
 
-    fn routes(&self, _state: Arc<AppState>) -> Router<SharedState> {
-        // 知识库的 HTTP 路由(CRUD/导入/检索/问答)在 3-5 检索链路接入。
-        // 本节(3-3)先建立数据模型与文档解析分块能力,路由暂为空。
-        Router::new()
-    }
+    fn routes(&self, state: Arc<AppState>) -> Router<SharedState> {
+        routes::create_router(state)
+        }
 }
