@@ -1,3 +1,5 @@
+pub mod knowledge;
+
 use async_trait::async_trait;
 use axum::Router;
 use serde::Serialize;
@@ -41,10 +43,9 @@ pub struct ServiceRegistry {
 
 impl ServiceRegistry {
     pub fn new() -> Self {
-        // 服务在后续章节接入:
-        //   3-3 注册 KnowledgeService,3-6 注册 McpService。
-        // 本节先建立 Service trait 与 Registry 框架,服务列表为空。
-        Self { services: vec![] }
+        let mut registry = Self { services: vec![] };
+        registry.register(Box::new(knowledge::KnowledgeService));
+        registry
     }
 
     pub fn register(&mut self, service: Box<dyn Service>) {
