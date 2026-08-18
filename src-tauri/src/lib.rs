@@ -7,6 +7,7 @@ mod db;
 mod utils;
 mod security;
 mod protocol;
+pub mod services;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -161,6 +162,7 @@ pub fn run() {
             commands::import_export::import_scanned_sources,
             commands::import_export::pick_import_file,
             commands::import_export::save_export_file,
+            commands::services::get_service_statuses,
         ])
         .build(tauri::generate_context!())
         .expect("error while building CrowAPI")
