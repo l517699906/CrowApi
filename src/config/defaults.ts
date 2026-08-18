@@ -10,6 +10,8 @@ export const DEFAULT_SETTINGS: Settings = {
     auto_start: false,
     retry_enabled: true,
     retry_times: 2,
+    default_key_quota: 1_000_000,
+    total_quota: 0,
     security_enabled: false,
     security_mode: "audit",
     security_scan_unicode: true,

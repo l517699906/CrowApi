@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
     Check,
     CircleHelp,
+    Gauge,
     Globe2,
     Monitor,
     Palette,
@@ -14,14 +15,16 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { DEFAULT_SETTINGS } from "../config/defaults";
 import { settingsApi } from "../lib/api";
+import { MAX_QUOTA, normalizeQuota } from "../lib/quota";
 import { errorMessage, queryKeys } from "../lib/query";
 import type { Settings } from "../types";
 import { PageTitle, SegmentedControl, Toast, Toggle } from "../components/ui";
 
-type SettingsTab = "service" | "general" | "interface" | "retry";
+type SettingsTab = "service" | "quota" | "general" | "interface" | "retry";
 
 const tabs: Array<{ id: SettingsTab; label: string; icon: typeof Server }> = [
     { id: "service", label: "服务配置", icon: Server },
+    { id: "quota", label: "配额管理", icon: Gauge },
     { id: "general", label: "通用设置", icon: Settings2 },
     { id: "interface", label: "界面设置", icon: Palette },
     { id: "retry", label: "重试策略", icon: RefreshCcw },
@@ -127,6 +130,46 @@ export function SettingsPage() {
                                 </label>
                             </div>
                             <div className="settings-note"><CircleHelp size={17} /><span>服务配置将在网关下次启动时生效。</span></div>
+                        </div>
+                    ) : null}
+
+                    {activeTab === "quota" ? (
+                        <div className="settings-section page-enter" key="quota">
+                            <div className="settings-heading">
+                                <span className="settings-heading-icon settings-heading-blue"><Gauge size={19} /></span>
+                                <div><h2>配额管理</h2><p>密钥默认额度与网关总额度</p></div>
+                            </div>
+                            <div className="settings-form-block">
+                                <div className="form-grid">
+                                    <label className="field-label">
+                                        <span>默认密钥配额</span>
+                                        <input
+                                            className="field-input font-mono"
+                                            type="number"
+                                            min="0"
+                                            max={MAX_QUOTA}
+                                            step="1"
+                                            value={draft.default_key_quota}
+                                            onChange={(event) => updateSetting("default_key_quota", normalizeQuota(event.target.value))}
+                                        />
+                                        <small>新建密钥的默认 Token 上限，0 表示不限制</small>
+                                    </label>
+                                    <label className="field-label">
+                                        <span>总配额</span>
+                                        <input
+                                            className="field-input font-mono"
+                                            type="number"
+                                            min="0"
+                                            max={MAX_QUOTA}
+                                            step="1"
+                                            value={draft.total_quota}
+                                            onChange={(event) => updateSetting("total_quota", normalizeQuota(event.target.value))}
+                                        />
+                                        <small>所有密钥累计 Token 上限，0 表示不限制</small>
+                                    </label>
+                                </div>
+                            </div>
+                            <div className="settings-note"><CircleHelp size={17} /><span>总配额保存后立即应用，默认密钥配额用于之后创建的密钥。</span></div>
                         </div>
                     ) : null}
 

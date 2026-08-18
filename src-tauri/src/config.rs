@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
+pub const DEFAULT_KEY_QUOTA: i64 = 1_000_000;
+pub const DEFAULT_TOTAL_QUOTA: i64 = 0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub server_port: u16,
@@ -13,6 +16,8 @@ pub struct AppSettings {
     pub auto_start: bool,
     pub retry_enabled: bool,
     pub retry_times: i32,
+    pub default_key_quota: i64,
+    pub total_quota: i64,
     pub security_enabled: bool,
     pub security_mode: String,
     pub security_scan_unicode: bool,
@@ -35,6 +40,8 @@ impl Default for AppSettings {
             auto_start: false,
             retry_enabled: true,
             retry_times: 2,
+            default_key_quota: DEFAULT_KEY_QUOTA,
+            total_quota: DEFAULT_TOTAL_QUOTA,
             security_enabled: false,
             security_mode: "audit".to_string(),
             security_scan_unicode: true,
@@ -45,6 +52,32 @@ impl Default for AppSettings {
             security_block_on_critical: false,
         }
     }
+}
+
+fn get_non_negative_i64(
+    store: &tauri_plugin_store::Store<tauri::Wry>,
+    key: &str,
+    default: i64,
+) -> i64 {
+    store
+        .get(key)
+        .and_then(|value| value.as_i64())
+        .filter(|value| *value >= 0)
+        .unwrap_or(default)
+}
+
+pub fn load_default_key_quota(app: &AppHandle) -> i64 {
+    let Ok(store) = app.store("settings.json") else {
+        return DEFAULT_KEY_QUOTA;
+    };
+    get_non_negative_i64(&store, "quota.default_key_limit", DEFAULT_KEY_QUOTA)
+}
+
+pub fn load_total_quota(app: &AppHandle) -> i64 {
+    let Ok(store) = app.store("settings.json") else {
+        return DEFAULT_TOTAL_QUOTA;
+    };
+    get_non_negative_i64(&store, "quota.total_limit", DEFAULT_TOTAL_QUOTA)
 }
 
 pub fn load_settings(app: &AppHandle) -> AppSettings {
@@ -93,6 +126,16 @@ pub fn load_settings(app: &AppHandle) -> AppSettings {
             .and_then(|value| value.as_i64())
             .and_then(|value| i32::try_from(value).ok())
             .unwrap_or(defaults.retry_times),
+        default_key_quota: get_non_negative_i64(
+            &store,
+            "quota.default_key_limit",
+            defaults.default_key_quota,
+        ),
+        total_quota: get_non_negative_i64(
+            &store,
+            "quota.total_limit",
+            defaults.total_quota,
+        ),
         security_enabled: store
             .get("security.enabled")
             .and_then(|value| value.as_bool())
@@ -139,6 +182,9 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
     if !(0..=5).contains(&settings.retry_times) {
         return Err("最大重试次数必须在 0 到 5 之间".to_string());
     }
+    if settings.default_key_quota < 0 || settings.total_quota < 0 {
+        return Err("配额不能小于 0".to_string());
+    }
     if !matches!(settings.security_mode.as_str(), "audit" | "redact" | "block") {
         return Err("安全模式必须是 audit、redact 或 block".to_string());
     }
@@ -153,6 +199,8 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
     store.set("app.auto_start", serde_json::json!(settings.auto_start));
     store.set("retry.enabled", serde_json::json!(settings.retry_enabled));
     store.set("retry.times", serde_json::json!(settings.retry_times));
+    store.set("quota.default_key_limit", serde_json::json!(settings.default_key_quota));
+    store.set("quota.total_limit", serde_json::json!(settings.total_quota));
     store.set("security.enabled", serde_json::json!(settings.security_enabled));
     store.set("security.mode", serde_json::json!(settings.security_mode));
     store.set("security.scan_unicode", serde_json::json!(settings.security_scan_unicode));

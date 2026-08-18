@@ -7,11 +7,11 @@ pub struct ClaudeAdaptor;
 impl Adaptor for ClaudeAdaptor {
     fn channel_type(&self) -> &'static str { "claude" }
     fn default_models(&self) -> Vec<&'static str> { vec!["claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022"] }
-    fn default_base_url(&self) -> &str { "https://api.anthropic.com" }
+    fn default_base_url(&self) -> &str { "https://api.anthropic.com/v1" }
 
     async fn test(&self, config: &ChannelConfig) -> Result<TestResult, anyhow::Error> {
         let start = std::time::Instant::now();
-        let url = format!("{}/v1/messages", config.base_url.trim_end_matches('/'));
+        let url = format!("{}/messages", config.base_url.trim_end_matches('/'));
         // Claude 没有廉价的 GET /models 鉴权接口，发一个 max_tokens=1 的最小请求
         let body = serde_json::json!({
             "model": config.models.first().map(|s| s.as_str()).unwrap_or("claude-3-5-haiku-20241022"),
@@ -29,10 +29,17 @@ impl Adaptor for ClaudeAdaptor {
             Ok(r) => {
                 let latency = start.elapsed().as_millis() as u64;
                 // 400 也算连通（说明认证过了，只是请求参数问题）
-                if r.status().is_success() || r.status().as_u16() == 400 {
+                let status = r.status();
+
+                if status.is_success() {
                     Ok(TestResult { success: true, message: "连接成功".to_string(), latency_ms: latency })
                 } else {
-                    Ok(TestResult { success: false, message: format!("HTTP {}", r.status()), latency_ms: latency })
+                    let body = r.text().await.unwrap_or_default();
+                    let err_msg = serde_json::from_str::<serde_json::Value>(&body)
+                                            .ok()
+                                            .and_then(|v| v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).map(String::from))
+                                            .unwrap_or(body);
+                    Ok(TestResult { success: false, message: format!("HTTP {} {}", status.as_u16(), err_msg), latency_ms: latency })
                 }
             }
             Err(e) => Ok(TestResult { success: false, message: format!("连接失败: {}", e), latency_ms: start.elapsed().as_millis() as u64 }),
@@ -40,7 +47,7 @@ impl Adaptor for ClaudeAdaptor {
     }
 
     async fn forward(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<(u16, serde_json::Value, Option<TokenUsage>), anyhow::Error> {
-        let url = format!("{}/v1/messages", config.base_url.trim_end_matches('/'));
+        let url = format!("{}/messages", config.base_url.trim_end_matches('/'));
         let openai_body = &request.body;
 
         // Convert OpenAI format to Claude format
@@ -89,7 +96,7 @@ impl Adaptor for ClaudeAdaptor {
     }
 
     async fn forward_stream(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<reqwest::Response, anyhow::Error> {
-        let url = format!("{}/v1/messages", config.base_url.trim_end_matches('/'));
+        let url = format!("{}/messages", config.base_url.trim_end_matches('/'));
         let openai_body = &request.body;
         let model = openai_body.get("model").and_then(|m| m.as_str()).unwrap_or("claude-3-5-haiku-20241022");
         let messages = openai_body.get("messages").cloned().unwrap_or(serde_json::Value::Array(vec![]));
@@ -137,6 +144,24 @@ fn convert_openai_messages_to_claude(messages: &serde_json::Value) -> (Option<St
                 system = Some(s.to_string());
             }
         } else {
+            // Skip empty assistant messages without tool_calls
+            if role == "assistant" {
+                let is_empty = match &content {
+                    serde_json::Value::Null => true,
+                    serde_json::Value::String(s) => s.is_empty(),
+                    serde_json::Value::Array(a) => a.is_empty(),
+                    _ => false,
+                };
+                let has_tool_calls = msg
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if is_empty && !has_tool_calls {
+                    continue;
+                }
+            }
+
             // assistant 保留，其他一律视为 user
             claude_msgs.push(serde_json::json!({
                 "role": if role == "assistant" { "assistant" } else { "user" },

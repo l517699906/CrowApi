@@ -19,7 +19,7 @@ import {
     X,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { formatDateTime, formatDuration, formatNumber } from "../lib/format";
+import { formatDateTime, formatDuration, formatTokenCount } from "../lib/format";
 import { logApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
 import type { RequestLog } from "../types";
@@ -254,7 +254,7 @@ export function LogDetailDrawer({ log, onClose }: LogDetailDrawerProps) {
                             <div><dt>上游模型</dt><dd>{log.upstream_model ?? "未路由"}</dd></div>
                             <div><dt>密钥</dt><dd>{log.api_key_name ?? "未识别"}</dd></div>
                             <div><dt>渠道</dt><dd>{log.channel_name ?? "未路由"}</dd></div>
-                            <div><dt>Token</dt><dd>{formatNumber(log.prompt_tokens)} + {formatNumber(log.completion_tokens)}</dd></div>
+                            <div><dt>Token</dt><dd>{formatTokenCount(log.total_tokens)}</dd></div>
                             <div><dt>延迟</dt><dd>{formatDuration(log.duration_ms)}</dd></div>
                         </dl>
                         {log.error_message || log.blocked_reason ? (

@@ -22,12 +22,14 @@ pub struct LogDto {
     pub is_retry: bool,
     pub created_at: String,
     pub request_body: Option<String>,
+    pub response_choices: Option<String>,
     pub risk_level: String,
     pub risk_score: i64,
     pub risk_summary: Option<String>,
     pub security_action: String,
     pub sanitized: bool,
     pub blocked_reason: Option<String>,
+    pub trace_id: Option<String>,
 }
 
 impl From<RequestLog> for LogDto {
@@ -50,12 +52,14 @@ impl From<RequestLog> for LogDto {
             is_retry: l.is_retry == 1,
             created_at: l.created_at,
             request_body: l.request_body,
+            response_choices: l.response_choices,
             risk_level: l.risk_level,
             risk_score: l.risk_score,
             risk_summary: l.risk_summary,
             security_action: l.security_action,
             sanitized: l.sanitized == 1,
             blocked_reason: l.blocked_reason,
+            trace_id: l.trace_id,
         }
     }
 }
@@ -99,13 +103,13 @@ impl From<RequestSecurityFinding> for SecurityFindingDto {
 pub struct GetLogsInput {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    pub after_seq: Option<i64>,
     pub keyword: Option<String>,
     pub api_key_name: Option<String>,
     pub channel_name: Option<String>,
     pub model: Option<String>,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
+    pub trace_id: Option<String>,
 }
 
 #[tauri::command]
@@ -122,24 +126,10 @@ pub async fn get_logs(
         || input.channel_name.is_some()
         || input.model.is_some()
         || input.date_from.is_some()
-        || input.date_to.is_some();
+        || input.date_to.is_some()
+        || input.trace_id.is_some();
 
-    let logs = if let Some(after_seq) = input.after_seq {
-        if has_search {
-            repo.search_logs_after(
-                input.keyword.as_deref(),
-                input.api_key_name.as_deref(),
-                input.channel_name.as_deref(),
-                input.model.as_deref(),
-                input.date_from.as_deref(),
-                input.date_to.as_deref(),
-                after_seq,
-                limit,
-            ).await
-        } else {
-            repo.get_logs_after(after_seq, limit).await
-        }
-    } else if has_search {
+    let logs = if has_search {
         repo.search_logs(
             input.keyword.as_deref(),
             input.api_key_name.as_deref(),
@@ -147,6 +137,7 @@ pub async fn get_logs(
             input.model.as_deref(),
             input.date_from.as_deref(),
             input.date_to.as_deref(),
+            input.trace_id.as_deref(),
             limit,
             offset,
         ).await
@@ -181,9 +172,7 @@ pub async fn delete_log(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<(), String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.delete_log(&id).await.map_err(|e| e.to_string())?;
-    state.log_events.mark_reset();
-    Ok(())
+    repo.delete_log(&id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -192,9 +181,7 @@ pub async fn delete_logs_before(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<u64, String> {
     let repo = Repository::new(state.db.pool.clone());
-    let deleted = repo.delete_logs_before(&before_date).await.map_err(|e| e.to_string())?;
-    state.log_events.mark_reset();
-    Ok(deleted)
+    repo.delete_logs_before(&before_date).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -202,9 +189,7 @@ pub async fn delete_all_logs(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<u64, String> {
     let repo = Repository::new(state.db.pool.clone());
-    let deleted = repo.delete_all_logs().await.map_err(|e| e.to_string())?;
-    state.log_events.mark_reset();
-    Ok(deleted)
+    repo.delete_all_logs().await.map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize)]

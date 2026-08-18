@@ -7,18 +7,40 @@ use axum::{
 use futures_util::StreamExt;
 use super::router::SharedState;
 use crate::core::proxy;
-use crate::core::access::{parse_scope, scope_allows};
+use crate::db::models::ApiKey;
 use crate::db::repository::Repository;
 use crate::adaptor::{get_adaptor, ProxyRequest};
 use crate::core::dispatcher::Dispatcher;
 use crate::security;
+use crate::protocol;
+
+fn quota_limit_reached(limit: i64, used: i64) -> bool {
+    limit > 0 && used >= limit
+}
+
+async fn quota_exceeded(
+    repo: &Repository,
+    app: &tauri::AppHandle,
+    key: &ApiKey,
+) -> Result<bool, sqlx::Error> {
+    if quota_limit_reached(key.quota_limit, key.quota_used) {
+        return Ok(true);
+    }
+
+    let total_quota = crate::config::load_total_quota(app);
+    if total_quota == 0 {
+        return Ok(false);
+    }
+
+    let total_used = repo.get_total_quota_used().await?;
+    Ok(quota_limit_reached(total_quota, total_used))
+}
 
 pub async fn handle_chat_completions(
     State(shared): State<SharedState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    // 1. 解析 JSON
     let body_str = String::from_utf8_lossy(&body);
     let json: serde_json::Value = match serde_json::from_str(&body_str) {
         Ok(j) => j,
@@ -27,7 +49,6 @@ pub async fn handle_chat_completions(
 
     let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
-    // 2. API Key 鉴权
     let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok()).unwrap_or("");
     let api_key = auth_header.strip_prefix("Bearer ").unwrap_or("").trim();
 
@@ -41,47 +62,29 @@ pub async fn handle_chat_completions(
         Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
     };
 
-    if key_record
-        .expires_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|expires_at| expires_at <= chrono::Utc::now())
-    {
-        return (StatusCode::UNAUTHORIZED, "API key expired").into_response();
-    }
-
-    let model = json.get("model").and_then(|value| value.as_str()).unwrap_or("");
-    if model.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Missing model").into_response();
-    }
-    let allowed_models = match parse_scope(&key_record.allowed_models) {
-        Ok(scope) => scope,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid API key model scope").into_response(),
+    let is_quota_exceeded = match quota_exceeded(&repo, &shared.app, &key_record).await {
+        Ok(exceeded) => exceeded,
+        Err(error) => {
+            tracing::error!("quota check failed: {}", error);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to check quota").into_response();
+        }
     };
-    if !scope_allows(&allowed_models, model, "全部模型") {
-        return (StatusCode::FORBIDDEN, "Model not allowed for this API key").into_response();
-    }
-    let allowed_channels = match parse_scope(&key_record.allowed_channels) {
-        Ok(scope) => scope,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid API key channel scope").into_response(),
-    };
-
-    // 3. 配额检查
-    if key_record.quota_limit > 0 && key_record.quota_used >= key_record.quota_limit {
+    if is_quota_exceeded {
         return (StatusCode::TOO_MANY_REQUESTS, "Quota exceeded").into_response();
     }
 
-    // 4. 保存原始请求体（日志用）
+    // Extract Wali-Trace-Id from request headers
+    let trace_id = headers.get("Wali-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+
+    // Store full request body for logging (no truncation — let frontend handle display)
     let request_body_str = serde_json::to_string(&json).unwrap_or_default();
 
-    // 5. 分流：流式 vs 非流式
     if is_stream {
-        handle_stream(shared, json, key_record.id, key_record.name, allowed_channels, request_body_str).await
+        handle_stream(shared, json, key_record.id, key_record.name, request_body_str, trace_id).await
     } else {
-        match proxy::handle_request(&repo, &shared.app, &key_record.id, &key_record.name, &allowed_channels, json, false, Some(request_body_str)).await {
+        match proxy::handle_request(&repo, &shared.app, &key_record.id, &key_record.name, json, false, Some(request_body_str), trace_id).await {
             Ok(result) => (StatusCode::OK, Json(result.body)).into_response(),
             Err((code, msg)) => {
-                // 错误也返回 OpenAI 兼容格式
                 let err_body = serde_json::json!({
                     "error": { "message": msg, "type": "upstream_error", "code": code }
                 });
@@ -122,11 +125,9 @@ async fn handle_stream(
     json: serde_json::Value,
     api_key_id: String,
     api_key_name: String,
-    allowed_channel_ids: Vec<String>,
     request_body: String,
+    trace_id: Option<String>,
 ) -> Response {
-    // ── 前置流程与非流式相同：安全扫描、阻断、调度（代码略，同 proxy.rs 逻辑）──
-
     let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     let security_settings = security::get_security_settings(&shared.app);
     let security_result = security::scan_request(&json, &security_settings);
@@ -146,6 +147,7 @@ async fn handle_stream(
 
     if matches!(security_result.action, security::SecurityAction::Block) {
         let log = crate::db::models::RequestLog {
+            response_choices: None,
             id: crate::utils::id::new_id(),
             seq: None,
             api_key_id: Some(api_key_id),
@@ -171,22 +173,16 @@ async fn handle_stream(
             security_action: security_result.action.as_str().to_string(),
             sanitized: if security_result.sanitized { 1 } else { 0 },
             blocked_reason: security_result.blocked_reason.clone(),
+            trace_id: trace_id.clone(),
         };
-        let _ = crate::core::log_events::persist_log(
-            repo.as_ref(),
-            &shared.app,
-            &log,
-            &security_result.findings,
-            security_result.action.as_str(),
-        ).await;
+        let log_id = log.id.clone();
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
         let err_body = serde_json::json!({"error": {"message": security_result.summary, "type": "security_blocked", "code": "security.blocked"}});
         return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
     }
     let channels = match repo.get_enabled_channels().await {
-        Ok(channels) => channels
-            .into_iter()
-            .filter(|channel| scope_allows(&allowed_channel_ids, &channel.id, "全部渠道"))
-            .collect::<Vec<_>>(),
+        Ok(c) => c,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "No channels available").into_response(),
     };
 
@@ -228,14 +224,12 @@ async fn handle_stream(
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    // 上游返回错误（非 2xx），读错误体，尝试下一个渠道
                     let body_str = resp.text().await.unwrap_or_default();
                     last_error = Some(format!("{}: {}", channel.name, body_str));
                     continue;
                 }
 
                 let start = std::time::Instant::now();
-                // 克隆日志所需数据（闭包要 move 进流中）
                 let channel_id = channel.id.clone();
                 let channel_name = channel.name.clone();
                 let repo_clone = repo.clone();
@@ -245,37 +239,120 @@ async fn handle_stream(
                 let upstream_model_clone = upstream_model.clone();
                 let request_body_clone = request_body.clone();
                 let security_result_clone = security_result.clone();
-                let app_for_log = shared.app.clone();
+                let trace_id_clone = trace_id.clone();
                 let is_retry = if attempt > 0 { 1 } else { 0 };
 
-                // ── 核心：字节透传 + 旁路解析 ──────────────────
+                // ── Raw byte passthrough with usage parsing ───────────────
+                // Forward upstream SSE bytes directly as the response body.
+                // While passing through, scan data lines for `usage` to record
+                // token consumption in the log.
                 let upstream_stream = resp.bytes_stream();
 
                 let passthrough_stream = async_stream::stream! {
                     tokio::pin!(upstream_stream);
 
-                    // Accumulate token usage from SSE chunks
+                    // Accumulate token usage and response content from SSE chunks
                     let mut usage_prompt: i64 = 0;
                     let mut usage_completion: i64 = 0;
                     let mut usage_total: i64 = 0;
                     let mut had_error = false;
+                    let mut accumulated_content = String::new();
+                    let mut accumulated_reasoning = String::new();
+                    let mut response_role: Option<String> = None;
+                    let mut finish_reason: Option<String> = None;
+                    // Accumulate tool_calls by index (streaming chunks may contain partial tool_calls)
+                    let mut tool_calls_map: std::collections::BTreeMap<i64, serde_json::Value> = std::collections::BTreeMap::new();
 
-                    // 逐 chunk 透传
                     while let Some(chunk_result) = upstream_stream.next().await {
                         match chunk_result {
                             Ok(bytes) => {
-                                // 旁路解析 usage（不影响转发）
+                                // Try to parse usage and content from this chunk
                                 if let Ok(text) = std::str::from_utf8(&bytes) {
                                     if let Some((p, c, t)) = parse_usage_from_chunk(text) {
                                         usage_prompt = p;
                                         usage_completion = c;
                                         usage_total = t;
                                     }
+                                    // Accumulate delta content from SSE chunks
+                                    for line in text.lines() {
+                                        let trimmed = line.trim();
+                                        if !trimmed.starts_with("data:") {
+                                            continue;
+                                        }
+                                        let data_str = trimmed.trim_start_matches("data:").trim();
+                                        if data_str == "[DONE]" || data_str.is_empty() {
+                                            continue;
+                                        }
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                                                if let Some(choice) = choices.first() {
+                                                    if let Some(delta) = choice.get("delta") {
+                                                        // Accumulate regular content
+                                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                                            accumulated_content.push_str(content);
+                                                        }
+                                                        // Accumulate reasoning/thinking content (DeepSeek R1, OpenAI o1/o3, etc.)
+                                                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                                                            accumulated_reasoning.push_str(reasoning);
+                                                        }
+                                                        if response_role.is_none() {
+                                                            if let Some(role) = delta.get("role").and_then(|r| r.as_str()) {
+                                                                response_role = Some(role.to_string());
+                                                            }
+                                                        }
+                                                        // Accumulate tool_calls by index
+                                                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                                                            for tc in tcs {
+                                                                let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
+                                                                let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                                                                    serde_json::json!({
+                                                                        "id": "",
+                                                                        "type": "function",
+                                                                        "function": {
+                                                                            "name": "",
+                                                                            "arguments": ""
+                                                                        }
+                                                                    })
+                                                                });
+                                                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                                                    if !id.is_empty() {
+                                                                        entry["id"] = serde_json::json!(id);
+                                                                    }
+                                                                }
+                                                                if let Some(t) = tc.get("type").and_then(|v| v.as_str()) {
+                                                                    if !t.is_empty() {
+                                                                        entry["type"] = serde_json::json!(t);
+                                                                    }
+                                                                }
+                                                                if let Some(func) = tc.get("function") {
+                                                                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                                                        if !name.is_empty() {
+                                                                            entry["function"]["name"] = serde_json::json!(name);
+                                                                        }
+                                                                    }
+                                                                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                                                        let existing = entry["function"]["arguments"].as_str().unwrap_or("");
+                                                                        entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    if finish_reason.is_none() {
+                                                        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                                                            if !reason.is_empty() && reason != "null" {
+                                                                finish_reason = Some(reason.to_string());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 yield Ok::<_, std::io::Error>(bytes);
                             }
                             Err(e) => {
-                                // 流中断：补发错误 chunk + [DONE]，优雅收尾
                                 had_error = true;
                                 let err_chunk = format!(
                                     "data: {{\"error\":{{\"message\":\"Stream connection interrupted: {}\",\"type\":\"server_error\"}}}}\n\n",
@@ -288,10 +365,37 @@ async fn handle_stream(
                         }
                     }
 
+                    // Build response_choices from accumulated streaming content
+                    let has_content = !accumulated_content.is_empty() || !accumulated_reasoning.is_empty() || !tool_calls_map.is_empty();
+                    let response_choices = if has_content {
+                        let mut message = serde_json::json!({
+                            "role": response_role.unwrap_or_else(|| "assistant".to_string()),
+                        });
+                        // Only include content if there is any
+                        if !accumulated_content.is_empty() {
+                            message["content"] = serde_json::json!(accumulated_content);
+                        }
+                        // Include reasoning_content if present
+                        if !accumulated_reasoning.is_empty() {
+                            message["reasoning_content"] = serde_json::json!(accumulated_reasoning);
+                        }
+                        // Include tool_calls if present
+                        if !tool_calls_map.is_empty() {
+                            let tcs: Vec<serde_json::Value> = tool_calls_map.into_values().collect();
+                            message["tool_calls"] = serde_json::json!(tcs);
+                        }
+                        Some(serde_json::to_string(&vec![serde_json::json!({
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": finish_reason,
+                        })]).unwrap_or_default())
+                    } else {
+                        None
+                    };
+
                     // Log after stream completes
                     let quota_to_add = usage_total;
                     let key_id_for_quota = api_key_id_clone.clone();
-                    // ── 流结束后：统一写日志 + 扣配额 ──────────
                     let log = crate::db::models::RequestLog {
                         id: crate::utils::id::new_id(),
                         seq: None,
@@ -312,28 +416,25 @@ async fn handle_stream(
                         is_retry,
                         created_at: crate::utils::time::now_iso(),
                         request_body: Some(request_body_clone),
+                        response_choices,
                         risk_level: security_result_clone.risk_level.as_str().to_string(),
                         risk_score: security_result_clone.risk_score as i64,
                         risk_summary: Some(security_result_clone.summary.clone()),
                         security_action: security_result_clone.action.as_str().to_string(),
                         sanitized: if security_result_clone.sanitized { 1 } else { 0 },
                         blocked_reason: security_result_clone.blocked_reason.clone(),
+                        trace_id: trace_id_clone,
                     };
-                    let _ = crate::core::log_events::persist_log(
-                        repo_clone.as_ref(),
-                        &app_for_log,
-                        &log,
-                        &security_result_clone.findings,
-                        security_result_clone.action.as_str(),
-                    ).await;
+                    let log_id = log.id.clone();
+                    if let Err(e) = repo_clone.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
 
                     // Increment quota if we got token counts
                     if quota_to_add > 0 {
-                        let _ = repo_clone.increment_quota(&key_id_for_quota, quota_to_add).await;
+                        if let Err(e) = repo_clone.increment_quota(&key_id_for_quota, quota_to_add).await { eprintln!("[WARN] increment_quota failed: {}", e); }
                     }
                 };
 
-                // 返回 SSE 响应
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/event-stream")
@@ -343,7 +444,6 @@ async fn handle_stream(
                     .unwrap();
             }
             Err(e) => {
-                // 连接失败：记日志，尝试下一个渠道
                 let error_message = e.to_string();
                 let log = crate::db::models::RequestLog {
                     id: crate::utils::id::new_id(),
@@ -365,26 +465,23 @@ async fn handle_stream(
                     is_retry: if attempt > 0 { 1 } else { 0 },
                     created_at: crate::utils::time::now_iso(),
                     request_body: Some(request_body.clone()),
+                    response_choices: None,
                     risk_level: security_result.risk_level.as_str().to_string(),
                     risk_score: security_result.risk_score as i64,
                     risk_summary: Some(security_result.summary.clone()),
                     security_action: security_result.action.as_str().to_string(),
                     sanitized: if security_result.sanitized { 1 } else { 0 },
                     blocked_reason: security_result.blocked_reason.clone(),
+                    trace_id: trace_id.clone(),
                 };
-                let _ = crate::core::log_events::persist_log(
-                    repo.as_ref(),
-                    &shared.app,
-                    &log,
-                    &security_result.findings,
-                    security_result.action.as_str(),
-                ).await;
+                let log_id = log.id.clone();
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                 last_error = Some(format!("{}: {}", channel.name, error_message));
             }
         }
     }
 
-    // 所有渠道失败
     let err_body = serde_json::json!({
         "error": {
             "message": format!(
@@ -399,12 +496,992 @@ async fn handle_stream(
     (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
 }
 
+// ─── Anthropic Messages API: POST /v1/messages ─────────────────────────────
+// Accepts Anthropic-format requests and proxies to upstream channels.
+// For Claude-type channels: forward natively (Anthropic format).
+// For other channels: convert Anthropic → OpenAI → upstream → OpenAI → Anthropic.
+
+pub async fn handle_messages(
+    State(shared): State<SharedState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let body_str = String::from_utf8_lossy(&body);
+    let json: serde_json::Value = match serde_json::from_str(&body_str) {
+        Ok(j) => j,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
+    };
+
+    let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+
+    // Extract API key from x-api-key header or Authorization Bearer
+    let api_key = match protocol::extract_api_key(&headers) {
+        Some(k) => k,
+        None => {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "authentication_error", "message": "Missing API key"}
+            }))).into_response();
+        }
+    };
+
+    let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
+    let key_record = match repo.get_api_key_by_key(&api_key).await {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "type": "error",
+            "error": {"type": "authentication_error", "message": "Invalid API key"}
+        }))).into_response(),
+    };
+
+    let is_quota_exceeded = match quota_exceeded(&repo, &shared.app, &key_record).await {
+        Ok(exceeded) => exceeded,
+        Err(error) => {
+            tracing::error!("quota check failed: {}", error);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": "Failed to check quota"}
+            }))).into_response();
+        }
+    };
+    if is_quota_exceeded {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "Quota exceeded"}
+        }))).into_response();
+    }
+
+    let trace_id = headers.get("Wali-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+    let request_body_str = serde_json::to_string(&json).unwrap_or_default();
+    let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+
+    // Convert Anthropic request to OpenAI format for internal proxy
+    let openai_body = protocol::anthropic_to_openai(&json);
+
+    if is_stream {
+        handle_messages_stream(shared, openai_body, model, key_record.id, key_record.name, request_body_str, trace_id).await
+    } else {
+        match proxy::handle_request(&repo, &shared.app, &key_record.id, &key_record.name, openai_body, false, Some(request_body_str), trace_id).await {
+            Ok(result) => {
+                // Convert OpenAI response back to Anthropic format
+                let anthropic_resp = protocol::openai_to_anthropic(&result.body, &result.channel.channel_type);
+                (StatusCode::OK, Json(anthropic_resp)).into_response()
+            }
+            Err((code, msg)) => {
+                let err_body = serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": msg}
+                });
+                (StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY), Json(err_body)).into_response()
+            }
+        }
+    }
+}
+
+/// Stream handler for Anthropic Messages API.
+/// Converts OpenAI SSE stream to Anthropic SSE events.
+async fn handle_messages_stream(
+    shared: SharedState,
+    openai_body: serde_json::Value,
+    model: String,
+    api_key_id: String,
+    api_key_name: String,
+    request_body: String,
+    trace_id: Option<String>,
+) -> Response {
+    let security_settings = security::get_security_settings(&shared.app);
+    let security_result = security::scan_request(&openai_body, &security_settings);
+
+    let (forward_json, was_redacted) = if matches!(security_result.action, security::SecurityAction::Redact) || security_settings.redact_secrets {
+        security::redact_request_body(&openai_body, &security_settings)
+    } else {
+        (openai_body.clone(), false)
+    };
+    let mut security_result = security_result;
+    if was_redacted {
+        security_result.sanitized = true;
+    }
+
+    let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
+
+    if matches!(security_result.action, security::SecurityAction::Block) {
+        let log = crate::db::models::RequestLog {
+            response_choices: None,
+            id: crate::utils::id::new_id(),
+            seq: None,
+            api_key_id: Some(api_key_id.clone()),
+            api_key_name: Some(api_key_name.clone()),
+            channel_id: None,
+            channel_name: None,
+            model: model.clone(),
+            upstream_model: None,
+            mode: "anthropic".to_string(),
+            status_code: 451,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            duration_ms: 0,
+            error_message: security_result.blocked_reason.clone(),
+            is_stream: 1,
+            is_retry: 0,
+            created_at: crate::utils::time::now_iso(),
+            request_body: Some(request_body),
+            risk_level: security_result.risk_level.as_str().to_string(),
+            risk_score: security_result.risk_score as i64,
+            risk_summary: Some(security_result.summary.clone()),
+            security_action: security_result.action.as_str().to_string(),
+            sanitized: if security_result.sanitized { 1 } else { 0 },
+            blocked_reason: security_result.blocked_reason.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let log_id = log.id.clone();
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+        let err_body = serde_json::json!({"type": "error", "error": {"type": "api_error", "message": security_result.summary}});
+        return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
+    }
+
+    let channels = match repo.get_enabled_channels().await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "type": "error", "error": {"type": "api_error", "message": "No channels available"}
+        }))).into_response(),
+    };
+
+    let selected_channels = Dispatcher::select_channels(&channels, &model);
+    if selected_channels.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "type": "error", "error": {"type": "api_error", "message": format!("No channel for model: {}", model)}
+        }))).into_response();
+    }
+
+    let request = ProxyRequest { model: model.clone(), body: forward_json.clone(), stream: true };
+    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
+    let max_attempts = if retry_enabled {
+        (retry_times.max(0) as usize + 1).min(selected_channels.len())
+    } else { 1 };
+
+    let mut last_error = None;
+
+    for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
+        let config = Dispatcher::channel_to_config(&channel);
+        let adaptor = get_adaptor(&channel.channel_type);
+        let upstream_model = {
+            let mapping = &config.model_mapping;
+            if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
+                mapped.to_string()
+            } else { model.clone() }
+        };
+
+        match adaptor.forward_stream(&request, &config).await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let body_str = resp.text().await.unwrap_or_default();
+                    last_error = Some(format!("{}: {}", channel.name, body_str));
+                    continue;
+                }
+
+                let start = std::time::Instant::now();
+                let channel_id = channel.id.clone();
+                let channel_name = channel.name.clone();
+                let repo_clone = repo.clone();
+                let api_key_id_clone = api_key_id.clone();
+                let api_key_name_clone = api_key_name.clone();
+                let model_clone = model.clone();
+                let upstream_model_clone = upstream_model.clone();
+                let request_body_clone = request_body.clone();
+                let security_result_clone = security_result.clone();
+                let trace_id_clone = trace_id.clone();
+                let is_retry = if attempt > 0 { 1 } else { 0 };
+
+                let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+                let upstream_stream = resp.bytes_stream();
+
+                let passthrough_stream = async_stream::stream! {
+                    tokio::pin!(upstream_stream);
+
+                    let mut state = crate::protocol::anthropic::AnthropicStreamState::default();
+                    let mut usage_prompt: i64 = 0;
+                    let mut usage_completion: i64 = 0;
+                    let mut usage_total: i64 = 0;
+                    let mut had_error = false;
+                    let mut accumulated_content = String::new();
+
+                    while let Some(chunk_result) = upstream_stream.next().await {
+                        match chunk_result {
+                            Ok(bytes) => {
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    if let Some((p, c, t)) = crate::protocol::anthropic::parse_usage_from_sse_chunk(text) {
+                                        usage_prompt = p;
+                                        usage_completion = c;
+                                        usage_total = t;
+                                    }
+                                    // Accumulate content for logging
+                                    for line in text.lines() {
+                                        let trimmed = line.trim();
+                                        if !trimmed.starts_with("data:") { continue; }
+                                        let data_str = trimmed.trim_start_matches("data:").trim();
+                                        if data_str == "[DONE]" || data_str.is_empty() { continue; }
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                                                if let Some(choice) = choices.first() {
+                                                    if let Some(delta) = choice.get("delta") {
+                                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                                            accumulated_content.push_str(content);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Convert OpenAI SSE → Anthropic SSE events
+                                    let events = crate::protocol::anthropic::convert_openai_sse_to_anthropic(
+                                        text, &model_clone, &message_id, &mut state
+                                    );
+                                    for event in events {
+                                        yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                                    }
+                                } else {
+                                    yield Ok::<_, std::io::Error>(bytes);
+                                }
+                            }
+                            Err(e) => {
+                                had_error = true;
+                                let err_event = format!(
+                                    "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"Stream interrupted: {}\"}}}}\n\n",
+                                    e
+                                );
+                                yield Ok::<_, std::io::Error>(err_event.into_bytes().into());
+                                break;
+                            }
+                        }
+                    }
+
+                    // Build response_choices for logging
+                    let response_choices = if !accumulated_content.is_empty() {
+                        Some(serde_json::to_string(&vec![serde_json::json!({
+                            "index": 0,
+                            "message": {"role": "assistant", "content": accumulated_content},
+                            "finish_reason": "stop",
+                        })]).unwrap_or_default())
+                    } else { None };
+
+                    let log = crate::db::models::RequestLog {
+                        id: crate::utils::id::new_id(),
+                        seq: None,
+                        api_key_id: Some(api_key_id_clone.clone()),
+                        api_key_name: Some(api_key_name_clone.clone()),
+                        channel_id: Some(channel_id),
+                        channel_name: Some(channel_name),
+                        model: model_clone.clone(),
+                        upstream_model: Some(upstream_model_clone),
+                        mode: "anthropic".to_string(),
+                        status_code: if had_error { 502 } else { 200 },
+                        prompt_tokens: usage_prompt,
+                        completion_tokens: usage_completion,
+                        total_tokens: usage_total,
+                        duration_ms: start.elapsed().as_millis() as i64,
+                        error_message: if had_error { Some("Stream interrupted".to_string()) } else { None },
+                        is_stream: 1,
+                        is_retry,
+                        created_at: crate::utils::time::now_iso(),
+                        request_body: Some(request_body_clone),
+                        response_choices,
+                        risk_level: security_result_clone.risk_level.as_str().to_string(),
+                        risk_score: security_result_clone.risk_score as i64,
+                        risk_summary: Some(security_result_clone.summary.clone()),
+                        security_action: security_result_clone.action.as_str().to_string(),
+                        sanitized: if security_result_clone.sanitized { 1 } else { 0 },
+                        blocked_reason: security_result_clone.blocked_reason.clone(),
+                        trace_id: trace_id_clone,
+                    };
+                    let log_id = log.id.clone();
+                    if let Err(e) = repo_clone.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                    if usage_total > 0 {
+                        if let Err(e) = repo_clone.increment_quota(&api_key_id_clone, usage_total).await { eprintln!("[WARN] increment_quota failed: {}", e); }
+                    }
+                };
+
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from_stream(passthrough_stream))
+                    .unwrap();
+            }
+            Err(e) => {
+                let error_message = e.to_string();
+                let log = crate::db::models::RequestLog {
+                    id: crate::utils::id::new_id(),
+                    seq: None,
+                    api_key_id: Some(api_key_id.clone()),
+                    api_key_name: Some(api_key_name.clone()),
+                    channel_id: Some(channel.id.clone()),
+                    channel_name: Some(channel.name.clone()),
+                    model: model.clone(),
+                    upstream_model: Some(upstream_model.clone()),
+                    mode: "anthropic".to_string(),
+                    status_code: 502,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    duration_ms: 0,
+                    error_message: Some(error_message.clone()),
+                    is_stream: 1,
+                    is_retry: if attempt > 0 { 1 } else { 0 },
+                    created_at: crate::utils::time::now_iso(),
+                    request_body: Some(request_body.clone()),
+                    response_choices: None,
+                    risk_level: security_result.risk_level.as_str().to_string(),
+                    risk_score: security_result.risk_score as i64,
+                    risk_summary: Some(security_result.summary.clone()),
+                    security_action: security_result.action.as_str().to_string(),
+                    sanitized: if security_result.sanitized { 1 } else { 0 },
+                    blocked_reason: security_result.blocked_reason.clone(),
+                    trace_id: trace_id.clone(),
+                };
+                let log_id = log.id.clone();
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                last_error = Some(format!("{}: {}", channel.name, error_message));
+            }
+        }
+    }
+
+    let err_body = serde_json::json!({
+        "type": "error",
+        "error": {"type": "api_error", "message": format!("All channels failed for model {} after {} attempt(s): {}", model, max_attempts, last_error.unwrap_or_else(|| "unknown".to_string()))}
+    });
+    (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
+}
+
+// ─── OpenAI Responses API: POST /v1/responses ────────────────────────────────
+// Accepts Responses API format and proxies to upstream channels via Chat Completions.
+// Converts: Responses input → OpenAI messages → upstream → OpenAI response → Responses output.
+
+pub async fn handle_responses(
+    State(shared): State<SharedState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let body_str = String::from_utf8_lossy(&body);
+    let json: serde_json::Value = match serde_json::from_str(&body_str) {
+        Ok(j) => j,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
+    };
+
+    let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+
+    let api_key = match protocol::extract_api_key(&headers) {
+        Some(k) => k,
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": {"message": "Missing API key", "type": "authentication_error"}
+        }))).into_response(),
+    };
+
+    let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
+    let key_record = match repo.get_api_key_by_key(&api_key).await {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": {"message": "Invalid API key", "type": "authentication_error"}
+        }))).into_response(),
+    };
+
+    let is_quota_exceeded = match quota_exceeded(&repo, &shared.app, &key_record).await {
+        Ok(exceeded) => exceeded,
+        Err(error) => {
+            tracing::error!("quota check failed: {}", error);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": {"message": "Failed to check quota", "type": "server_error"}
+            }))).into_response();
+        }
+    };
+    if is_quota_exceeded {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "error": {"message": "Quota exceeded", "type": "rate_limit_error"}
+        }))).into_response();
+    }
+
+    let trace_id = headers.get("Wali-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+    let request_body_str = serde_json::to_string(&json).unwrap_or_default();
+    let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+
+    // Convert Responses API request to OpenAI Chat Completions format
+    let openai_body = protocol::responses_to_openai(&json);
+
+    if is_stream {
+        handle_responses_stream(shared, openai_body, model, key_record.id, key_record.name, request_body_str, trace_id).await
+    } else {
+        match proxy::handle_request(&repo, &shared.app, &key_record.id, &key_record.name, openai_body, false, Some(request_body_str), trace_id).await {
+            Ok(result) => {
+                // Convert OpenAI response to Responses API format
+                let responses_resp = protocol::openai_to_responses(&result.body, &model);
+                (StatusCode::OK, Json(responses_resp)).into_response()
+            }
+            Err((code, msg)) => {
+                let err_body = serde_json::json!({
+                    "error": {"message": msg, "type": "upstream_error", "code": code}
+                });
+                (StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY), Json(err_body)).into_response()
+            }
+        }
+    }
+}
+
+/// Stream handler for Responses API.
+/// Converts OpenAI SSE stream to Responses API SSE events.
+async fn handle_responses_stream(
+    shared: SharedState,
+    openai_body: serde_json::Value,
+    model: String,
+    api_key_id: String,
+    api_key_name: String,
+    request_body: String,
+    trace_id: Option<String>,
+) -> Response {
+    let security_settings = security::get_security_settings(&shared.app);
+    let security_result = security::scan_request(&openai_body, &security_settings);
+
+    let (forward_json, was_redacted) = if matches!(security_result.action, security::SecurityAction::Redact) || security_settings.redact_secrets {
+        security::redact_request_body(&openai_body, &security_settings)
+    } else {
+        (openai_body.clone(), false)
+    };
+    let mut security_result = security_result;
+    if was_redacted {
+        security_result.sanitized = true;
+    }
+
+    let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
+
+    if matches!(security_result.action, security::SecurityAction::Block) {
+        let log = crate::db::models::RequestLog {
+            response_choices: None,
+            id: crate::utils::id::new_id(),
+            seq: None,
+            api_key_id: Some(api_key_id.clone()),
+            api_key_name: Some(api_key_name.clone()),
+            channel_id: None,
+            channel_name: None,
+            model: model.clone(),
+            upstream_model: None,
+            mode: "responses".to_string(),
+            status_code: 451,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            duration_ms: 0,
+            error_message: security_result.blocked_reason.clone(),
+            is_stream: 1,
+            is_retry: 0,
+            created_at: crate::utils::time::now_iso(),
+            request_body: Some(request_body),
+            risk_level: security_result.risk_level.as_str().to_string(),
+            risk_score: security_result.risk_score as i64,
+            risk_summary: Some(security_result.summary.clone()),
+            security_action: security_result.action.as_str().to_string(),
+            sanitized: if security_result.sanitized { 1 } else { 0 },
+            blocked_reason: security_result.blocked_reason.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let log_id = log.id.clone();
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+        let err_body = serde_json::json!({"error": {"message": security_result.summary, "type": "security_blocked"}});
+        return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
+    }
+
+    let channels = match repo.get_enabled_channels().await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "No channels available").into_response(),
+    };
+
+    let selected_channels = Dispatcher::select_channels(&channels, &model);
+    if selected_channels.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
+    }
+
+    let request = ProxyRequest { model: model.clone(), body: forward_json.clone(), stream: true };
+    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
+    let max_attempts = if retry_enabled {
+        (retry_times.max(0) as usize + 1).min(selected_channels.len())
+    } else { 1 };
+
+    let mut last_error = None;
+
+    for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
+        let config = Dispatcher::channel_to_config(&channel);
+        let adaptor = get_adaptor(&channel.channel_type);
+        let upstream_model = {
+            let mapping = &config.model_mapping;
+            if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
+                mapped.to_string()
+            } else { model.clone() }
+        };
+
+        match adaptor.forward_stream(&request, &config).await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let body_str = resp.text().await.unwrap_or_default();
+                    last_error = Some(format!("{}: {}", channel.name, body_str));
+                    continue;
+                }
+
+                let start = std::time::Instant::now();
+                let channel_id = channel.id.clone();
+                let channel_name = channel.name.clone();
+                let repo_clone = repo.clone();
+                let api_key_id_clone = api_key_id.clone();
+                let api_key_name_clone = api_key_name.clone();
+                let model_clone = model.clone();
+                let upstream_model_clone = upstream_model.clone();
+                let request_body_clone = request_body.clone();
+                let security_result_clone = security_result.clone();
+                let trace_id_clone = trace_id.clone();
+                let is_retry = if attempt > 0 { 1 } else { 0 };
+
+                let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+                let upstream_stream = resp.bytes_stream();
+
+                let passthrough_stream = async_stream::stream! {
+                    tokio::pin!(upstream_stream);
+
+                    // Emit response.created event
+                    let created = crate::protocol::responses::create_response_created_event(&model_clone, &response_id);
+                    yield Ok::<_, std::io::Error>(created.into_bytes().into());
+
+                    let mut usage_prompt: i64 = 0;
+                    let mut usage_completion: i64 = 0;
+                    let mut usage_total: i64 = 0;
+                    let mut had_error = false;
+                    let mut accumulated_content = String::new();
+
+                    while let Some(chunk_result) = upstream_stream.next().await {
+                        match chunk_result {
+                            Ok(bytes) => {
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    if let Some((p, c, t)) = crate::protocol::responses::parse_usage_from_sse_chunk(text) {
+                                        usage_prompt = p;
+                                        usage_completion = c;
+                                        usage_total = t;
+                                    }
+                                    // Accumulate content for logging
+                                    for line in text.lines() {
+                                        let trimmed = line.trim();
+                                        if !trimmed.starts_with("data:") { continue; }
+                                        let data_str = trimmed.trim_start_matches("data:").trim();
+                                        if data_str == "[DONE]" || data_str.is_empty() { continue; }
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                                                if let Some(choice) = choices.first() {
+                                                    if let Some(delta) = choice.get("delta") {
+                                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                                            accumulated_content.push_str(content);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Convert OpenAI SSE → Responses SSE events
+                                    let events = crate::protocol::responses::convert_openai_sse_to_responses(
+                                        text, &model_clone, &response_id
+                                    );
+                                    for event in events {
+                                        yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                                    }
+                                } else {
+                                    yield Ok::<_, std::io::Error>(bytes);
+                                }
+                            }
+                            Err(e) => {
+                                had_error = true;
+                                let err_event = format!(
+                                    "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response_id\":\"{}\",\"error\":{{\"message\":\"Stream interrupted: {}\"}}}}\n\n",
+                                    response_id, e
+                                );
+                                yield Ok::<_, std::io::Error>(err_event.into_bytes().into());
+                                break;
+                            }
+                        }
+                    }
+
+                    // Build response_choices for logging
+                    let response_choices = if !accumulated_content.is_empty() {
+                        Some(serde_json::to_string(&vec![serde_json::json!({
+                            "index": 0,
+                            "message": {"role": "assistant", "content": accumulated_content},
+                            "finish_reason": "stop",
+                        })]).unwrap_or_default())
+                    } else { None };
+
+                    let log = crate::db::models::RequestLog {
+                        id: crate::utils::id::new_id(),
+                        seq: None,
+                        api_key_id: Some(api_key_id_clone.clone()),
+                        api_key_name: Some(api_key_name_clone.clone()),
+                        channel_id: Some(channel_id),
+                        channel_name: Some(channel_name),
+                        model: model_clone.clone(),
+                        upstream_model: Some(upstream_model_clone),
+                        mode: "responses".to_string(),
+                        status_code: if had_error { 502 } else { 200 },
+                        prompt_tokens: usage_prompt,
+                        completion_tokens: usage_completion,
+                        total_tokens: usage_total,
+                        duration_ms: start.elapsed().as_millis() as i64,
+                        error_message: if had_error { Some("Stream interrupted".to_string()) } else { None },
+                        is_stream: 1,
+                        is_retry,
+                        created_at: crate::utils::time::now_iso(),
+                        request_body: Some(request_body_clone),
+                        response_choices,
+                        risk_level: security_result_clone.risk_level.as_str().to_string(),
+                        risk_score: security_result_clone.risk_score as i64,
+                        risk_summary: Some(security_result_clone.summary.clone()),
+                        security_action: security_result_clone.action.as_str().to_string(),
+                        sanitized: if security_result_clone.sanitized { 1 } else { 0 },
+                        blocked_reason: security_result_clone.blocked_reason.clone(),
+                        trace_id: trace_id_clone,
+                    };
+                    let log_id = log.id.clone();
+                    if let Err(e) = repo_clone.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                    if usage_total > 0 {
+                        if let Err(e) = repo_clone.increment_quota(&api_key_id_clone, usage_total).await { eprintln!("[WARN] increment_quota failed: {}", e); }
+                    }
+                };
+
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive")
+                    .body(Body::from_stream(passthrough_stream))
+                    .unwrap();
+            }
+            Err(e) => {
+                let error_message = e.to_string();
+                let log = crate::db::models::RequestLog {
+                    id: crate::utils::id::new_id(),
+                    seq: None,
+                    api_key_id: Some(api_key_id.clone()),
+                    api_key_name: Some(api_key_name.clone()),
+                    channel_id: Some(channel.id.clone()),
+                    channel_name: Some(channel.name.clone()),
+                    model: model.clone(),
+                    upstream_model: Some(upstream_model.clone()),
+                    mode: "responses".to_string(),
+                    status_code: 502,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    duration_ms: 0,
+                    error_message: Some(error_message.clone()),
+                    is_stream: 1,
+                    is_retry: if attempt > 0 { 1 } else { 0 },
+                    created_at: crate::utils::time::now_iso(),
+                    request_body: Some(request_body.clone()),
+                    response_choices: None,
+                    risk_level: security_result.risk_level.as_str().to_string(),
+                    risk_score: security_result.risk_score as i64,
+                    risk_summary: Some(security_result.summary.clone()),
+                    security_action: security_result.action.as_str().to_string(),
+                    sanitized: if security_result.sanitized { 1 } else { 0 },
+                    blocked_reason: security_result.blocked_reason.clone(),
+                    trace_id: trace_id.clone(),
+                };
+                let log_id = log.id.clone();
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                last_error = Some(format!("{}: {}", channel.name, error_message));
+            }
+        }
+    }
+
+    let err_body = serde_json::json!({
+        "error": {
+            "message": format!("All channels failed for model {} after {} attempt(s): {}", model, max_attempts, last_error.unwrap_or_else(|| "unknown".to_string())),
+            "type": "upstream_error"
+        }
+    });
+    (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
+}
+
 pub async fn handle_completions(State(_shared): State<SharedState>) -> Response {
     (StatusCode::NOT_IMPLEMENTED, "Not implemented yet").into_response()
 }
 
-pub async fn handle_embeddings(State(_shared): State<SharedState>) -> Response {
-    (StatusCode::NOT_IMPLEMENTED, "Not implemented yet").into_response()
+pub async fn handle_embeddings(
+    State(shared): State<SharedState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let body_str = String::from_utf8_lossy(&body);
+    let json: serde_json::Value = match serde_json::from_str(&body_str) {
+        Ok(j) => j,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
+    };
+
+    let api_key = match protocol::extract_api_key(&headers) {
+        Some(k) => k,
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": {"message": "Missing API key", "type": "authentication_error"}
+        }))).into_response(),
+    };
+
+    let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
+    let key_record = match repo.get_api_key_by_key(&api_key).await {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": {"message": "Invalid API key", "type": "authentication_error"}
+        }))).into_response(),
+    };
+
+    let is_quota_exceeded = match quota_exceeded(&repo, &shared.app, &key_record).await {
+        Ok(exceeded) => exceeded,
+        Err(error) => {
+            tracing::error!("quota check failed: {}", error);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": {"message": "Failed to check quota", "type": "server_error"}
+            }))).into_response();
+        }
+    };
+    if is_quota_exceeded {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "error": {"message": "Quota exceeded", "type": "rate_limit_error"}
+        }))).into_response();
+    }
+
+    let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let trace_id = headers.get("Wali-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+    let request_body_str = serde_json::to_string(&json).unwrap_or_default();
+
+    // Security scan
+    let security_settings = security::get_security_settings(&shared.app);
+    let security_result = security::scan_request(&json, &security_settings);
+
+    if matches!(security_result.action, security::SecurityAction::Block) {
+        let log = crate::db::models::RequestLog {
+            response_choices: None,
+            id: crate::utils::id::new_id(),
+            seq: None,
+            api_key_id: Some(key_record.id.clone()),
+            api_key_name: Some(key_record.name.clone()),
+            channel_id: None,
+            channel_name: None,
+            model: model.clone(),
+            upstream_model: None,
+            mode: "embedding".to_string(),
+            status_code: 451,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            duration_ms: 0,
+            error_message: security_result.blocked_reason.clone(),
+            is_stream: 0,
+            is_retry: 0,
+            created_at: crate::utils::time::now_iso(),
+            request_body: Some(request_body_str),
+            risk_level: security_result.risk_level.as_str().to_string(),
+            risk_score: security_result.risk_score as i64,
+            risk_summary: Some(security_result.summary.clone()),
+            security_action: security_result.action.as_str().to_string(),
+            sanitized: if security_result.sanitized { 1 } else { 0 },
+            blocked_reason: security_result.blocked_reason.clone(),
+            trace_id: trace_id.clone(),
+        };
+        let log_id = log.id.clone();
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+        return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(serde_json::json!({
+            "error": {"message": security_result.summary, "type": "security_blocked"}
+        }))).into_response();
+    }
+
+    // Select channels
+    let channels = match repo.get_enabled_channels().await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "No channels available").into_response(),
+    };
+
+    let selected_channels = Dispatcher::select_channels(&channels, &model);
+    if selected_channels.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
+    }
+
+    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
+    let max_attempts = if retry_enabled {
+        (retry_times.max(0) as usize + 1).min(selected_channels.len())
+    } else { 1 };
+
+    let mut last_error = None;
+    let start = std::time::Instant::now();
+    let client = reqwest::Client::new();
+
+    for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
+        let config = Dispatcher::channel_to_config(&channel);
+        let upstream_model = {
+            let mapping = &config.model_mapping;
+            if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
+                mapped.to_string()
+            } else { model.clone() }
+        };
+
+        // Build upstream embedding request — send directly to /embeddings
+        // (adaptor.forward() hard-codes /chat/completions which doesn't work for embeddings)
+        let base_url = config.base_url.trim_end_matches('/');
+        let embed_url = format!("{}/embeddings", base_url);
+        let embed_body = serde_json::json!({
+            "model": upstream_model,
+            "input": json.get("input").cloned().unwrap_or(serde_json::Value::Null),
+            "encoding_format": "float"
+        });
+
+        let result = client
+            .post(&embed_url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&embed_body)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let status = resp.status();
+                let resp_body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+                if !status.is_success() {
+                    let error_message = format!("HTTP {}: {}", status, serde_json::to_string(&resp_body).unwrap_or_default().chars().take(300).collect::<String>());
+                    let log = crate::db::models::RequestLog {
+                        id: crate::utils::id::new_id(),
+                        seq: None,
+                        api_key_id: Some(key_record.id.clone()),
+                        api_key_name: Some(key_record.name.clone()),
+                        channel_id: Some(channel.id.clone()),
+                        channel_name: Some(channel.name.clone()),
+                        model: model.clone(),
+                        upstream_model: Some(upstream_model.clone()),
+                        mode: "embedding".to_string(),
+                        status_code: status.as_u16() as i64,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        duration_ms: start.elapsed().as_millis() as i64,
+                        error_message: Some(error_message.clone()),
+                        is_stream: 0,
+                        is_retry: if attempt > 0 { 1 } else { 0 },
+                        created_at: crate::utils::time::now_iso(),
+                        request_body: Some(request_body_str.clone()),
+                        response_choices: None,
+                        risk_level: security_result.risk_level.as_str().to_string(),
+                        risk_score: security_result.risk_score as i64,
+                        risk_summary: Some(security_result.summary.clone()),
+                        security_action: security_result.action.as_str().to_string(),
+                        sanitized: if security_result.sanitized { 1 } else { 0 },
+                        blocked_reason: security_result.blocked_reason.clone(),
+                        trace_id: trace_id.clone(),
+                    };
+                    let log_id = log.id.clone();
+                    if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                    last_error = Some(error_message);
+                    continue;
+                }
+
+                // Extract usage from response
+                let usage_total = resp_body.get("usage").and_then(|u| u.get("total_tokens")).and_then(|t| t.as_u64()).unwrap_or(0) as i64;
+                let usage_prompt = resp_body.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64()).unwrap_or(0) as i64;
+
+                let log = crate::db::models::RequestLog {
+                    id: crate::utils::id::new_id(),
+                    seq: None,
+                    api_key_id: Some(key_record.id.clone()),
+                    api_key_name: Some(key_record.name.clone()),
+                    channel_id: Some(channel.id.clone()),
+                    channel_name: Some(channel.name.clone()),
+                    model: model.clone(),
+                    upstream_model: Some(upstream_model.clone()),
+                    mode: "embedding".to_string(),
+                    status_code: status.as_u16() as i64,
+                    prompt_tokens: usage_prompt,
+                    completion_tokens: 0,
+                    total_tokens: usage_total,
+                    duration_ms: start.elapsed().as_millis() as i64,
+                    error_message: None,
+                    is_stream: 0,
+                    is_retry: if attempt > 0 { 1 } else { 0 },
+                    created_at: crate::utils::time::now_iso(),
+                    request_body: Some(request_body_str.clone()),
+                    response_choices: None,
+                    risk_level: security_result.risk_level.as_str().to_string(),
+                    risk_score: security_result.risk_score as i64,
+                    risk_summary: Some(security_result.summary.clone()),
+                    security_action: security_result.action.as_str().to_string(),
+                    sanitized: if security_result.sanitized { 1 } else { 0 },
+                    blocked_reason: security_result.blocked_reason.clone(),
+                    trace_id: trace_id.clone(),
+                };
+                let log_id = log.id.clone();
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                if usage_total > 0 {
+                    if let Err(e) = repo.increment_quota(&key_record.id, usage_total).await { eprintln!("[WARN] increment_quota failed: {}", e); }
+                }
+
+                return (StatusCode::OK, Json(resp_body)).into_response();
+            }
+            Err(e) => {
+                let error_message = e.to_string();
+                let log = crate::db::models::RequestLog {
+                    id: crate::utils::id::new_id(),
+                    seq: None,
+                    api_key_id: Some(key_record.id.clone()),
+                    api_key_name: Some(key_record.name.clone()),
+                    channel_id: Some(channel.id.clone()),
+                    channel_name: Some(channel.name.clone()),
+                    model: model.clone(),
+                    upstream_model: Some(upstream_model.clone()),
+                    mode: "embedding".to_string(),
+                    status_code: 502,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    duration_ms: start.elapsed().as_millis() as i64,
+                    error_message: Some(error_message.clone()),
+                    is_stream: 0,
+                    is_retry: if attempt > 0 { 1 } else { 0 },
+                    created_at: crate::utils::time::now_iso(),
+                    request_body: Some(request_body_str.clone()),
+                    response_choices: None,
+                    risk_level: security_result.risk_level.as_str().to_string(),
+                    risk_score: security_result.risk_score as i64,
+                    risk_summary: Some(security_result.summary.clone()),
+                    security_action: security_result.action.as_str().to_string(),
+                    sanitized: if security_result.sanitized { 1 } else { 0 },
+                    blocked_reason: security_result.blocked_reason.clone(),
+                    trace_id: trace_id.clone(),
+                };
+                let log_id = log.id.clone();
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                last_error = Some(error_message);
+            }
+        }
+    }
+
+    let err_body = serde_json::json!({
+        "error": {
+            "message": format!("All channels failed for embedding model {} after {} attempt(s): {}", model, max_attempts, last_error.unwrap_or_else(|| "unknown".to_string())),
+            "type": "upstream_error"
+        }
+    });
+    (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
 }
 
 pub async fn handle_list_models(State(shared): State<SharedState>) -> Response {
@@ -469,13 +1546,18 @@ pub async fn handle_health(State(shared): State<SharedState>) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod quota_tests {
+    use super::quota_limit_reached;
 
     #[test]
-    fn streaming_usage_is_read_from_sse_payload() {
-        let chunk = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8,\"total_tokens\":20}}\n\n";
-        assert_eq!(parse_usage_from_chunk(chunk), Some((12, 8, 20)));
-        assert_eq!(parse_usage_from_chunk("data: [DONE]\n\n"), None);
+    fn zero_quota_is_unlimited() {
+        assert!(!quota_limit_reached(0, 10_000));
+    }
+
+    #[test]
+    fn positive_quota_is_reached_at_the_limit() {
+        assert!(!quota_limit_reached(100, 99));
+        assert!(quota_limit_reached(100, 100));
+        assert!(quota_limit_reached(100, 101));
     }
 }

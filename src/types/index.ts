@@ -64,7 +64,8 @@ export interface CreateApiKeyInput {
 
 export interface UpdateApiKeyInput {
     id: string;
-    status: number;
+    status?: number;
+    quota_limit?: number;
 }
 
 export type RiskLevel = "clean" | "info" | "low" | "medium" | "high" | "critical";
@@ -149,6 +150,8 @@ export interface Settings {
     auto_start: boolean;
     retry_enabled: boolean;
     retry_times: number;
+    default_key_quota: number;
+    total_quota: number;
     security_enabled: boolean;
     security_mode: string;
     security_scan_unicode: boolean;

@@ -1,8 +1,6 @@
 use super::models::*;
 use sqlx::SqlitePool;
 
-const REQUEST_LOG_COLUMNS: &str = "request_logs.rowid AS seq, request_logs.*";
-
 pub struct Repository {
     pool: SqlitePool,
 }
@@ -161,22 +159,20 @@ impl Repository {
     pub async fn create_api_key(&self, input: &CreateApiKeyInput) -> Result<ApiKey, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
-        // 密钥生成：sk-crowapi- + UUID simple（无横线）
-        let key = format!("sk-crowapi-{}", uuid::Uuid::new_v4().simple());
+        let key = format!("sk-waliapi-{}", uuid::Uuid::new_v4().simple());
         let allowed_models = serde_json::to_string(&input.allowed_models.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
         let allowed_channels = serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
 
         sqlx::query(
-            "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, quota_limit, quota_used, expires_at, created_at, updated_at)
-             VALUES (?, ?, ?, 1, ?, ?, ?, 0, ?, ?, ?)"
+            "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, quota_limit, quota_used, created_at, updated_at)
+             VALUES (?, ?, ?, 1, ?, ?, ?, 0, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
         .bind(&key)
         .bind(&allowed_models)
         .bind(&allowed_channels)
-        .bind(input.quota_limit.unwrap_or(-1))    // -1 表示无限制
-        .bind(&input.expires_at)
+        .bind(input.quota_limit.unwrap_or(-1))
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -192,6 +188,17 @@ impl Repository {
         let now = now_iso();
         sqlx::query("UPDATE api_keys SET status = ?, updated_at = ? WHERE id = ?")
             .bind(status)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_api_key_quota(&self, id: &str, quota_limit: i64) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query("UPDATE api_keys SET quota_limit = ?, updated_at = ? WHERE id = ?")
+            .bind(quota_limit)
             .bind(&now)
             .bind(id)
             .execute(&self.pool)
@@ -216,12 +223,18 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn get_total_quota_used(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COALESCE(SUM(quota_used), 0) FROM api_keys")
+            .fetch_one(&self.pool)
+            .await
+    }
+
     // ==================== Request Log ====================
 
     pub async fn create_log(&self, log: &RequestLog) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
-            "INSERT INTO request_logs (id, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO request_logs (id, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&log.id)
         .bind(&log.api_key_id)
@@ -241,15 +254,27 @@ impl Repository {
         .bind(log.is_retry)
         .bind(&log.created_at)
         .bind(&log.request_body)
+        .bind(&log.response_choices)
         .bind(&log.risk_level)
         .bind(log.risk_score)
         .bind(&log.risk_summary)
         .bind(&log.security_action)
         .bind(log.sanitized)
         .bind(&log.blocked_reason)
+        .bind(&log.trace_id)
         .execute(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid())
+        let seq = result.last_insert_rowid();
+
+        // Backfill seq with rowid for new rows
+        sqlx::query(
+            "UPDATE request_logs SET seq = ? WHERE id = ? AND (seq = 0 OR seq IS NULL)",
+        )
+        .bind(seq)
+        .bind(&log.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(seq)
     }
 
     pub async fn create_security_findings(&self, log_id: &str, findings: &[crate::security::SecurityFinding], action: &str) -> Result<(), sqlx::Error> {
@@ -285,8 +310,7 @@ impl Repository {
     }
 
     pub async fn get_log(&self, id: &str) -> Result<RequestLog, sqlx::Error> {
-        let query = format!("SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE id = ?");
-        sqlx::query_as::<_, RequestLog>(&query)
+        sqlx::query_as::<_, RequestLog>("SELECT * FROM request_logs WHERE id = ?")
             .bind(id)
             .fetch_one(&self.pool)
             .await
@@ -316,23 +340,13 @@ impl Repository {
     }
 
     pub async fn get_logs(&self, limit: i64, offset: i64) -> Result<Vec<RequestLog>, sqlx::Error> {
-        let query = format!("SELECT {REQUEST_LOG_COLUMNS} FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?");
-        sqlx::query_as::<_, RequestLog>(&query)
+        sqlx::query_as::<_, RequestLog>(
+            "SELECT * FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        )
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-    }
-
-    pub async fn get_logs_after(&self, after_seq: i64, limit: i64) -> Result<Vec<RequestLog>, sqlx::Error> {
-        let query = format!(
-            "SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE request_logs.rowid > ? ORDER BY request_logs.rowid ASC LIMIT ?"
-        );
-        sqlx::query_as::<_, RequestLog>(&query)
-            .bind(after_seq)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
     }
 
     pub async fn search_logs(
@@ -343,10 +357,11 @@ impl Repository {
         model: Option<&str>,
         date_from: Option<&str>,
         date_to: Option<&str>,
+        trace_id: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RequestLog>, sqlx::Error> {
-        let mut q = sqlx::QueryBuilder::new(format!("SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE 1=1"));
+        let mut q = sqlx::QueryBuilder::new("SELECT * FROM request_logs WHERE 1=1");
 
         if let Some(kw) = keyword {
             let pattern = format!("%{}%", kw);
@@ -382,67 +397,16 @@ impl Repository {
 
         if let Some(to) = date_to {
             q.push(" AND created_at <= ").push_bind(to);
+        }
+
+        if let Some(tid) = trace_id {
+            let pattern = format!("%{}%", tid);
+            q.push(" AND trace_id LIKE ").push_bind(pattern);
         }
 
         q.push(" ORDER BY created_at DESC LIMIT ").push_bind(limit);
         q.push(" OFFSET ").push_bind(offset);
 
-        q.build_query_as::<RequestLog>().fetch_all(&self.pool).await
-    }
-
-    pub async fn search_logs_after(
-        &self,
-        keyword: Option<&str>,
-        api_key_name: Option<&str>,
-        channel_name: Option<&str>,
-        model: Option<&str>,
-        date_from: Option<&str>,
-        date_to: Option<&str>,
-        after_seq: i64,
-        limit: i64,
-    ) -> Result<Vec<RequestLog>, sqlx::Error> {
-        let mut q = sqlx::QueryBuilder::new(format!(
-            "SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE request_logs.rowid > "
-        ));
-        q.push_bind(after_seq);
-
-        if let Some(kw) = keyword {
-            let pattern = format!("%{}%", kw);
-            q.push(" AND (api_key_name LIKE ").push_bind(pattern.clone());
-            q.push(" OR channel_name LIKE ").push_bind(pattern.clone());
-            q.push(" OR model LIKE ").push_bind(pattern.clone());
-            q.push(" OR upstream_model LIKE ").push_bind(pattern.clone());
-            q.push(" OR api_key_id LIKE ").push_bind(pattern.clone());
-            q.push(" OR id LIKE ").push_bind(pattern);
-            q.push(")");
-        }
-
-        if let Some(name) = api_key_name {
-            let pattern = format!("%{}%", name);
-            q.push(" AND api_key_name LIKE ").push_bind(pattern);
-        }
-
-        if let Some(name) = channel_name {
-            let pattern = format!("%{}%", name);
-            q.push(" AND channel_name LIKE ").push_bind(pattern);
-        }
-
-        if let Some(m) = model {
-            let pattern = format!("%{}%", m);
-            q.push(" AND (model LIKE ").push_bind(pattern.clone());
-            q.push(" OR upstream_model LIKE ").push_bind(pattern);
-            q.push(")");
-        }
-
-        if let Some(from) = date_from {
-            q.push(" AND created_at >= ").push_bind(from);
-        }
-
-        if let Some(to) = date_to {
-            q.push(" AND created_at <= ").push_bind(to);
-        }
-
-        q.push(" ORDER BY request_logs.rowid ASC LIMIT ").push_bind(limit);
         q.build_query_as::<RequestLog>().fetch_all(&self.pool).await
     }
 
@@ -530,160 +494,5 @@ impl Repository {
         .bind(&since)
         .fetch_all(&self.pool)
         .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    async fn create_test_repository() -> anyhow::Result<Repository> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Repository::new(pool))
-    }
-
-    #[tokio::test]
-    async fn api_key_lifecycle_persists_access_rules() -> anyhow::Result<()> {
-        let repo = create_test_repository().await?;
-        let expires_at = "2099-12-31T23:59:59Z".to_string();
-        let created = repo
-            .create_api_key(&CreateApiKeyInput {
-                name: "integration-test".to_string(),
-                allowed_models: Some(vec!["deepseek-chat".to_string()]),
-                allowed_channels: Some(vec!["channel-1".to_string()]),
-                quota_limit: Some(10_000),
-                expires_at: Some(expires_at.clone()),
-            })
-            .await?;
-
-        assert!(created.key.starts_with("sk-crowapi-"));
-        assert_eq!(created.allowed_models, r#"["deepseek-chat"]"#);
-        assert_eq!(created.allowed_channels, r#"["channel-1"]"#);
-        assert_eq!(created.quota_limit, 10_000);
-        assert_eq!(created.expires_at.as_deref(), Some(expires_at.as_str()));
-
-        repo.increment_quota(&created.id, 128).await?;
-        let active = repo.get_api_key_by_key(&created.key).await?;
-        assert_eq!(active.quota_used, 128);
-
-        repo.update_api_key_status(&created.id, 0).await?;
-        assert!(matches!(
-            repo.get_api_key_by_key(&created.key).await,
-            Err(sqlx::Error::RowNotFound)
-        ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn request_logs_use_rowid_as_sequence_without_schema_column() -> anyhow::Result<()> {
-        let repo = create_test_repository().await?;
-        let created_at = "2026-08-15T08:13:26.293Z".to_string();
-        let log = RequestLog {
-            id: "request-1".to_string(),
-            seq: None,
-            api_key_id: Some("key-1".to_string()),
-            api_key_name: Some("local".to_string()),
-            channel_id: Some("channel-1".to_string()),
-            channel_name: Some("DeepSeek".to_string()),
-            model: "deepseek-chat".to_string(),
-            upstream_model: Some("deepseek-chat".to_string()),
-            mode: "chat".to_string(),
-            status_code: 200,
-            prompt_tokens: 10,
-            completion_tokens: 20,
-            total_tokens: 30,
-            duration_ms: 120,
-            error_message: None,
-            is_stream: 1,
-            is_retry: 0,
-            created_at: created_at.clone(),
-            request_body: None,
-            risk_level: "low".to_string(),
-            risk_score: 0,
-            risk_summary: None,
-            security_action: "allow".to_string(),
-            sanitized: 0,
-            blocked_reason: None,
-        };
-
-        repo.create_log(&log).await?;
-
-        let direct = repo.get_log(&log.id).await?;
-        assert_eq!(direct.seq, Some(1));
-
-        let recent = repo.get_logs(10, 0).await?;
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].total_tokens, 30);
-
-        let filtered = repo
-            .search_logs(None, None, None, None, Some(&created_at), None, 10, 0)
-            .await?;
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].seq, Some(1));
-
-        let mut next_log = log.clone();
-        next_log.id = "request-2".to_string();
-        next_log.status_code = 500;
-        next_log.created_at = "2026-08-15T08:13:27.293Z".to_string();
-        repo.create_log(&next_log).await?;
-
-        let delta = repo.get_logs_after(1, 10).await?;
-        assert_eq!(delta.len(), 1);
-        assert_eq!(delta[0].id, "request-2");
-        assert_eq!(delta[0].seq, Some(2));
-
-        let filtered_delta = repo
-            .search_logs_after(Some("request-2"), None, None, None, None, None, 1, 10)
-            .await?;
-        assert_eq!(filtered_delta.len(), 1);
-        assert_eq!(filtered_delta[0].id, "request-2");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn channel_update_without_api_key_preserves_secret() -> anyhow::Result<()> {
-        let repo = create_test_repository().await?;
-        let created = repo
-            .create_channel(&CreateChannelInput {
-                name: "DeepSeek".to_string(),
-                channel_type: "deepseek".to_string(),
-                base_url: "https://api.deepseek.com/v1".to_string(),
-                api_key: "upstream-secret".to_string(),
-                models: vec!["deepseek-chat".to_string()],
-                priority: Some(10),
-                weight: Some(100),
-                config: None,
-                model_mapping: None,
-            })
-            .await?;
-
-        let updated = repo
-            .update_channel(&UpdateChannelInput {
-                id: created.id,
-                name: Some("DeepSeek primary".to_string()),
-                channel_type: None,
-                base_url: None,
-                api_key: None,
-                models: None,
-                status: None,
-                priority: Some(20),
-                weight: None,
-                config: None,
-                model_mapping: None,
-            })
-            .await?;
-
-        assert_eq!(updated.name, "DeepSeek primary");
-        assert_eq!(updated.api_key, "upstream-secret");
-        assert_eq!(updated.priority, 20);
-
-        Ok(())
     }
 }

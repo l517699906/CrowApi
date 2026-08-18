@@ -43,7 +43,19 @@ pub async fn get_api_keys(state: tauri::State<'_, std::sync::Arc<AppState>>) -> 
 }
 
 #[tauri::command]
-pub async fn create_api_key(input: CreateApiKeyInput, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<ApiKeyDto, String> {
+pub async fn create_api_key(
+    mut input: CreateApiKeyInput,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<ApiKeyDto, String> {
+    let quota_limit = input
+        .quota_limit
+        .unwrap_or_else(|| crate::config::load_default_key_quota(&app));
+    if quota_limit < 0 {
+        return Err("密钥配额不能小于 0".to_string());
+    }
+    input.quota_limit = Some(quota_limit);
+
     let repo = Repository::new(state.db.pool.clone());
     repo.create_api_key(&input).await.map_err(|e| e.to_string()).map(Into::into)
 }
@@ -52,16 +64,31 @@ pub async fn create_api_key(input: CreateApiKeyInput, state: tauri::State<'_, st
 pub struct UpdateApiKeyInput {
     pub id: String,
     pub status: Option<i64>,
+    pub quota_limit: Option<i64>,
 }
 
 #[tauri::command]
 pub async fn update_api_key(input: UpdateApiKeyInput, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<(), String> {
     let repo = Repository::new(state.db.pool.clone());
-    let status = input.status.ok_or_else(|| "缺少密钥状态".to_string())?;
-    if !matches!(status, 0 | 1) {
-        return Err("密钥状态只能是 0 或 1".to_string());
+    if input.status.is_none() && input.quota_limit.is_none() {
+        return Err("没有可更新的密钥字段".to_string());
     }
-    repo.update_api_key_status(&input.id, status).await.map_err(|e| e.to_string())
+    if let Some(status) = input.status {
+        if !matches!(status, 0 | 1) {
+            return Err("密钥状态只能是 0 或 1".to_string());
+        }
+    }
+    if input.quota_limit.is_some_and(|quota_limit| quota_limit < 0) {
+        return Err("密钥配额不能小于 0".to_string());
+    }
+
+    if let Some(status) = input.status {
+        repo.update_api_key_status(&input.id, status).await.map_err(|e| e.to_string())?;
+    }
+    if let Some(quota_limit) = input.quota_limit {
+        repo.update_api_key_quota(&input.id, quota_limit).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

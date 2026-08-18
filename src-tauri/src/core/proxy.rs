@@ -1,5 +1,4 @@
 use crate::adaptor::{get_adaptor, ProxyRequest, TokenUsage};
-use crate::core::access::scope_allows;
 use crate::core::dispatcher::Dispatcher;
 use crate::db::models::{Channel, RequestLog};
 use crate::db::repository::Repository;
@@ -8,7 +7,9 @@ use crate::security;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::AppHandle;
+use tauri_plugin_store::StoreExt;
 
+#[allow(dead_code)]
 pub struct ProxyResult {
     pub status: u16,
     pub body: serde_json::Value,
@@ -22,19 +23,17 @@ pub async fn handle_request(
     app: &AppHandle,
     api_key_id: &str,
     api_key_name: &str,
-    allowed_channel_ids: &[String],
     body: serde_json::Value,
     is_stream: bool,
     request_body: Option<String>,
+    trace_id: Option<String>,
 ) -> Result<ProxyResult, (u16, String)> {
-    let start = Instant::now();
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
-    // 从 Tauri Store 读取安全配置
+    let start: Instant = Instant::now();
+    let model: String = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     let security_settings = security::get_security_settings(app);
-    // 扫描请求体（凭证泄露、敏感路径、隐写字符等）
     let security_result = security::scan_request(&body, &security_settings);
 
-    // 如果策略是脱敏（或强制脱敏开关打开），在转发前改写请求体
+    // Real redaction: if redact mode is active, sanitize the request body before forwarding
     let (forward_body, was_redacted) = if matches!(security_result.action, security::SecurityAction::Redact) || security_settings.redact_secrets {
         security::redact_request_body(&body, &security_settings)
     } else {
@@ -45,14 +44,13 @@ pub async fn handle_request(
         security_result.sanitized = true;
     }
 
-    // 策略判定为阻断：记录日志后返回 451（法律原因不可用）
     if matches!(security_result.action, security::SecurityAction::Block) {
         let log = RequestLog {
             id: utils::id::new_id(),
             seq: None,
             api_key_id: Some(api_key_id.to_string()),
             api_key_name: Some(api_key_name.to_string()),
-            channel_id: None,                           // 还没走到渠道，无渠道信息
+            channel_id: None,
             channel_name: None,
             model: model.clone(),
             upstream_model: None,
@@ -67,30 +65,22 @@ pub async fn handle_request(
             is_retry: 0,
             created_at: utils::time::now_iso(),
             request_body: request_body.clone(),
+            response_choices: None,
             risk_level: security_result.risk_level.as_str().to_string(),
             risk_score: security_result.risk_score as i64,
             risk_summary: Some(security_result.summary.clone()),
             security_action: security_result.action.as_str().to_string(),
             sanitized: if security_result.sanitized { 1 } else { 0 },
             blocked_reason: security_result.blocked_reason.clone(),
+            trace_id: trace_id.clone(),
         };
-        let _ = crate::core::log_events::persist_log(
-            repo,
-            app,
-            &log,
-            &security_result.findings,
-            security_result.action.as_str(),
-        ).await;
+        let log_id = log.id.clone();
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
         return Err((451, security_result.summary));
     }
 
-    let channels: Vec<Channel> = repo
-        .get_enabled_channels()
-        .await
-        .map_err(|e| (500, format!("DB error: {}", e)))?
-        .into_iter()
-        .filter(|channel| scope_allows(allowed_channel_ids, &channel.id, "全部渠道"))
-        .collect();
+    let channels = repo.get_enabled_channels().await.map_err(|e| (500, format!("DB error: {}", e)))?;
     if channels.is_empty() {
         return Err((503, "No available channels".to_string()));
     }
@@ -106,9 +96,7 @@ pub async fn handle_request(
         stream: is_stream,
     };
 
-    // 从 Tauri Store 读取重试配置
     let (retry_enabled, retry_times) = get_retry_settings(app);
-    // 最大尝试次数 = 重试次数 + 1（首次），且不超过可用渠道数
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected_channels.len())
     } else {
@@ -125,7 +113,7 @@ pub async fn handle_request(
         let duration_ms = attempt_start.elapsed().as_millis() as u64;
         let is_retry = if attempt > 0 { 1 } else { 0 };
 
-        // 计算映射后的上游真实模型名（用于日志展示）
+        // Compute the actual upstream model after mapping
         let upstream_model = {
             let mapping = &config.model_mapping;
             if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
@@ -137,13 +125,18 @@ pub async fn handle_request(
 
         match result {
             Ok((status, resp_body, usage)) => {
-                // 响应侧安全扫描（可选开关）
+                // Extract and log choices
+                let response_choices = resp_body.get("choices").and_then(|c| serde_json::to_string(c).ok());
+                if let Some(ref choices) = response_choices {
+                    println!("Response choices: {}", choices);
+                }
+
+                // Scan response for risks
                 let resp_security = security::scan_response(&resp_body, &security_settings);
                 let resp_findings_count = resp_security.findings.len();
                 if resp_findings_count > 0 {
-                    // 响应的风险发现合并到请求的风险记录中
+                    // Merge response findings into request findings for logging
                     security_result.findings.extend(resp_security.findings);
-                    // 取更高的风险等级
                     if resp_security.risk_level.rank() > security_result.risk_level.rank() {
                         security_result.risk_level = resp_security.risk_level;
                         security_result.risk_score = security_result.risk_score.max(resp_security.risk_score);
@@ -171,24 +164,21 @@ pub async fn handle_request(
                     is_retry,
                     created_at: utils::time::now_iso(),
                     request_body: request_body.clone(),
+                    response_choices: response_choices.clone(),
                     risk_level: security_result.risk_level.as_str().to_string(),
                     risk_score: security_result.risk_score as i64,
                     risk_summary: Some(security_result.summary.clone()),
                     security_action: security_result.action.as_str().to_string(),
                     sanitized: if security_result.sanitized { 1 } else { 0 },
                     blocked_reason: security_result.blocked_reason.clone(),
+                    trace_id: trace_id.clone(),
                 };
-                let _ = crate::core::log_events::persist_log(
-                    repo,
-                    app,
-                    &log,
-                    &security_result.findings,
-                    security_result.action.as_str(),
-                ).await;
+                let log_id = log.id.clone();
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
 
-                // 配额扣减
                 if let Some(ref u) = usage {
-                    let _ = repo.increment_quota(api_key_id, u.total_tokens as i64).await;
+                    if let Err(e) = repo.increment_quota(api_key_id, u.total_tokens as i64).await { eprintln!("[WARN] increment_quota failed: {}", e); }
                 }
 
                 return Ok(ProxyResult {
@@ -200,7 +190,6 @@ pub async fn handle_request(
                 });
             }
             Err(e) => {
-                // 失败路径：记录日志，继续下一个渠道
                 let error_message = e.to_string();
                 let log = RequestLog {
                     id: utils::id::new_id(),
@@ -222,26 +211,23 @@ pub async fn handle_request(
                     is_retry,
                     created_at: utils::time::now_iso(),
                     request_body: request_body.clone(),
+                    response_choices: None,
                     risk_level: security_result.risk_level.as_str().to_string(),
                     risk_score: security_result.risk_score as i64,
                     risk_summary: Some(security_result.summary.clone()),
                     security_action: security_result.action.as_str().to_string(),
                     sanitized: if security_result.sanitized { 1 } else { 0 },
                     blocked_reason: security_result.blocked_reason.clone(),
+                    trace_id: trace_id.clone(),
                 };
-                let _ = crate::core::log_events::persist_log(
-                    repo,
-                    app,
-                    &log,
-                    &security_result.findings,
-                    security_result.action.as_str(),
-                ).await;
+                let log_id = log.id.clone();
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                 last_error = Some(error_message);
             }
         }
     }
 
-    // 所有渠道都失败了
     Err((
         502,
         format!(
@@ -254,6 +240,16 @@ pub async fn handle_request(
 }
 
 pub fn get_retry_settings(app: &AppHandle) -> (bool, i32) {
-    let settings = crate::config::load_settings(app);
-    (settings.retry_enabled, settings.retry_times)
+    if let Ok(store) = app.store("settings.json") {
+        let enabled = store
+            .get("retry.enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let times = store
+            .get("retry.times")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(2) as i32;
+        return (enabled, times);
+    }
+    (true, 2)
 }

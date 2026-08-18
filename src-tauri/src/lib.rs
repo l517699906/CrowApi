@@ -6,6 +6,7 @@ mod server;
 mod db;
 mod utils;
 mod security;
+mod protocol;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

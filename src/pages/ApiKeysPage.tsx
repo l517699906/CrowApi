@@ -3,6 +3,7 @@ import {
     Check,
     Copy,
     KeyRound,
+    Pencil,
     Plus,
     ShieldCheck,
     Trash2,
@@ -10,8 +11,10 @@ import {
     XCircle,
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { DEFAULT_SETTINGS } from "../config/defaults";
 import { formatCompactNumber, formatDateTime, formatQuota } from "../lib/format";
-import { apiKeyApi, channelApi, statsApi } from "../lib/api";
+import { apiKeyApi, channelApi, settingsApi, statsApi } from "../lib/api";
+import { MAX_QUOTA, normalizeQuota } from "../lib/quota";
 import { errorMessage, queryKeys } from "../lib/query";
 import type { ApiKey } from "../types";
 import { IconButton, Modal, PageTitle, StatusBadge, Toast, Toggle } from "../components/ui";
@@ -24,13 +27,15 @@ interface KeyFormState {
     expiresAt: string;
 }
 
-const initialForm: KeyFormState = {
-    name: "",
-    quotaLimit: 1_000_000,
-    modelScope: "",
-    channelScope: "",
-    expiresAt: "",
-};
+function createInitialForm(quotaLimit = DEFAULT_SETTINGS.default_key_quota): KeyFormState {
+    return {
+        name: "",
+        quotaLimit,
+        modelScope: "",
+        channelScope: "",
+        expiresAt: "",
+    };
+}
 
 export function ApiKeysPage() {
     const queryClient = useQueryClient();
@@ -46,18 +51,25 @@ export function ApiKeysPage() {
         queryKey: queryKeys.dashboard,
         queryFn: statsApi.getDashboard,
     });
+    const { data: settings } = useQuery({
+        queryKey: queryKeys.settings,
+        queryFn: settingsApi.get,
+    });
     const [createOpen, setCreateOpen] = useState(false);
-    const [form, setForm] = useState<KeyFormState>(initialForm);
+    const [form, setForm] = useState<KeyFormState>(() => createInitialForm());
     const [createdKey, setCreatedKey] = useState<ApiKey | null>(null);
+    const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
+    const [quotaDraft, setQuotaDraft] = useState(0);
     const [deletingKey, setDeletingKey] = useState<ApiKey | null>(null);
     const [copiedKey, setCopiedKey] = useState<string | null>(null);
     const [toast, setToast] = useState("");
 
     const models = useMemo(() => Array.from(new Set(channels.flatMap((channel) => channel.models))), [channels]);
-    const totalQuota = apiKeys.reduce((sum, key) => sum + Math.max(key.quota_limit, 0), 0);
+    const defaultKeyQuota = settings?.default_key_quota ?? DEFAULT_SETTINGS.default_key_quota;
+    const totalQuota = settings?.total_quota ?? DEFAULT_SETTINGS.total_quota;
     const totalUsed = apiKeys.reduce((sum, key) => sum + key.quota_used, 0);
     const totalQuotaPercentage = totalQuota > 0 ? Math.min((totalUsed / totalQuota) * 100, 100) : 0;
-    const hasUnlimitedQuota = apiKeys.some((key) => key.quota_limit <= 0);
+    const isTotalQuotaUnlimited = totalQuota <= 0;
     const now = Date.now();
     const activeKeys = apiKeys.filter((key) => key.status === 1 && (!key.expires_at || new Date(key.expires_at).getTime() > now));
 
@@ -97,6 +109,18 @@ export function ApiKeysPage() {
         },
         onError: (mutationError) => showToast(errorMessage(mutationError)),
     });
+    const updateQuotaMutation = useMutation({
+        mutationFn: ({ id, quotaLimit }: { id: string; quotaLimit: number }) => apiKeyApi.update({
+            id,
+            quota_limit: quotaLimit,
+        }),
+        onSuccess: async () => {
+            await refreshKeys();
+            setEditingKey(null);
+            showToast("密钥配额已更新");
+        },
+        onError: (mutationError) => showToast(errorMessage(mutationError)),
+    });
 
     const copyKey = async (apiKey: ApiKey) => {
         try {
@@ -108,10 +132,21 @@ export function ApiKeysPage() {
         }
     };
 
+    const openCreateDialog = () => {
+        setForm(createInitialForm(defaultKeyQuota));
+        setCreatedKey(null);
+        setCreateOpen(true);
+    };
+
     const closeCreateDialog = () => {
         setCreateOpen(false);
         setCreatedKey(null);
-        setForm(initialForm);
+        setForm(createInitialForm(defaultKeyQuota));
+    };
+
+    const openQuotaDialog = (apiKey: ApiKey) => {
+        setQuotaDraft(normalizeQuota(apiKey.quota_limit));
+        setEditingKey(apiKey);
     };
 
     const submitCreate = async (event: FormEvent<HTMLFormElement>) => {
@@ -133,13 +168,24 @@ export function ApiKeysPage() {
         }
     };
 
+    const submitQuota = (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        if (!editingKey) {
+            return;
+        }
+        updateQuotaMutation.mutate({
+            id: editingKey.id,
+            quotaLimit: normalizeQuota(quotaDraft),
+        });
+    };
+
     return (
         <div className="page-enter">
             <PageTitle
                 title="密钥"
                 meta={`${activeKeys.length} 个有效密钥`}
                 action={(
-                    <button type="button" className="button-primary" onClick={() => setCreateOpen(true)}>
+                    <button type="button" className="button-primary" onClick={openCreateDialog}>
                         <Plus size={16} />创建密钥
                     </button>
                 )}
@@ -150,14 +196,14 @@ export function ApiKeysPage() {
                     <span className="overview-icon"><WalletCards size={20} /></span>
                     <div>
                         <p>总配额用量</p>
-                        <strong>{formatCompactNumber(totalUsed)} <span>/ {hasUnlimitedQuota || totalQuota === 0 ? "不限" : formatCompactNumber(totalQuota)}</span></strong>
+                        <strong>{formatCompactNumber(totalUsed)} <span>/ {isTotalQuotaUnlimited ? "不限" : formatCompactNumber(totalQuota)}</span></strong>
                     </div>
                 </div>
                 <div className="key-quota-track">
                     <span style={{ width: `${totalQuotaPercentage}%` }} />
                 </div>
                 <div className="key-overview-meta">
-                    <span>{hasUnlimitedQuota || totalQuota === 0 ? "包含不限额密钥" : `已使用 ${Math.round(totalQuotaPercentage)}%`}</span>
+                    <span>{isTotalQuotaUnlimited ? "总配额未限制" : `已使用 ${Math.round(totalQuotaPercentage)}%`}</span>
                     <span>今日调用 {dashboard?.today_requests ?? 0}</span>
                 </div>
             </section>
@@ -241,7 +287,10 @@ export function ApiKeysPage() {
                                             </div>
                                         </td>
                                         <td>
-                                            <div className="flex justify-end">
+                                            <div className="flex justify-end gap-1">
+                                                <IconButton label={`编辑 ${apiKey.name} 的配额`} onClick={() => openQuotaDialog(apiKey)}>
+                                                    <Pencil size={16} />
+                                                </IconButton>
                                                 <IconButton label={`删除 ${apiKey.name}`} tone="danger" onClick={() => setDeletingKey(apiKey)}>
                                                     <Trash2 size={16} />
                                                 </IconButton>
@@ -310,9 +359,10 @@ export function ApiKeysPage() {
                                     className="field-input"
                                     type="number"
                                     min="0"
+                                    max={MAX_QUOTA}
                                     step="1"
                                     value={form.quotaLimit}
-                                    onChange={(event) => setForm((current) => ({ ...current, quotaLimit: Number(event.target.value) }))}
+                                    onChange={(event) => setForm((current) => ({ ...current, quotaLimit: normalizeQuota(event.target.value) }))}
                                 />
                                 <small>设置为 0 表示不限制</small>
                             </label>
@@ -353,6 +403,40 @@ export function ApiKeysPage() {
                             </label>
                         </form>
                     )}
+                </Modal>
+            ) : null}
+
+            {editingKey ? (
+                <Modal
+                    title="编辑密钥配额"
+                    description={editingKey.name}
+                    size="sm"
+                    onClose={() => setEditingKey(null)}
+                    footer={(
+                        <>
+                            <button type="button" className="button-secondary" onClick={() => setEditingKey(null)}>取消</button>
+                            <button type="submit" form="quota-form" className="button-primary" disabled={updateQuotaMutation.isPending}>
+                                {updateQuotaMutation.isPending ? "保存中..." : "保存配额"}
+                            </button>
+                        </>
+                    )}
+                >
+                    <form id="quota-form" onSubmit={submitQuota}>
+                        <label className="field-label">
+                            <span>Token 配额</span>
+                            <input
+                                className="field-input font-mono"
+                                type="number"
+                                min="0"
+                                max={MAX_QUOTA}
+                                step="1"
+                                autoFocus
+                                value={quotaDraft}
+                                onChange={(event) => setQuotaDraft(normalizeQuota(event.target.value))}
+                            />
+                            <small>已使用 {formatCompactNumber(editingKey.quota_used)} Token；0 表示不限制</small>
+                        </label>
+                    </form>
                 </Modal>
             ) : null}
 

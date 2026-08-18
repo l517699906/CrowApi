@@ -111,6 +111,17 @@ export const useGatewayStore = create<GatewayState>()(
                 logs,
                 settings,
             }),
+            merge: (persistedState, currentState) => {
+                const persisted = persistedState as Partial<GatewayState>;
+                return {
+                    ...currentState,
+                    ...persisted,
+                    settings: {
+                        ...currentState.settings,
+                        ...persisted.settings,
+                    },
+                };
+            },
         },
     ),
 );

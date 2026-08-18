@@ -79,8 +79,20 @@ fn convert_openai_to_gemini(body: &serde_json::Value) -> serde_json::Value {
                 "parts": [{"text": content}]
             }));
         } else {
+            // Skip empty assistant messages without tool_calls
+            if role == "assistant" && content.is_empty() {
+                let has_tool_calls = msg
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if !has_tool_calls {
+                    continue;
+                }
+            }
+
             contents.push(serde_json::json!({
-                // assistant → model
+                // assistant -> model
                 "role": if role == "assistant" { "model" } else { "user" },
                 "parts": [{"text": content}]
             }));
@@ -145,4 +157,34 @@ fn convert_gemini_to_openai(gemini_json: &serde_json::Value, model: &str) -> ser
             "total_tokens": prompt_tokens + completion_tokens,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_openai_to_gemini;
+    use serde_json::json;
+
+    #[test]
+    fn converts_messages_and_skips_empty_assistant_message() {
+        let converted = convert_openai_to_gemini(&json!({
+            "messages": [
+                {"role": "system", "content": "Follow the instructions."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": ""},
+                {"role": "assistant", "content": "Hi"}
+            ]
+        }));
+
+        assert_eq!(
+            converted["systemInstruction"],
+            json!({"parts": [{"text": "Follow the instructions."}]})
+        );
+        assert_eq!(
+            converted["contents"],
+            json!([
+                {"role": "user", "parts": [{"text": "Hello"}]},
+                {"role": "model", "parts": [{"text": "Hi"}]}
+            ])
+        );
+    }
 }

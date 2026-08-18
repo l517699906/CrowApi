@@ -23,6 +23,10 @@ pub struct Settings {
     pub retry_enabled: bool,
     #[serde(default = "default_retry_times")]
     pub retry_times: i32,
+    #[serde(default = "default_key_quota")]
+    pub default_key_quota: i64,
+    #[serde(default = "default_total_quota")]
+    pub total_quota: i64,
     #[serde(default = "default_security_enabled")]
     pub security_enabled: bool,
     #[serde(default = "default_security_mode")]
@@ -49,6 +53,8 @@ fn default_true() -> bool { true }
 fn default_false() -> bool { false }
 fn default_retry_enabled() -> bool { true }
 fn default_retry_times() -> i32 { 2 }
+fn default_key_quota() -> i64 { crate::config::DEFAULT_KEY_QUOTA }
+fn default_total_quota() -> i64 { crate::config::DEFAULT_TOTAL_QUOTA }
 fn default_security_enabled() -> bool { true }
 fn default_security_mode() -> String { "audit".to_string() }
 
@@ -64,6 +70,8 @@ impl Default for Settings {
             auto_start: default_false(),
             retry_enabled: default_retry_enabled(),
             retry_times: default_retry_times(),
+            default_key_quota: default_key_quota(),
+            total_quota: default_total_quota(),
             security_enabled: default_security_enabled(),
             security_mode: default_security_mode(),
             security_scan_unicode: default_true(),
@@ -90,6 +98,14 @@ fn get_bool(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: b
     store.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
+fn get_non_negative_i64(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: i64) -> i64 {
+    store
+        .get(key)
+        .and_then(|value| value.as_i64())
+        .filter(|value| *value >= 0)
+        .unwrap_or(default)
+}
+
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
@@ -103,6 +119,16 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
         auto_start: get_bool(&store, "general.auto_start", false),
         retry_enabled: get_bool(&store, "retry.enabled", true),
         retry_times: get_u64(&store, "retry.times", 2) as i32,
+        default_key_quota: get_non_negative_i64(
+            &store,
+            "quota.default_key_limit",
+            crate::config::DEFAULT_KEY_QUOTA,
+        ),
+        total_quota: get_non_negative_i64(
+            &store,
+            "quota.total_limit",
+            crate::config::DEFAULT_TOTAL_QUOTA,
+        ),
         security_enabled: get_bool(&store, "security.enabled", true),
         security_mode: get_str(&store, "security.mode", "audit"),
         security_scan_unicode: get_bool(&store, "security.scan_unicode", true),
@@ -117,6 +143,10 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
 
 #[tauri::command]
 pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), String> {
+    if settings.default_key_quota < 0 || settings.total_quota < 0 {
+        return Err("配额不能小于 0".to_string());
+    }
+
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
     store.set("server.port", serde_json::json!(settings.server_port));
     store.set("server.host", serde_json::json!(settings.server_host));
@@ -127,6 +157,8 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     store.set("general.auto_start", settings.auto_start);
     store.set("retry.enabled", settings.retry_enabled);
     store.set("retry.times", settings.retry_times);
+    store.set("quota.default_key_limit", serde_json::json!(settings.default_key_quota));
+    store.set("quota.total_limit", serde_json::json!(settings.total_quota));
     store.set("security.enabled", settings.security_enabled);
     store.set("security.mode", serde_json::json!(settings.security_mode));
     store.set("security.scan_unicode", settings.security_scan_unicode);
