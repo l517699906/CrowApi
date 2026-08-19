@@ -110,11 +110,13 @@ export function AppShell() {
             />
             <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`}>
                 <div className="sidebar-brand">
-                    <div className="brand-mark" aria-hidden="true">
-                        <span />
-                        <span />
-                        <span />
-                    </div>
+                    <img
+                        className="brand-mark"
+                        src="/crowapi-logo.png"
+                        alt=""
+                        aria-hidden="true"
+                        draggable={false}
+                    />
                     <div>
                         <div className="font-display text-[17px] font-bold leading-5 text-sidebar-ink">CrowAPI</div>
                         <div className="mt-0.5 font-mono text-[10px] uppercase text-sidebar-muted">Local gateway</div>
