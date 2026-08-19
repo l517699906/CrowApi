@@ -191,7 +191,18 @@ export interface DashboardStats {
     protocols: ProtocolUsageStat[];
 }
 
-export type UiTheme = "light" | "system" | "dark" | "mist" | "ember";
+export type UiTheme =
+    | "light"
+    | "system"
+    | "dark"
+    | "mist"
+    | "ember"
+    | "graphite"
+    | "frost"
+    | "sakura"
+    | "mono"
+    | "ocean"
+    | "neon";
 
 export interface Settings {
     server_port: number;

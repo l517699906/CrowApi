@@ -19,6 +19,7 @@ import { useQuery } from "@tanstack/react-query";
 import { DEFAULT_SETTINGS } from "../config/defaults";
 import { channelApi, serverApi, settingsApi } from "../lib/api";
 import { queryKeys } from "../lib/query";
+import { applyUiTheme, DARK_THEME_MEDIA_QUERY } from "../lib/theme";
 import { ApiKeysPage } from "../pages/ApiKeysPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
 import { DashboardPage } from "../pages/DashboardPage";
@@ -65,12 +66,8 @@ export function AppShell() {
     );
 
     useEffect(() => {
-        const media = window.matchMedia("(prefers-color-scheme: dark)");
-        const applyTheme = () => {
-            document.documentElement.dataset.theme = settings.ui_theme === "system"
-                ? (media.matches ? "dark" : "light")
-                : settings.ui_theme;
-        };
+        const media = window.matchMedia(DARK_THEME_MEDIA_QUERY);
+        const applyTheme = () => applyUiTheme(settings.ui_theme, media.matches);
         applyTheme();
         media.addEventListener("change", applyTheme);
         return () => media.removeEventListener("change", applyTheme);

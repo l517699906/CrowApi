@@ -4,6 +4,14 @@ use tauri_plugin_store::StoreExt;
 
 pub const DEFAULT_KEY_QUOTA: i64 = 1_000_000;
 pub const DEFAULT_TOTAL_QUOTA: i64 = 0;
+pub const SUPPORTED_UI_THEMES: &[&str] = &[
+    "light", "system", "dark", "mist", "ember", "graphite", "frost", "sakura", "mono",
+    "ocean", "neon",
+];
+
+pub fn is_supported_ui_theme(theme: &str) -> bool {
+    SUPPORTED_UI_THEMES.contains(&theme)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -184,6 +192,9 @@ pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), Stri
     }
     if settings.default_key_quota < 0 || settings.total_quota < 0 {
         return Err("配额不能小于 0".to_string());
+    }
+    if !is_supported_ui_theme(&settings.ui_theme) {
+        return Err("不支持的界面主题".to_string());
     }
     if !matches!(settings.security_mode.as_str(), "audit" | "redact" | "block") {
         return Err("安全模式必须是 audit、redact 或 block".to_string());

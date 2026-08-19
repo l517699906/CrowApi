@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
     Check,
     CircleHelp,
@@ -21,6 +21,7 @@ import { DEFAULT_SETTINGS } from "../config/defaults";
 import { settingsApi } from "../lib/api";
 import { MAX_QUOTA, normalizeQuota } from "../lib/quota";
 import { errorMessage, queryKeys } from "../lib/query";
+import { applyUiTheme } from "../lib/theme";
 import type { Settings, UiTheme } from "../types";
 import { PageTitle, Toast, Toggle } from "../components/ui";
 
@@ -41,6 +42,12 @@ const themeOptions: ReadonlyArray<{ value: UiTheme; label: string; colors: reado
     { value: "dark", label: "深色", colors: ["#121714", "#3db88a", "#76a4e5"] },
     { value: "mist", label: "雾青", colors: ["#eef3f5", "#087f72", "#3a6fc8"] },
     { value: "ember", label: "余烬", colors: ["#181616", "#df6258", "#68a4d7"] },
+    { value: "graphite", label: "石墨", colors: ["#f1f2f3", "#c33b32", "#326ca8"] },
+    { value: "frost", label: "冰川", colors: ["#edf4f7", "#167e94", "#4b63c7"] },
+    { value: "sakura", label: "樱庭", colors: ["#f8f1f5", "#ad3f70", "#2f7f86"] },
+    { value: "mono", label: "黑白", colors: ["#f5f5f3", "#1e5fd8", "#d14d61"] },
+    { value: "ocean", label: "深海", colors: ["#0f1820", "#36c2b4", "#69a7e8"] },
+    { value: "neon", label: "霓虹", colors: ["#101114", "#22c8bd", "#d66ac7"] },
 ];
 
 type UpdatePhase = "idle" | "checking" | "downloading" | "installing" | "current" | "error";
@@ -59,9 +66,13 @@ export function SettingsPage() {
     const [updatePhase, setUpdatePhase] = useState<UpdatePhase>("idle");
     const [updateProgress, setUpdateProgress] = useState(0);
     const [updateError, setUpdateError] = useState("");
+    const persistedThemeRef = useRef<UiTheme>(DEFAULT_SETTINGS.ui_theme);
+    const previewingThemeRef = useRef(false);
     const saveMutation = useMutation({
         mutationFn: settingsApi.save,
         onSuccess: (_, savedSettings) => {
+            persistedThemeRef.current = savedSettings.ui_theme;
+            previewingThemeRef.current = false;
             queryClient.setQueryData(queryKeys.settings, savedSettings);
             setToast("设置已保存");
             window.setTimeout(() => setToast(""), 1800);
@@ -70,9 +81,16 @@ export function SettingsPage() {
 
     useEffect(() => {
         if (settings) {
+            persistedThemeRef.current = settings.ui_theme;
             setDraft({ ...settings });
         }
     }, [settings]);
+
+    useEffect(() => () => {
+        if (previewingThemeRef.current) {
+            applyUiTheme(persistedThemeRef.current);
+        }
+    }, []);
 
     useEffect(() => {
         void getVersion().then(setCurrentVersion).catch(() => setCurrentVersion("0.1.0"));
@@ -80,6 +98,12 @@ export function SettingsPage() {
 
     function updateSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
         setDraft((current) => ({ ...current, [key]: value }));
+    }
+
+    function previewTheme(theme: UiTheme) {
+        previewingThemeRef.current = true;
+        updateSetting("ui_theme", theme);
+        applyUiTheme(theme);
     }
 
     const save = async () => {
@@ -316,7 +340,7 @@ export function SettingsPage() {
                                             role="radio"
                                             aria-checked={draft.ui_theme === option.value}
                                             className={`theme-choice theme-choice-${option.value} ${draft.ui_theme === option.value ? "is-selected" : ""}`}
-                                            onClick={() => updateSetting("ui_theme", option.value)}
+                                            onClick={() => previewTheme(option.value)}
                                         >
                                             <span className="theme-choice-preview" aria-hidden="true">
                                                 <i /><i /><i />

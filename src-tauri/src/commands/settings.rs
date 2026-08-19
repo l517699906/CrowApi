@@ -156,7 +156,7 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     if !(1..=100).contains(&settings.quota_warning_threshold) {
         return Err("配额告警阈值必须在 1 到 100 之间".to_string());
     }
-    if !matches!(settings.ui_theme.as_str(), "light" | "system" | "dark" | "mist" | "ember") {
+    if !crate::config::is_supported_ui_theme(&settings.ui_theme) {
         return Err("不支持的界面主题".to_string());
     }
 
