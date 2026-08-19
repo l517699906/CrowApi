@@ -1,7 +1,7 @@
 use crate::db::models::Channel;
 use crate::db::repository::Repository;
 
-/// Call WaLiAPI's internal channel dispatch to get embeddings.
+/// Call CrowAPI's internal channel dispatch to get embeddings.
 /// Reuses existing channel config (base_url, api_key, model_mapping) but
 /// sends requests directly to the /embeddings endpoint instead of /chat/completions,
 /// because all adaptors hard-code the chat completions URL.

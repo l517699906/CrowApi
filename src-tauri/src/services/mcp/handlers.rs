@@ -14,7 +14,7 @@ use crate::services::knowledge::{repository::KbRepository, embedder, retriever, 
 use tauri::{Manager, Emitter};
 
 /// MCP server instructions — agent 首次连接时注入 system prompt
-const MCP_INSTRUCTIONS: &str = r#"# WaLiAPI 知识库 — 本地 RAG + 向量检索
+const MCP_INSTRUCTIONS: &str = r#"# CrowAPI 知识库 — 本地 RAG + 向量检索
 
 知识库已预建索引：文档已解析、分块、向量化并存入本地 SQLite + HNSW 索引。
 所有检索都是本地操作，亚秒级响应。
@@ -340,7 +340,7 @@ async fn dispatch_jsonrpc_async(
                     "tools": {}
                 },
                 "serverInfo": {
-                    "name": "WaLiAPI Knowledge Base",
+                    "name": "CrowAPI Knowledge Base",
                     "version": "0.1.0"
                 },
                 "instructions": MCP_INSTRUCTIONS

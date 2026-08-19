@@ -1,4 +1,4 @@
-use crate::db::models::{Channel, CreateChannelInput, UpdateChannelInput};
+use crate::db::models::{Channel, CreateChannelInput, UpdateChannelInput, ChannelStats};
 use crate::db::repository::Repository;
 use crate::AppState;
 use crate::adaptor::{get_adaptor, ChannelConfig};
@@ -71,6 +71,13 @@ pub async fn get_channel(id: String, state: tauri::State<'_, std::sync::Arc<AppS
 }
 
 #[tauri::command]
+pub async fn get_channel_api_key(id: String, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<String, String> {
+    let repo = Repository::new(state.db.pool.clone());
+    let channel = repo.get_channel(&id).await.map_err(|e| e.to_string())?;
+    Ok(channel.api_key)
+}
+
+#[tauri::command]
 pub async fn create_channel(input: CreateChannelInput, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<ChannelDto, String> {
     let mut input = input;
     input.name = input.name.trim().to_string();
@@ -130,6 +137,12 @@ pub async fn toggle_channel(id: String, status: i64, state: tauri::State<'_, std
 pub async fn delete_channel(id: String, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<(), String> {
     let repo = Repository::new(state.db.pool.clone());
     repo.delete_channel(&id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_channel_stats(state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<Vec<ChannelStats>, String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.get_channel_stats().await.map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -44,20 +44,22 @@ impl From<Channel> for ExportedChannel {
     }
 }
 
-// ─── Walicode backup types ──────────────────────────────────────────────────
+// ─── Crowcode backup types ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WalicodeBackup {
+#[allow(dead_code)]
+pub struct CrowcodeBackup {
     pub version: serde_json::Value,
     pub r#type: Option<String>,
     #[serde(default)]
-    pub ai_settings: Option<WalicodeAiSettings>,
+    pub ai_settings: Option<CrowcodeAiSettings>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WalicodeAiSettings {
+#[allow(dead_code)]
+pub struct CrowcodeAiSettings {
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -71,12 +73,13 @@ pub struct WalicodeAiSettings {
     #[serde(default)]
     pub custom_models: Option<Vec<String>>,
     #[serde(default)]
-    pub custom_providers: Option<Vec<WalicodeProvider>>,
+    pub custom_providers: Option<Vec<CrowcodeProvider>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WalicodeProvider {
+#[allow(dead_code)]
+pub struct CrowcodeProvider {
     pub name: String,
     #[serde(default)]
     pub api_key: Option<String>,
@@ -138,14 +141,14 @@ pub async fn export_channels(
     serde_json::to_string_pretty(&export).map_err(|e| e.to_string())
 }
 
-/// Import channels from a walicode-full-backup.json file content
+/// Import channels from a Crowcode-full-backup.json file content
 #[tauri::command]
-pub async fn import_walicode_backup(
+pub async fn import_crowcode_backup(
     content: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<ImportResult, String> {
-    let backup: WalicodeBackup =
-        serde_json::from_str(&content).map_err(|e| format!("解析 walicode 备份文件失败: {}", e))?;
+    let backup: CrowcodeBackup =
+        serde_json::from_str(&content).map_err(|e| format!("解析 crowcode 备份文件失败: {}", e))?;
 
     let repo = Repository::new(state.db.pool.clone());
     let existing = repo.get_all_channels().await.map_err(|e| e.to_string())?;
@@ -160,7 +163,7 @@ pub async fn import_walicode_backup(
     if let Some(ai) = &backup.ai_settings {
         if let (Some(api_key), Some(base_url)) = (ai.api_key.as_ref(), ai.base_url.as_ref()) {
             if !api_key.is_empty() && !base_url.is_empty() {
-                let name = "walicode-default".to_string();
+                let name = "crowcode-default".to_string();
                 if existing_names.contains(&name) {
                     skipped += 1;
                 } else {
@@ -190,7 +193,7 @@ pub async fn import_walicode_backup(
 
                     match repo.create_channel(&input).await {
                         Ok(_) => imported += 1,
-                        Err(e) => errors.push(format!("导入 walicode 默认渠道失败: {}", e)),
+                        Err(e) => errors.push(format!("导入 crowcode 默认渠道失败: {}", e)),
                     }
                 }
             }

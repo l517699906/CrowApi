@@ -182,7 +182,7 @@ impl Repository {
     pub async fn create_api_key(&self, input: &CreateApiKeyInput) -> Result<ApiKey, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
-        let key = format!("sk-waliapi-{}", uuid::Uuid::new_v4().simple());
+        let key = format!("sk-crowapi-{}", uuid::Uuid::new_v4().simple());
         let allowed_models = serde_json::to_string(&input.allowed_models.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
         let allowed_channels = serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
 
@@ -482,6 +482,21 @@ impl Repository {
         .await
         .unwrap_or(0);
 
+        let total_knowledge_bases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_knowledge_bases")
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        let total_kb_documents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_documents")
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        let total_kb_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_chunks")
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
         let protocols = self.get_protocol_usage(None, None).await?;
 
         Ok(DashboardStats {
@@ -493,8 +508,27 @@ impl Repository {
             total_api_keys,
             total_requests,
             total_tokens,
+            total_knowledge_bases,
+            total_kb_documents,
+            total_kb_chunks,
             protocols,
         })
+    }
+
+    pub async fn get_channel_stats(&self) -> Result<Vec<ChannelStats>, sqlx::Error> {
+        sqlx::query_as::<_, ChannelStats>(
+            "SELECT\n                r.channel_id as channel_id,\n                COUNT(*) as total_calls,\n                SUM(CASE WHEN r.status_code >= 200 AND r.status_code < 300 THEN 1 ELSE 0 END) as success_calls,\n                SUM(CASE WHEN r.status_code >= 200 AND r.status_code < 300 THEN 0 ELSE 1 END) as failed_calls,\n                COALESCE(SUM(r.total_tokens), 0) as total_tokens,\n                COALESCE(SUM(r.prompt_tokens), 0) as prompt_tokens,\n                COALESCE(SUM(r.completion_tokens), 0) as completion_tokens,\n                COALESCE(AVG(r.duration_ms), 0) as avg_latency_ms,\n                MAX(r.created_at) as last_call_at\n            FROM request_logs r\n            WHERE r.channel_id IS NOT NULL\n            GROUP BY r.channel_id"
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_api_key_stats(&self) -> Result<Vec<ApiKeyStats>, sqlx::Error> {
+        sqlx::query_as::<_, ApiKeyStats>(
+            "SELECT\n                r.api_key_id as api_key_id,\n                COUNT(*) as total_calls,\n                SUM(CASE WHEN r.status_code >= 200 AND r.status_code < 300 THEN 1 ELSE 0 END) as success_calls,\n                SUM(CASE WHEN r.status_code >= 200 AND r.status_code < 300 THEN 0 ELSE 1 END) as failed_calls,\n                COALESCE(SUM(r.total_tokens), 0) as total_tokens,\n                COALESCE(SUM(r.prompt_tokens), 0) as prompt_tokens,\n                COALESCE(SUM(r.completion_tokens), 0) as completion_tokens,\n                COALESCE(AVG(r.duration_ms), 0) as avg_latency_ms,\n                MAX(r.created_at) as last_call_at\n            FROM request_logs r\n            WHERE r.api_key_id IS NOT NULL\n            GROUP BY r.api_key_id"
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn get_usage_stats(

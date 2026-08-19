@@ -12,6 +12,9 @@ pub struct DashboardStatsDto {
     pub total_api_keys: i64,
     pub total_requests: i64,
     pub total_tokens: i64,
+    pub total_knowledge_bases: i64,
+    pub total_kb_documents: i64,
+    pub total_kb_chunks: i64,
     pub protocols: Vec<ProtocolUsageStatDto>,
 }
 
@@ -57,6 +60,9 @@ pub async fn get_dashboard_stats(
         total_api_keys: s.total_api_keys,
         total_requests: s.total_requests,
         total_tokens: s.total_tokens,
+        total_knowledge_bases: s.total_knowledge_bases,
+        total_kb_documents: s.total_kb_documents,
+        total_kb_chunks: s.total_kb_chunks,
         protocols: s.protocols.into_iter().map(Into::into).collect(),
     })
 }

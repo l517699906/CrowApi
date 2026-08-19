@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
     BarChart3,
     Bell,
+    Database,
     Check,
     ChevronRight,
     Command,
@@ -26,12 +27,14 @@ import { DashboardPage } from "../pages/DashboardPage";
 import { LogsPage } from "../pages/LogsPage";
 import { SettingsPage } from "../pages/SettingsPage";
 import { UsagePage } from "../pages/UsagePage";
+import { KnowledgeBasePage } from "../pages/KnowledgeBasePage";
 import { IconButton } from "./ui";
 
 const navItems = [
     { to: "/dashboard", label: "仪表盘", icon: LayoutDashboard },
     { to: "/usage", label: "用量", icon: BarChart3 },
     { to: "/channels", label: "渠道", icon: Radio },
+    { to: "/services", label: "知识库", icon: Database },
     { to: "/keys", label: "密钥", icon: KeyRound },
     { to: "/logs", label: "日志", icon: ScrollText },
     { to: "/settings", label: "设置", icon: Settings2 },
@@ -56,7 +59,9 @@ export function AppShell() {
     });
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [endpointCopied, setEndpointCopied] = useState(false);
-    const pageName = pageNames.get(location.pathname) ?? "仪表盘";
+    const pageName = location.pathname.startsWith("/services")
+        ? "知识库"
+        : pageNames.get(location.pathname) ?? "仪表盘";
     const isRunning = serverStatus?.running ?? false;
     const endpointBase = serverStatus?.port ? serverStatus.url : `http://${settings.server_host}:${settings.server_port}`;
     const endpoint = `${endpointBase}/v1`;
@@ -197,6 +202,7 @@ export function AppShell() {
                         <Route path="/dashboard" element={<DashboardPage />} />
                         <Route path="/usage" element={<UsagePage />} />
                         <Route path="/channels" element={<ChannelsPage />} />
+                        <Route path="/services/*" element={<KnowledgeBasePage />} />
                         <Route path="/keys" element={<ApiKeysPage />} />
                         <Route path="/logs" element={<LogsPage />} />
                         <Route path="/settings" element={<SettingsPage />} />

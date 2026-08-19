@@ -246,6 +246,7 @@ fn add(
     });
 }
 
+#[allow(dead_code)]
 pub fn add_finding(
     f: &mut Vec<SecurityFinding>,
     phase: &str,

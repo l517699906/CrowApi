@@ -90,8 +90,8 @@ pub async fn handle_chat_completions(
         return (StatusCode::TOO_MANY_REQUESTS, "Quota exceeded").into_response();
     }
 
-    // Extract Wali-Trace-Id from request headers
-    let trace_id = headers.get("Wali-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+    // Extract Crow-Trace-Id from request headers
+    let trace_id = headers.get("Crow-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
 
     // Store full request body for logging (no truncation — let frontend handle display)
     let request_body_str = serde_json::to_string(&json).unwrap_or_default();
@@ -563,7 +563,7 @@ pub async fn handle_messages(
         }))).into_response();
     }
 
-    let trace_id = headers.get("Wali-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+    let trace_id = headers.get("Crow-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
     let request_body_str = serde_json::to_string(&json).unwrap_or_default();
     let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
 
@@ -912,7 +912,7 @@ pub async fn handle_responses(
         }))).into_response();
     }
 
-    let trace_id = headers.get("Wali-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+    let trace_id = headers.get("Crow-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
     let request_body_str = serde_json::to_string(&json).unwrap_or_default();
     let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
 
@@ -1260,7 +1260,7 @@ pub async fn handle_embeddings(
     }
 
     let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
-    let trace_id = headers.get("Wali-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+    let trace_id = headers.get("Crow-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
     let request_body_str = serde_json::to_string(&json).unwrap_or_default();
 
     // Security scan

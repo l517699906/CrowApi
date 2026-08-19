@@ -113,6 +113,7 @@ impl BuiltinRuleRepository {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn get_enabled(pool: &SqlitePool) -> Result<Vec<BuiltinRule>, sqlx::Error> {
         sqlx::query_as::<_, BuiltinRule>(
             "SELECT * FROM security_builtin_rules WHERE enabled = 1 ORDER BY rule_id"
@@ -185,6 +186,7 @@ impl CustomRuleRepository {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn get_enabled(pool: &SqlitePool) -> Result<Vec<CustomRule>, sqlx::Error> {
         sqlx::query_as::<_, CustomRule>(
             "SELECT * FROM security_custom_rules WHERE enabled = 1 ORDER BY created_at DESC",
@@ -240,6 +242,7 @@ impl CustomRuleRepository {
 
 // ─── Rule matching helpers ──────────────────────────────────────────────────
 // 黑名单匹配：命中即产生 finding
+#[allow(dead_code)]
 pub fn apply_custom_rules(
     text: &str,
     phase: &str,
@@ -267,6 +270,7 @@ pub fn apply_custom_rules(
 }
 
 // 白名单匹配：命中则豁免对应类别的检测
+#[allow(dead_code)]
 pub fn is_whitelisted(category: &str, value: &str, custom_rules: &[CustomRule]) -> bool {
     let lower = value.to_ascii_lowercase();
     custom_rules.iter().any(|r| {
@@ -277,6 +281,7 @@ pub fn is_whitelisted(category: &str, value: &str, custom_rules: &[CustomRule]) 
     })
 }
 
+#[allow(dead_code)]
 fn parse_severity(s: &str) -> RiskLevel {
     match s {
         "info" => RiskLevel::Info,

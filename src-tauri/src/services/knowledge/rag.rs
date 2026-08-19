@@ -8,7 +8,7 @@ use tauri::AppHandle;
 use std::sync::Arc;
 use sqlx::SqlitePool;
 
-/// RAG: Retrieve relevant chunks, then generate answer via WaLiAPI proxy
+/// RAG: Retrieve relevant chunks, then generate answer via CrowAPI proxy
 /// Enhanced with conversation history, token limit fallback, and configurable search modes.
 pub async fn ask(
     pool: &SqlitePool,

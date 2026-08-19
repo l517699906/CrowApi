@@ -14,7 +14,7 @@ const DEFAULT_EF_SEARCH: usize = 50;
 fn index_path(kb_id: &str) -> PathBuf {
     let dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("./data"))
-        .join("waliapi")
+        .join("crowapi")
         .join("hnsw_indexes");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("kb_{}.hnsw", kb_id))
