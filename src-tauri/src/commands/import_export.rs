@@ -570,11 +570,15 @@ pub async fn save_export_file(
     use tauri_plugin_dialog::DialogExt;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
+    let dialog = app.dialog()
         .file()
-        .set_file_name(&default_name)
-        .add_filter("JSON files", &["json"])
-        .save_file(move |file_path| {
+        .set_file_name(&default_name);
+    let dialog = if default_name.to_ascii_lowercase().ends_with(".csv") {
+        dialog.add_filter("CSV files", &["csv"])
+    } else {
+        dialog.add_filter("JSON files", &["json"])
+    };
+    dialog.save_file(move |file_path| {
             if let Some(path) = file_path {
                 if let Some(p) = path.as_path() {
                     match std::fs::write(p, &content) {

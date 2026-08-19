@@ -33,6 +33,10 @@ export interface UpdateChannelInput extends Partial<CreateChannelInput> {
     status?: number;
 }
 
+export interface ReorderChannelsInput {
+    ordered_ids: string[];
+}
+
 export interface TestChannelResult {
     success: boolean;
     latency_ms: number;
@@ -88,12 +92,14 @@ export interface RequestLog {
     is_retry: boolean;
     created_at: string;
     request_body: string | null;
+    response_choices: string | null;
     risk_level: RiskLevel;
     risk_score: number;
     risk_summary: string | null;
     security_action: string;
     sanitized: boolean;
     blocked_reason: string | null;
+    trace_id: string | null;
 }
 
 export interface RequestSecurityFinding {
@@ -129,6 +135,50 @@ export interface LogStats {
     total_tokens: number;
 }
 
+export interface ProtocolUsageStat {
+    mode: string;
+    request_count: number;
+    total_tokens: number;
+}
+
+export interface UsageBucketStat {
+    bucket_index: number;
+    request_count: number;
+}
+
+export interface ModelUsageStat {
+    name: string;
+    request_count: number;
+    total_tokens: number;
+}
+
+export interface ChannelUsageStat {
+    id: string;
+    name: string;
+    channel_type: string;
+    request_count: number;
+}
+
+export interface DashboardStatsInput {
+    date_from?: string;
+    date_to?: string;
+}
+
+export interface UsageStatsInput extends DashboardStatsInput {
+    bucket_seconds?: number;
+    bucket_count?: number;
+}
+
+export interface UsageStats {
+    total_requests: number;
+    total_tokens: number;
+    failed_requests: number;
+    protocols: ProtocolUsageStat[];
+    series: UsageBucketStat[];
+    models: ModelUsageStat[];
+    channels: ChannelUsageStat[];
+}
+
 export interface DashboardStats {
     today_requests: number;
     today_total_tokens: number;
@@ -138,12 +188,15 @@ export interface DashboardStats {
     total_api_keys: number;
     total_requests: number;
     total_tokens: number;
+    protocols: ProtocolUsageStat[];
 }
+
+export type UiTheme = "light" | "system" | "dark" | "mist" | "ember";
 
 export interface Settings {
     server_port: number;
     server_host: string;
-    ui_theme: string;
+    ui_theme: UiTheme;
     ui_language: string;
     minimize_to_tray: boolean;
     close_to_tray: boolean;
@@ -152,6 +205,7 @@ export interface Settings {
     retry_times: number;
     default_key_quota: number;
     total_quota: number;
+    quota_warning_threshold: number;
     security_enabled: boolean;
     security_mode: string;
     security_scan_unicode: boolean;

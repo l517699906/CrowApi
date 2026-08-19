@@ -1,7 +1,10 @@
 import { type FormEvent, useDeferredValue, useMemo, useState } from "react";
 import {
     CheckCircle2,
+    Clock3,
     FlaskConical,
+    GripVertical,
+    Layers3,
     Pencil,
     Plus,
     Radio,
@@ -11,9 +14,10 @@ import {
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PROVIDERS, PROVIDER_DEFAULTS, providerLabel } from "../config/providers";
-import { formatDateTime } from "../lib/format";
-import { channelApi } from "../lib/api";
+import { formatDateTime, formatDuration } from "../lib/format";
+import { channelApi, statsApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
+import { localDayStatsInput } from "../lib/statistics";
 import type { Channel, ChannelType, CreateChannelInput, UpdateChannelInput } from "../types";
 import {
     IconButton,
@@ -240,11 +244,18 @@ export function ChannelsPage() {
         queryKey: queryKeys.channels,
         queryFn: channelApi.getAll,
     });
+    const { data: dashboard } = useQuery({
+        queryKey: queryKeys.dashboard,
+        queryFn: () => statsApi.getDashboard(localDayStatsInput()),
+        refetchInterval: 5_000,
+    });
     const [query, setQuery] = useState("");
     const [typeFilter, setTypeFilter] = useState("全部");
     const [editingChannel, setEditingChannel] = useState<Channel | null | undefined>(undefined);
     const [deletingChannel, setDeletingChannel] = useState<Channel | null>(null);
     const [testingId, setTestingId] = useState<string | null>(null);
+    const [draggedId, setDraggedId] = useState<string | null>(null);
+    const [dragOverId, setDragOverId] = useState<string | null>(null);
     const [toast, setToast] = useState("");
     const deferredQuery = useDeferredValue(query.trim().toLowerCase());
 
@@ -289,13 +300,85 @@ export function ChannelsPage() {
         onError: (mutationError) => showToast(errorMessage(mutationError)),
         onSettled: () => setTestingId(null),
     });
+    const reorderMutation = useMutation<
+        void,
+        unknown,
+        Channel[],
+        { previousChannels: Channel[] | undefined }
+    >({
+        mutationFn: (nextChannels) => channelApi.reorder({
+            ordered_ids: nextChannels.map((channel) => channel.id),
+        }),
+        onMutate: async (nextChannels) => {
+            await queryClient.cancelQueries({ queryKey: queryKeys.channels });
+            const previousChannels = queryClient.getQueryData<Channel[]>(queryKeys.channels);
+            queryClient.setQueryData(queryKeys.channels, nextChannels);
+            return { previousChannels };
+        },
+        onSuccess: () => showToast("渠道优先级已更新"),
+        onError: (mutationError, _nextChannels, context) => {
+            if (context?.previousChannels) {
+                queryClient.setQueryData(queryKeys.channels, context.previousChannels);
+            }
+            showToast(`排序失败，已恢复原顺序：${errorMessage(mutationError)}`);
+        },
+        onSettled: async () => {
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: queryKeys.channels }),
+                queryClient.invalidateQueries({ queryKey: queryKeys.dashboard }),
+            ]);
+        },
+    });
 
     const testChannel = async (channel: Channel) => {
         setTestingId(channel.id);
         await testMutation.mutateAsync(channel.id).catch(() => undefined);
     };
 
+    const reorderVisibleChannels = (sourceId: string, targetId: string) => {
+        if (sourceId === targetId || reorderMutation.isPending) {
+            return;
+        }
+
+        const visibleIds = filteredChannels.map((channel) => channel.id);
+        const sourceIndex = visibleIds.indexOf(sourceId);
+        const targetIndex = visibleIds.indexOf(targetId);
+        if (sourceIndex < 0 || targetIndex < 0) {
+            return;
+        }
+
+        const reorderedVisibleIds = [...visibleIds];
+        const [movedId] = reorderedVisibleIds.splice(sourceIndex, 1);
+        if (!movedId) {
+            return;
+        }
+        reorderedVisibleIds.splice(targetIndex, 0, movedId);
+        const visibleIdSet = new Set(visibleIds);
+        let visibleIndex = 0;
+        const channelById = new Map(channels.map((channel) => [channel.id, channel]));
+        const reorderedChannels = channels.map((channel) => (
+            visibleIdSet.has(channel.id)
+                ? channelById.get(reorderedVisibleIds[visibleIndex++]) ?? channel
+                : channel
+        )).map((channel, index, orderedChannels) => ({
+            ...channel,
+            priority: orderedChannels.length - index,
+        }));
+
+        reorderMutation.mutate(reorderedChannels);
+    };
+
+    const moveChannelByKeyboard = (channelId: string, direction: -1 | 1) => {
+        const currentIndex = filteredChannels.findIndex((channel) => channel.id === channelId);
+        const target = filteredChannels[currentIndex + direction];
+        if (currentIndex < 0 || !target) {
+            return;
+        }
+        reorderVisibleChannels(channelId, target.id);
+    };
+
     const activeCount = channels.filter((channel) => channel.status === 1).length;
+    const failedCount = channels.filter((channel) => channel.last_test_ok === 0).length;
 
     return (
         <div className="page-enter">
@@ -309,7 +392,14 @@ export function ChannelsPage() {
                 )}
             />
 
-            <section className="toolbar-row">
+            <section className="channel-summary-grid" aria-label="渠道统计摘要">
+                <div className="summary-tile"><Layers3 size={18} className="text-data-blue" /><div><span>总渠道</span><strong>{channels.length}</strong></div></div>
+                <div className="summary-tile"><CheckCircle2 size={18} className="text-accent" /><div><span>活跃渠道</span><strong>{activeCount}</strong></div></div>
+                <div className="summary-tile"><XCircle size={18} className="text-danger" /><div><span>失败渠道</span><strong>{failedCount}</strong></div></div>
+                <div className="summary-tile"><Clock3 size={18} className="text-warning" /><div><span>平均延迟</span><strong>{formatDuration(Math.round(dashboard?.avg_latency_ms ?? 0))}</strong></div></div>
+            </section>
+
+            <section className="toolbar-row mt-4">
                 <label className="search-field">
                     <Search size={16} />
                     <input value={query} placeholder="搜索渠道或模型" onChange={(event) => setQuery(event.target.value)} />
@@ -321,90 +411,102 @@ export function ChannelsPage() {
                         {PROVIDERS.map((provider) => <option key={provider.value} value={provider.value}>{provider.label}</option>)}
                     </select>
                 </label>
-                <div className="ml-auto flex items-center gap-2 text-xs text-muted">
-                    <span className="live-dot" />
-                    数据来自本机 SQLite
+                <div className="ml-auto flex items-center gap-2 text-xs text-muted" aria-live="polite">
+                    {reorderMutation.isPending ? <span className="button-spinner" /> : <GripVertical size={14} />}
+                    {reorderMutation.isPending ? "正在保存优先级" : "拖拽卡片调整分发顺序"}
                 </div>
             </section>
 
-            <section className="panel mt-4 min-w-0">
-                <div className="table-scroll">
-                    <table className="data-table channel-table min-w-[960px]">
-                        <thead>
-                            <tr>
-                                <th>渠道</th>
-                                <th>API 地址</th>
-                                <th>模型</th>
-                                <th>路由</th>
-                                <th>状态</th>
-                                <th>启用</th>
-                                <th className="text-right">操作</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {filteredChannels.map((channel) => (
-                                <tr key={channel.id}>
-                                    <td>
-                                        <div className="flex items-center gap-3">
-                                            <ProviderMark type={channel.type} />
-                                            <div className="min-w-0">
-                                                <p className="font-medium text-ink">{channel.name}</p>
-                                                <p className="mt-0.5 text-xs text-subtle">{providerLabel(channel.type)}</p>
-                                            </div>
-                                        </div>
-                                    </td>
-                                    <td><span className="block max-w-[220px] truncate font-mono text-xs text-muted" title={channel.base_url}>{channel.base_url}</span></td>
-                                    <td>
-                                        <div className="flex max-w-[230px] flex-wrap gap-1">
-                                            {channel.models.slice(0, 2).map((model) => <span className="model-name" key={model}>{model}</span>)}
-                                            {channel.models.length > 2 ? <span className="model-more">+{channel.models.length - 2}</span> : null}
-                                        </div>
-                                    </td>
-                                    <td>
-                                        <p className="font-mono text-xs text-ink">P{channel.priority} · W{channel.weight}</p>
-                                    </td>
-                                    <td>
-                                        {channel.last_test_ok === 1 ? (
-                                            <div>
-                                                <StatusBadge status="success" dot>正常</StatusBadge>
-                                                {channel.last_test_at ? <p className="mt-1 text-[10px] text-subtle">{formatDateTime(channel.last_test_at)}</p> : null}
-                                            </div>
-                                        ) : channel.last_test_ok === 0 ? (
-                                            <StatusBadge status="danger" dot>异常</StatusBadge>
-                                        ) : (
-                                            <StatusBadge status="neutral">未测试</StatusBadge>
-                                        )}
-                                    </td>
-                                    <td>
-                                        <Toggle
-                                            checked={channel.status === 1}
-                                            label={`${channel.status === 1 ? "停用" : "启用"}${channel.name}`}
-                                            disabled={toggleMutation.isPending}
-                                            onChange={() => toggleMutation.mutate(channel)}
-                                        />
-                                    </td>
-                                    <td>
-                                        <div className="flex justify-end gap-1">
-                                            <IconButton
-                                                label={`测试 ${channel.name}`}
-                                                disabled={testingId === channel.id}
-                                                onClick={() => testChannel(channel)}
-                                            >
-                                                {testingId === channel.id ? <span className="button-spinner" /> : <FlaskConical size={16} />}
-                                            </IconButton>
-                                            <IconButton label={`编辑 ${channel.name}`} onClick={() => setEditingChannel(channel)}>
-                                                <Pencil size={16} />
-                                            </IconButton>
-                                            <IconButton label={`删除 ${channel.name}`} tone="danger" onClick={() => setDeletingChannel(channel)}>
-                                                <Trash2 size={16} />
-                                            </IconButton>
-                                        </div>
-                                    </td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                </div>
+            <section className="channel-card-grid mt-4" aria-label="渠道优先级列表">
+                {filteredChannels.map((channel) => (
+                    <article
+                        key={channel.id}
+                        className={`channel-card ${draggedId === channel.id ? "is-dragging" : ""} ${dragOverId === channel.id ? "is-drag-over" : ""}`}
+                        draggable={!reorderMutation.isPending}
+                        onDragStart={(event) => {
+                            setDraggedId(channel.id);
+                            event.dataTransfer.effectAllowed = "move";
+                            event.dataTransfer.setData("text/plain", channel.id);
+                        }}
+                        onDragEnd={() => {
+                            setDraggedId(null);
+                            setDragOverId(null);
+                        }}
+                        onDragOver={(event) => {
+                            event.preventDefault();
+                            event.dataTransfer.dropEffect = "move";
+                            setDragOverId(channel.id);
+                        }}
+                        onDrop={(event) => {
+                            event.preventDefault();
+                            const sourceId = event.dataTransfer.getData("text/plain") || draggedId;
+                            setDraggedId(null);
+                            setDragOverId(null);
+                            if (sourceId) {
+                                reorderVisibleChannels(sourceId, channel.id);
+                            }
+                        }}
+                    >
+                        <div className="channel-card-rank">
+                            <button
+                                type="button"
+                                className="channel-drag-handle"
+                                aria-label={`调整 ${channel.name} 的优先级，当前第 ${channels.findIndex((item) => item.id === channel.id) + 1} 位`}
+                                disabled={reorderMutation.isPending}
+                                onKeyDown={(event) => {
+                                    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                                        event.preventDefault();
+                                        moveChannelByKeyboard(channel.id, event.key === "ArrowUp" ? -1 : 1);
+                                    }
+                                }}
+                            >
+                                <GripVertical size={17} />
+                            </button>
+                            <span>{String(channels.findIndex((item) => item.id === channel.id) + 1).padStart(2, "0")}</span>
+                        </div>
+                        <div className="channel-card-main">
+                            <div className="channel-card-heading">
+                                <ProviderMark type={channel.type} />
+                                <div className="min-w-0">
+                                    <h2>{channel.name}</h2>
+                                    <p>{providerLabel(channel.type)}</p>
+                                </div>
+                                <div className="channel-card-status">
+                                    {channel.last_test_ok === 1 ? (
+                                        <StatusBadge status="success" dot>正常</StatusBadge>
+                                    ) : channel.last_test_ok === 0 ? (
+                                        <StatusBadge status="danger" dot>异常</StatusBadge>
+                                    ) : (
+                                        <StatusBadge status="neutral">未测试</StatusBadge>
+                                    )}
+                                </div>
+                            </div>
+                            <code className="channel-card-url" title={channel.base_url}>{channel.base_url}</code>
+                            <div className="channel-card-models">
+                                {channel.models.slice(0, 3).map((model) => <span className="model-name" key={model}>{model}</span>)}
+                                {channel.models.length > 3 ? <span className="model-more">+{channel.models.length - 3}</span> : null}
+                            </div>
+                        </div>
+                        <dl className="channel-card-routing">
+                            <div><dt>优先级</dt><dd>P{channel.priority}</dd></div>
+                            <div><dt>权重</dt><dd>W{channel.weight}</dd></div>
+                            <div><dt>最近测试</dt><dd>{channel.last_test_at ? formatDateTime(channel.last_test_at) : "--"}</dd></div>
+                        </dl>
+                        <div className="channel-card-actions">
+                            <Toggle
+                                checked={channel.status === 1}
+                                label={`${channel.status === 1 ? "停用" : "启用"}${channel.name}`}
+                                disabled={toggleMutation.isPending}
+                                onChange={() => toggleMutation.mutate(channel)}
+                            />
+                            <IconButton label={`测试 ${channel.name}`} disabled={testingId === channel.id} onClick={() => testChannel(channel)}>
+                                {testingId === channel.id ? <span className="button-spinner" /> : <FlaskConical size={16} />}
+                            </IconButton>
+                            <IconButton label={`编辑 ${channel.name}`} onClick={() => setEditingChannel(channel)}><Pencil size={16} /></IconButton>
+                            <IconButton label={`删除 ${channel.name}`} tone="danger" onClick={() => setDeletingChannel(channel)}><Trash2 size={16} /></IconButton>
+                        </div>
+                    </article>
+                ))}
                 {isPending ? (
                     <div className="empty-state"><span className="button-spinner" /><strong>正在读取渠道</strong></div>
                 ) : error ? (
@@ -416,12 +518,6 @@ export function ChannelsPage() {
                         <span>{channels.length === 0 ? "添加上游渠道后即可测试连接" : "调整搜索关键词或渠道类型"}</span>
                     </div>
                 ) : null}
-            </section>
-
-            <section className="mt-4 grid gap-3 sm:grid-cols-3">
-                <div className="summary-tile"><CheckCircle2 size={18} className="text-accent" /><div><span>运行中</span><strong>{activeCount}</strong></div></div>
-                <div className="summary-tile"><XCircle size={18} className="text-danger" /><div><span>异常</span><strong>{channels.filter((channel) => channel.last_test_ok === 0).length}</strong></div></div>
-                <div className="summary-tile"><FlaskConical size={18} className="text-data-blue" /><div><span>已测试</span><strong>{channels.filter((channel) => channel.last_test_ok !== null).length}</strong></div></div>
             </section>
 
             {editingChannel !== undefined ? (

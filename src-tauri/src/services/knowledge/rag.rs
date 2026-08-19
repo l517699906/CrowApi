@@ -200,6 +200,7 @@ pub async fn ask_with_config(
         "知识库RAG",
         chat_request,
         false,
+        "chat",
         None,
         None,
     )
@@ -434,6 +435,7 @@ pub async fn deep_research(
                 "深度研究",
                 follow_up_request,
                 false,
+                "chat",
                 None,
                 None,
             ).await {
@@ -534,6 +536,7 @@ pub async fn deep_research(
             "深度研究",
             chat_request,
             false,
+            "chat",
             None,
             None,
         ).await;
@@ -600,6 +603,7 @@ pub async fn deep_research(
         "深度研究",
         final_request,
         false,
+        "chat",
         None,
         None,
     ).await;

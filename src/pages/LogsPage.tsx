@@ -5,25 +5,31 @@ import {
     ChevronDown,
     ChevronRight,
     Clock3,
+    Download,
     FilterX,
+    FileJson2,
     Search,
     ShieldAlert,
+    TableProperties,
     TriangleAlert,
 } from "lucide-react";
 import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { formatDateTime, formatDuration, formatNumber, formatTokenCount } from "../lib/format";
-import { apiKeyApi, channelApi, logApi } from "../lib/api";
+import { apiKeyApi, channelApi, fileApi, logApi } from "../lib/api";
+import { logExportName, logsToCsv, logsToJson } from "../lib/logExport";
+import { getProtocolMeta } from "../lib/protocol";
 import { errorMessage, queryKeys } from "../lib/query";
 import type { GetLogsInput, RequestLog } from "../types";
 import { LogDetailDrawer } from "../components/LogDetailDrawer";
 import { LogRiskBadge } from "../components/LogRiskBadge";
-import { PageTitle, StatusBadge } from "../components/ui";
+import { PageTitle, StatusBadge, Toast } from "../components/ui";
 
 const PAGE_SIZE = 50;
 const LIVE_BATCH_SIZE = 200;
 const MAX_LIVE_BATCHES_PER_SYNC = 5;
 const LIVE_SYNC_DELAY_MS = 200;
+const LIVE_PROBE_INTERVAL_MS = 5_000;
 const LOG_CHANGED_EVENT = "request-logs-changed";
 
 interface LogChangedEvent {
@@ -98,9 +104,21 @@ function mergeLiveLogs(data: LogsQueryData, incoming: RequestLog[]): LogsQueryDa
         return data;
     }
 
+    const lastPage = data.pages[data.pages.length - 1];
+    const reachedEnd = lastPage.length < PAGE_SIZE;
+    const loadedCapacity = data.pages.length * PAGE_SIZE;
+    const merged = [...fresh, ...data.pages.flat()]
+        .sort((left, right) => (right.seq ?? 0) - (left.seq ?? 0));
+    const retained = reachedEnd ? merged : merged.slice(0, loadedCapacity);
+    const pages = Array.from(
+        { length: Math.ceil(retained.length / PAGE_SIZE) },
+        (_, index) => retained.slice(index * PAGE_SIZE, (index + 1) * PAGE_SIZE),
+    );
+
     return {
         ...data,
-        pages: [[...fresh, ...data.pages[0]], ...data.pages.slice(1)],
+        pages,
+        pageParams: pages.map((_, index) => index * PAGE_SIZE),
     };
 }
 
@@ -114,18 +132,28 @@ function LogStatus({ statusCode }: { statusCode: number }) {
     return <StatusBadge status="success">{statusCode}</StatusBadge>;
 }
 
+function ProtocolBadge({ mode }: { mode: string }) {
+    const protocol = getProtocolMeta(mode);
+    return <span className={`protocol-badge protocol-${protocol.tone}`}>{protocol.label}</span>;
+}
+
 export function LogsPage() {
     const [draftFilters, setDraftFilters] = useState<LogFilterState>(EMPTY_FILTERS);
     const [appliedFilters, setAppliedFilters] = useState<LogFilterState>(EMPTY_FILTERS);
     const [filterError, setFilterError] = useState("");
     const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null);
+    const [selectedLogIds, setSelectedLogIds] = useState<Set<string>>(() => new Set());
     const [pendingLiveLogs, setPendingLiveLogs] = useState(0);
+    const [exportingFormat, setExportingFormat] = useState<"csv" | "json" | null>(null);
+    const [toast, setToast] = useState("");
     const queryClient = useQueryClient();
     const logsQueryKey = useMemo(
         () => [...queryKeys.logs, "paged", appliedFilters] as const,
         [appliedFilters],
     );
     const logsQueryKeyRef = useRef(logsQueryKey);
+    const filterCursorKey = JSON.stringify(appliedFilters);
+    const filterCursorKeyRef = useRef(filterCursorKey);
     const syncedSeqRef = useRef(0);
     const targetSeqRef = useRef(0);
     const liveSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -182,8 +210,17 @@ export function LogsPage() {
     }, [logs]);
     const hasDraftFilters = Object.values(draftFilters).some(Boolean);
     const loadedPageCount = logs.length > 0 ? Math.ceil(logs.length / PAGE_SIZE) : 0;
+    const selectedLogs = useMemo(
+        () => logs.filter((log) => selectedLogIds.has(log.id)),
+        [logs, selectedLogIds],
+    );
+    const allLoadedSelected = logs.length > 0 && selectedLogs.length === logs.length;
+    const exportScopeLabel = selectedLogs.length > 0
+        ? `导出已选择的 ${selectedLogs.length} 条日志`
+        : "导出当前筛选的全部日志";
 
     const syncLiveLogs = useCallback(async () => {
+        const syncKey = filterCursorKey;
         if (liveSyncingRef.current) {
             liveSyncAgainRef.current = true;
             return;
@@ -213,6 +250,10 @@ export function LogsPage() {
                     limit: LIVE_BATCH_SIZE,
                     after_seq: cursor,
                 });
+
+                if (filterCursorKeyRef.current !== syncKey) {
+                    return;
+                }
 
                 if (rows.length === 0) {
                     cursor = target;
@@ -254,7 +295,7 @@ export function LogsPage() {
                 queueLiveSyncRef.current();
             }
         }
-    }, [appliedFilters, logsQueryKey, queryClient]);
+    }, [appliedFilters, filterCursorKey, logsQueryKey, queryClient]);
 
     const queueLiveSync = useCallback(() => {
         if (liveSyncTimerRef.current !== null) {
@@ -267,6 +308,76 @@ export function LogsPage() {
         }, LIVE_SYNC_DELAY_MS);
     }, [syncLiveLogs]);
     queueLiveSyncRef.current = queueLiveSync;
+
+    useEffect(() => {
+        filterCursorKeyRef.current = filterCursorKey;
+        syncedSeqRef.current = 0;
+        targetSeqRef.current = 0;
+        liveSyncAgainRef.current = false;
+        setPendingLiveLogs(0);
+        if (liveSyncTimerRef.current !== null) {
+            clearTimeout(liveSyncTimerRef.current);
+            liveSyncTimerRef.current = null;
+        }
+    }, [filterCursorKey]);
+
+    const probeLiveLogs = useCallback(async () => {
+        const probeKey = filterCursorKey;
+        if (document.visibilityState === "hidden" || liveSyncingRef.current) {
+            return;
+        }
+
+        const queryData = queryClient.getQueryData<LogsQueryData>(logsQueryKey);
+        if (!queryData) {
+            return;
+        }
+
+        liveSyncingRef.current = true;
+        try {
+            let cursor = syncedSeqRef.current;
+            let batchCount = 0;
+            while (batchCount < MAX_LIVE_BATCHES_PER_SYNC) {
+                const rows = await logApi.getAll({
+                    ...toGetLogsInput(appliedFilters),
+                    limit: LIVE_BATCH_SIZE,
+                    after_seq: cursor,
+                });
+                if (filterCursorKeyRef.current !== probeKey) {
+                    return;
+                }
+                if (rows.length === 0) {
+                    break;
+                }
+
+                const nextCursor = maxLogSeq(rows);
+                if (nextCursor <= cursor) {
+                    break;
+                }
+                queryClient.setQueryData<LogsQueryData>(logsQueryKey, (current) => (
+                    current ? mergeLiveLogs(current, rows) : current
+                ));
+                cursor = nextCursor;
+                batchCount += 1;
+                if (rows.length < LIVE_BATCH_SIZE) {
+                    break;
+                }
+            }
+
+            syncedSeqRef.current = Math.max(syncedSeqRef.current, cursor);
+            targetSeqRef.current = Math.max(targetSeqRef.current, cursor);
+            if (syncedSeqRef.current >= targetSeqRef.current) {
+                setPendingLiveLogs(0);
+            }
+        } catch {
+            // Tauri 事件不可用或短暂查询失败时，下一个探测周期会继续追赶游标。
+        } finally {
+            liveSyncingRef.current = false;
+            if (liveSyncAgainRef.current || targetSeqRef.current > syncedSeqRef.current) {
+                liveSyncAgainRef.current = false;
+                queueLiveSyncRef.current();
+            }
+        }
+    }, [appliedFilters, filterCursorKey, logsQueryKey, queryClient]);
 
     useEffect(() => {
         const loadedSeq = maxLogSeq(logs);
@@ -328,6 +439,21 @@ export function LogsPage() {
         };
     }, [queryClient]);
 
+    useEffect(() => {
+        const probe = () => void probeLiveLogs();
+        const intervalId = window.setInterval(probe, LIVE_PROBE_INTERVAL_MS);
+        const handleVisibilityChange = () => {
+            if (document.visibilityState === "visible") {
+                probe();
+            }
+        };
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+        return () => {
+            window.clearInterval(intervalId);
+            document.removeEventListener("visibilitychange", handleVisibilityChange);
+        };
+    }, [probeLiveLogs]);
+
     const updateDraftFilter = <Key extends keyof LogFilterState>(key: Key, value: LogFilterState[Key]) => {
         setDraftFilters((current) => ({ ...current, [key]: value }));
         if (key === "dateFrom" || key === "dateTo") {
@@ -345,6 +471,7 @@ export function LogsPage() {
         const nextFilters = { ...draftFilters, keyword: draftFilters.keyword.trim() };
         setFilterError("");
         setSelectedLog(null);
+        setSelectedLogIds(new Set());
         if (JSON.stringify(nextFilters) === JSON.stringify(appliedFilters)) {
             void logsQuery.refetch();
             return;
@@ -356,6 +483,7 @@ export function LogsPage() {
         setDraftFilters(EMPTY_FILTERS);
         setFilterError("");
         setSelectedLog(null);
+        setSelectedLogIds(new Set());
         if (JSON.stringify(appliedFilters) === JSON.stringify(EMPTY_FILTERS)) {
             void logsQuery.refetch();
         } else {
@@ -367,6 +495,59 @@ export function LogsPage() {
         if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             setSelectedLog(log);
+        }
+    };
+
+    const toggleLogSelection = (logId: string) => {
+        setSelectedLogIds((current) => {
+            const next = new Set(current);
+            if (next.has(logId)) {
+                next.delete(logId);
+            } else {
+                next.add(logId);
+            }
+            return next;
+        });
+    };
+
+    const toggleAllLoadedLogs = () => {
+        setSelectedLogIds(allLoadedSelected ? new Set() : new Set(logs.map((log) => log.id)));
+    };
+
+    const loadAllMatchingLogs = async () => {
+        const collected: RequestLog[] = [];
+        let offset = 0;
+        while (true) {
+            const page = await logApi.getAll(toGetLogsInput(appliedFilters, offset));
+            collected.push(...page);
+            if (page.length < PAGE_SIZE) {
+                break;
+            }
+            offset += page.length;
+        }
+
+        const unique = new Map(collected.map((log) => [log.id, log]));
+        return Array.from(unique.values()).sort((left, right) => (right.seq ?? 0) - (left.seq ?? 0));
+    };
+
+    const exportLogs = async (format: "csv" | "json") => {
+        if (logs.length === 0) {
+            return;
+        }
+        setExportingFormat(format);
+        try {
+            const exportRows = selectedLogs.length > 0 ? selectedLogs : await loadAllMatchingLogs();
+            const content = format === "csv" ? logsToCsv(exportRows) : logsToJson(exportRows);
+            const saved = await fileApi.saveExport(content, logExportName(format));
+            if (saved) {
+                setToast(`已导出 ${exportRows.length} 条日志`);
+                window.setTimeout(() => setToast(""), 1800);
+            }
+        } catch (exportError) {
+            setToast(errorMessage(exportError));
+            window.setTimeout(() => setToast(""), 2400);
+        } finally {
+            setExportingFormat(null);
         }
     };
 
@@ -383,7 +564,7 @@ export function LogsPage() {
                     <Search size={16} />
                     <input
                         value={draftFilters.keyword}
-                        placeholder="搜索请求 ID、密钥、渠道或模型"
+                        placeholder="搜索请求 ID、Trace ID、密钥、渠道或模型"
                         onChange={(event) => updateDraftFilter("keyword", event.target.value)}
                     />
                 </label>
@@ -457,18 +638,53 @@ export function LogsPage() {
 
             <section className="panel mt-4 min-w-0">
                 <div className="panel-header panel-header-compact">
-                    <p className="text-xs text-muted">已加载 {formatNumber(logs.length)} 条 · {loadedPageCount} 页</p>
-                    <span className="flex items-center gap-1.5 text-xs text-muted">
-                        <span className="live-dot" />
-                        {pendingLiveLogs > 0 ? `同步中 ${formatNumber(pendingLiveLogs)} 条` : "最新请求优先"}
-                    </span>
+                    <div>
+                        <p className="text-xs text-muted">已加载 {formatNumber(logs.length)} 条 · 已选择 {formatNumber(selectedLogs.length)} 条</p>
+                        <span className="mt-1 flex items-center gap-1.5 text-[10px] text-subtle">
+                            <span className="live-dot" />
+                            {pendingLiveLogs > 0 ? `同步中 ${formatNumber(pendingLiveLogs)} 条` : `实时更新 · ${loadedPageCount} 页`}
+                        </span>
+                    </div>
+                    <div className="log-export-actions">
+                        <Download size={15} className="text-muted" aria-hidden="true" />
+                        <button
+                            type="button"
+                            className="button-secondary"
+                            disabled={logs.length === 0 || exportingFormat !== null}
+                            aria-label={`${exportScopeLabel}为 CSV`}
+                            title={`${exportScopeLabel}为 CSV`}
+                            onClick={() => void exportLogs("csv")}
+                        >
+                            {exportingFormat === "csv" ? <span className="button-spinner" /> : <TableProperties size={15} />}CSV
+                        </button>
+                        <button
+                            type="button"
+                            className="button-secondary"
+                            disabled={logs.length === 0 || exportingFormat !== null}
+                            aria-label={`${exportScopeLabel}为 JSON`}
+                            title={`${exportScopeLabel}为 JSON`}
+                            onClick={() => void exportLogs("json")}
+                        >
+                            {exportingFormat === "json" ? <span className="button-spinner" /> : <FileJson2 size={15} />}JSON
+                        </button>
+                    </div>
                 </div>
                 <div className="table-scroll">
-                    <table className="data-table log-table min-w-[840px]">
+                    <table className="data-table log-table min-w-[1180px]">
                         <thead>
                             <tr>
+                                <th className="log-select-cell">
+                                    <input
+                                        type="checkbox"
+                                        aria-label="选择全部已加载日志"
+                                        checked={allLoadedSelected}
+                                        onChange={toggleAllLoadedLogs}
+                                    />
+                                </th>
                                 <th>序号</th>
                                 <th>时间</th>
+                                <th>Trace ID</th>
+                                <th>请求类型</th>
                                 <th>密钥名</th>
                                 <th>渠道名</th>
                                 <th>模型</th>
@@ -489,8 +705,22 @@ export function LogsPage() {
                                     onClick={() => setSelectedLog(log)}
                                     onKeyDown={(event) => openLogFromKeyboard(event, log)}
                                 >
+                                    <td className="log-select-cell">
+                                        <input
+                                            type="checkbox"
+                                            aria-label={`选择请求 ${log.seq ?? log.id}`}
+                                            checked={selectedLogIds.has(log.id)}
+                                            onClick={(event) => event.stopPropagation()}
+                                            onKeyDown={(event) => event.stopPropagation()}
+                                            onChange={() => toggleLogSelection(log.id)}
+                                        />
+                                    </td>
                                     <td className="font-mono text-xs font-semibold text-ink">{log.seq === null ? "--" : `#${log.seq}`}</td>
                                     <td className="font-mono text-[11px] text-muted">{formatDateTime(log.created_at)}</td>
+                                    <td>
+                                        <code className="log-trace-id" title={log.trace_id ?? undefined}>{log.trace_id ?? "--"}</code>
+                                    </td>
+                                    <td><ProtocolBadge mode={log.mode} /></td>
                                     <td className="text-xs text-ink">{log.api_key_name ?? "未识别"}</td>
                                     <td className="text-xs text-ink">{log.channel_name ?? "未路由"}</td>
                                     <td>
@@ -544,6 +774,7 @@ export function LogsPage() {
             </section>
 
             {selectedLog ? <LogDetailDrawer log={selectedLog} onClose={() => setSelectedLog(null)} /> : null}
+            {toast ? <Toast message={toast} /> : null}
         </div>
     );
 }

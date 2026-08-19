@@ -4,7 +4,9 @@ import {
     ArrowUpRight,
     CircleGauge,
     Clock3,
+    Coins,
     Cpu,
+    Database,
     KeyRound,
     MessageSquare,
     Radio,
@@ -17,6 +19,8 @@ import { useQuery } from "@tanstack/react-query";
 import { formatCompactNumber, formatDateTime, formatDuration, formatNumber } from "../lib/format";
 import { apiKeyApi, channelApi, logApi, serverApi, statsApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
+import { getProtocolMeta, protocolGradient, protocolTotal } from "../lib/protocol";
+import { localDayStatsInput, materializeUsageSeries, rollingUsageStatsInput } from "../lib/statistics";
 import type { RequestLog } from "../types";
 import { PageTitle, ProviderMark, StatusBadge } from "../components/ui";
 
@@ -35,6 +39,22 @@ const statDefinitions = [
         note: "今日累计用量",
         trend: "neutral",
         icon: Cpu,
+        tone: "blue",
+    },
+    {
+        key: "totalRequests",
+        label: "累计请求",
+        note: "全部历史请求",
+        trend: "neutral",
+        icon: Database,
+        tone: "green",
+    },
+    {
+        key: "totalTokens",
+        label: "累计 Token",
+        note: "全部历史用量",
+        trend: "neutral",
+        icon: Coins,
         tone: "blue",
     },
     {
@@ -95,7 +115,12 @@ function RequestStatus({ log }: { log: RequestLog }) {
 export function DashboardPage() {
     const { data: stats, error: statsError } = useQuery({
         queryKey: queryKeys.dashboard,
-        queryFn: statsApi.getDashboard,
+        queryFn: () => statsApi.getDashboard(localDayStatsInput()),
+        refetchInterval: 5_000,
+    });
+    const { data: rollingStats, error: rollingStatsError } = useQuery({
+        queryKey: queryKeys.usageStats("dashboard-24h"),
+        queryFn: () => statsApi.getUsage(rollingUsageStatsInput(24, 3_600)),
         refetchInterval: 5_000,
     });
     const { data: channels = [], error: channelsError } = useQuery({
@@ -104,7 +129,7 @@ export function DashboardPage() {
     });
     const { data: logs = [], error: logsError } = useQuery({
         queryKey: queryKeys.logs,
-        queryFn: () => logApi.getAll({ limit: 500 }),
+        queryFn: () => logApi.getAll({ limit: 6 }),
         refetchInterval: 3_000,
     });
     const { data: apiKeys = [], error: keysError } = useQuery({
@@ -121,30 +146,28 @@ export function DashboardPage() {
         [channels],
     );
     const recentLogs = logs.slice(0, 6);
-    const requestSeries = useMemo(() => {
-        const values = Array.from({ length: 24 }, () => 0);
-        const now = Date.now();
-        logs.forEach((log) => {
-            const elapsedHours = Math.floor((now - new Date(log.created_at).getTime()) / 3_600_000);
-            if (elapsedHours >= 0 && elapsedHours < 24) {
-                values[23 - elapsedHours] += 1;
-            }
-        });
-        return values;
-    }, [logs]);
+    const requestSeries = useMemo(
+        () => materializeUsageSeries(rollingStats?.series ?? [], 24),
+        [rollingStats?.series],
+    );
     const chartMax = Math.max(...requestSeries, 1);
-    const failures = logs.filter((log) => log.status_code >= 400).length;
-    const successRate = logs.length > 0 ? ((logs.length - failures) / logs.length) * 100 : 100;
+    const rollingRequests = rollingStats?.total_requests ?? 0;
+    const rollingFailures = rollingStats?.failed_requests ?? 0;
+    const successRate = rollingRequests > 0 ? ((rollingRequests - rollingFailures) / rollingRequests) * 100 : 100;
     const testedChannels = channels.filter((channel) => channel.last_test_ok !== null);
     const healthyChannels = testedChannels.filter((channel) => channel.last_test_ok === 1).length;
     const healthRate = testedChannels.length > 0 ? (healthyChannels / testedChannels.length) * 100 : 0;
     const activeKeys = apiKeys.filter((key) => key.status === 1 && (!key.expires_at || new Date(key.expires_at).getTime() > Date.now())).length;
-    const queryError = statsError ?? channelsError ?? logsError ?? keysError ?? serverError;
+    const protocolStats = stats?.protocols ?? [];
+    const totalProtocolRequests = protocolTotal(protocolStats);
+    const queryError = statsError ?? rollingStatsError ?? channelsError ?? logsError ?? keysError ?? serverError;
 
     const statValue = (key: string) => {
         switch (key) {
             case "requests": return formatNumber(stats?.today_requests ?? 0);
             case "tokens": return formatCompactNumber(stats?.today_total_tokens ?? 0);
+            case "totalRequests": return formatCompactNumber(stats?.total_requests ?? 0);
+            case "totalTokens": return formatCompactNumber(stats?.total_tokens ?? 0);
             case "channels": return `${activeChannels} / ${channels.length}`;
             case "latency": return formatDuration(Math.round(stats?.avg_latency_ms ?? 0));
             default: return "0";
@@ -193,7 +216,7 @@ export function DashboardPage() {
                 </div>
             </section>
 
-            <section className="kpi-grid" aria-label="今日概览">
+            <section className="kpi-grid" aria-label="请求与网关概览">
                 {statDefinitions.map(({ key, ...stat }) => (
                     <KpiCard
                         key={key}
@@ -212,7 +235,7 @@ export function DashboardPage() {
                         </div>
                         <div className="flex items-center gap-4 text-xs text-muted">
                             <span className="flex items-center gap-1.5"><span className="legend-dot legend-green" />请求</span>
-                            <span className="font-mono font-semibold text-ink">{formatNumber(stats?.today_requests ?? 0)}</span>
+                            <span className="font-mono font-semibold text-ink">{formatNumber(rollingRequests)}</span>
                         </div>
                     </div>
                     <div className="traffic-chart" aria-label="24 小时请求趋势柱状图">
@@ -222,12 +245,14 @@ export function DashboardPage() {
                                     className="chart-bar"
                                     style={{ height: `${Math.max((value / chartMax) * 100, 7)}%` }}
                                     title={`${23 - index} 小时前 · ${value} 次`}
+                                    role="img"
+                                    aria-label={`${23 - index} 小时前，${value} 次请求`}
                                 />
                             </div>
                         ))}
                     </div>
                     <div className="chart-axis">
-                        <span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>现在</span>
+                        <span>24 小时前</span><span>18 小时前</span><span>12 小时前</span><span>6 小时前</span><span>现在</span>
                     </div>
                 </article>
 
@@ -259,6 +284,40 @@ export function DashboardPage() {
                         ))}
                     </div>
                 </article>
+            </section>
+
+            <section className="panel protocol-panel mt-4">
+                <div className="panel-header">
+                    <div>
+                        <h2>协议分布</h2>
+                        <p>按累计请求类型统计</p>
+                    </div>
+                    <span className="font-mono text-xs text-muted">{formatNumber(totalProtocolRequests)} 次请求</span>
+                </div>
+                <div className="protocol-distribution">
+                    <div
+                        className="protocol-ring"
+                        style={{ background: protocolGradient(protocolStats) }}
+                        role="img"
+                        aria-label={`协议分布，共 ${totalProtocolRequests} 次请求`}
+                    >
+                        <div><strong>{formatCompactNumber(totalProtocolRequests)}</strong><span>累计请求</span></div>
+                    </div>
+                    <div className="protocol-legend">
+                        {protocolStats.map((item) => {
+                            const protocol = getProtocolMeta(item.mode);
+                            const percentage = totalProtocolRequests > 0 ? (item.request_count / totalProtocolRequests) * 100 : 0;
+                            return (
+                                <div className="protocol-legend-row" key={item.mode}>
+                                    <span className={`protocol-swatch protocol-swatch-${protocol.tone}`} />
+                                    <div><strong>{protocol.label}</strong><span>{formatCompactNumber(item.total_tokens)} Token</span></div>
+                                    <div><strong>{formatNumber(item.request_count)}</strong><span>{percentage.toFixed(1)}%</span></div>
+                                </div>
+                            );
+                        })}
+                        {protocolStats.length === 0 ? <p className="protocol-empty">暂无协议用量</p> : null}
+                    </div>
+                </div>
             </section>
 
             <section className="panel mt-4 min-w-0">
@@ -301,7 +360,7 @@ export function DashboardPage() {
             </section>
 
             <div className="mt-4 grid gap-4 sm:grid-cols-3">
-                <div className="mini-stat"><Activity size={17} /><span>总请求</span><strong>{formatCompactNumber(stats?.total_requests ?? 0)}</strong></div>
+                <div className="mini-stat"><Activity size={17} /><span>今日请求</span><strong>{formatCompactNumber(stats?.today_requests ?? 0)}</strong></div>
                 <div className="mini-stat"><KeyRound size={17} /><span>有效密钥</span><strong>{activeKeys}</strong></div>
                 <div className="mini-stat"><Clock3 size={17} /><span>网关状态</span><strong>{serverStatus?.running ? "运行中" : "未连接"}</strong></div>
             </div>

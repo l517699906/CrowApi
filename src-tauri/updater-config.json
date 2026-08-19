@@ -1,0 +1,11 @@
+{
+  "_comment": "更新源配置 - 修改后需要重新构建生效。",
+  "probeTimeoutMs": 3000,
+  "sources": [
+    {
+      "id": "github",
+      "label": "GitHub",
+      "latestJsonUrl": "https://github.com/l517699906/CrowApi/releases/latest/download/latest.json"
+    }
+  ]
+}

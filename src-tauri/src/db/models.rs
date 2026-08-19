@@ -117,6 +117,46 @@ pub struct DashboardStats {
     pub total_api_keys: i64,
     pub total_requests: i64,
     pub total_tokens: i64,
+    pub protocols: Vec<ProtocolUsageStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ProtocolUsageStat {
+    pub mode: String,
+    pub request_count: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UsageBucketStat {
+    pub bucket_index: i64,
+    pub request_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ModelUsageStat {
+    pub name: String,
+    pub request_count: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ChannelUsageStat {
+    pub id: String,
+    pub name: String,
+    pub channel_type: String,
+    pub request_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageStats {
+    pub total_requests: i64,
+    pub total_tokens: i64,
+    pub failed_requests: i64,
+    pub protocols: Vec<ProtocolUsageStat>,
+    pub series: Vec<UsageBucketStat>,
+    pub models: Vec<ModelUsageStat>,
+    pub channels: Vec<ChannelUsageStat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

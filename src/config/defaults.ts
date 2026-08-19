@@ -12,6 +12,7 @@ export const DEFAULT_SETTINGS: Settings = {
     retry_times: 2,
     default_key_quota: 1_000_000,
     total_quota: 0,
+    quota_warning_threshold: 85,
     security_enabled: false,
     security_mode: "audit",
     security_scan_unicode: true,

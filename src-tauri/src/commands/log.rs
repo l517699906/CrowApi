@@ -103,6 +103,7 @@ impl From<RequestSecurityFinding> for SecurityFindingDto {
 pub struct GetLogsInput {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub after_seq: Option<i64>,
     pub keyword: Option<String>,
     pub api_key_name: Option<String>,
     pub channel_name: Option<String>,
@@ -129,7 +130,23 @@ pub async fn get_logs(
         || input.date_to.is_some()
         || input.trace_id.is_some();
 
-    let logs = if has_search {
+    let logs = if let Some(after_seq) = input.after_seq {
+        if has_search {
+            repo.search_logs_after(
+                input.keyword.as_deref(),
+                input.api_key_name.as_deref(),
+                input.channel_name.as_deref(),
+                input.model.as_deref(),
+                input.date_from.as_deref(),
+                input.date_to.as_deref(),
+                input.trace_id.as_deref(),
+                after_seq,
+                limit,
+            ).await
+        } else {
+            repo.get_logs_after(after_seq, limit).await
+        }
+    } else if has_search {
         repo.search_logs(
             input.keyword.as_deref(),
             input.api_key_name.as_deref(),
@@ -172,7 +189,9 @@ pub async fn delete_log(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<(), String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.delete_log(&id).await.map_err(|e| e.to_string())
+    repo.delete_log(&id).await.map_err(|e| e.to_string())?;
+    state.log_events.mark_reset();
+    Ok(())
 }
 
 #[tauri::command]
@@ -181,7 +200,9 @@ pub async fn delete_logs_before(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<u64, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.delete_logs_before(&before_date).await.map_err(|e| e.to_string())
+    let deleted = repo.delete_logs_before(&before_date).await.map_err(|e| e.to_string())?;
+    state.log_events.mark_reset();
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -189,7 +210,9 @@ pub async fn delete_all_logs(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<u64, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.delete_all_logs().await.map_err(|e| e.to_string())
+    let deleted = repo.delete_all_logs().await.map_err(|e| e.to_string())?;
+    state.log_events.mark_reset();
+    Ok(deleted)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -116,7 +116,13 @@ export const initialApiKeys: ApiKey[] = [
     },
 ];
 
-const logSeed: Array<Omit<RequestLog, "created_at"> & { minutes_ago: number }> = [
+type LogSeed = Omit<RequestLog, "created_at" | "response_choices" | "trace_id"> & {
+    minutes_ago: number;
+    response_choices?: string | null;
+    trace_id?: string | null;
+};
+
+const logSeed: LogSeed[] = [
     { id: "log-12048", seq: 12048, api_key_name: "本地开发", channel_name: "OpenAI 主线路", model: "gpt-5.2", upstream_model: "gpt-5.2", mode: "chat", status_code: 200, prompt_tokens: 2840, completion_tokens: 962, total_tokens: 3802, duration_ms: 1248, error_message: null, is_stream: true, is_retry: false, request_body: "{\n  \"model\": \"gpt-5.2\",\n  \"stream\": true,\n  \"messages\": [\"...\"]\n}", risk_level: "low", risk_score: 3, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 1 },
     { id: "log-12047", seq: 12047, api_key_name: "Cursor", channel_name: "Claude 生产线路", model: "claude-sonnet-4-5", upstream_model: "claude-sonnet-4-5", mode: "chat", status_code: 200, prompt_tokens: 5120, completion_tokens: 1484, total_tokens: 6604, duration_ms: 1865, error_message: null, is_stream: true, is_retry: false, request_body: null, risk_level: "low", risk_score: 4, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 4 },
     { id: "log-12046", seq: 12046, api_key_name: "本地开发", channel_name: "DeepSeek 默认", model: "deepseek-reasoner", upstream_model: "deepseek-reasoner", mode: "chat", status_code: 200, prompt_tokens: 1650, completion_tokens: 3240, total_tokens: 4890, duration_ms: 3422, error_message: null, is_stream: false, is_retry: false, request_body: null, risk_level: "low", risk_score: 8, risk_summary: null, security_action: "allow", sanitized: false, blocked_reason: null, minutes_ago: 9 },
@@ -131,6 +137,8 @@ const logSeed: Array<Omit<RequestLog, "created_at"> & { minutes_ago: number }> =
 
 export const initialLogs: RequestLog[] = logSeed.map(({ minutes_ago, ...log }) => ({
     ...log,
+    response_choices: log.response_choices ?? null,
+    trace_id: log.trace_id ?? null,
     created_at: minutesAgo(minutes_ago),
 }));
 
@@ -146,6 +154,7 @@ export const initialSettings: Settings = {
     retry_times: 2,
     default_key_quota: 1_000_000,
     total_quota: 0,
+    quota_warning_threshold: 85,
     security_enabled: true,
     security_mode: "audit",
     security_scan_unicode: true,

@@ -7,6 +7,7 @@ import {
     Plus,
     ShieldCheck,
     Trash2,
+    TriangleAlert,
     WalletCards,
     XCircle,
 } from "lucide-react";
@@ -16,6 +17,7 @@ import { formatCompactNumber, formatDateTime, formatQuota } from "../lib/format"
 import { apiKeyApi, channelApi, settingsApi, statsApi } from "../lib/api";
 import { MAX_QUOTA, normalizeQuota } from "../lib/quota";
 import { errorMessage, queryKeys } from "../lib/query";
+import { localDayStatsInput } from "../lib/statistics";
 import type { ApiKey } from "../types";
 import { IconButton, Modal, PageTitle, StatusBadge, Toast, Toggle } from "../components/ui";
 
@@ -49,7 +51,7 @@ export function ApiKeysPage() {
     });
     const { data: dashboard } = useQuery({
         queryKey: queryKeys.dashboard,
-        queryFn: statsApi.getDashboard,
+        queryFn: () => statsApi.getDashboard(localDayStatsInput()),
     });
     const { data: settings } = useQuery({
         queryKey: queryKeys.settings,
@@ -67,9 +69,14 @@ export function ApiKeysPage() {
     const models = useMemo(() => Array.from(new Set(channels.flatMap((channel) => channel.models))), [channels]);
     const defaultKeyQuota = settings?.default_key_quota ?? DEFAULT_SETTINGS.default_key_quota;
     const totalQuota = settings?.total_quota ?? DEFAULT_SETTINGS.total_quota;
+    const quotaWarningThreshold = settings?.quota_warning_threshold ?? DEFAULT_SETTINGS.quota_warning_threshold;
     const totalUsed = apiKeys.reduce((sum, key) => sum + key.quota_used, 0);
     const totalQuotaPercentage = totalQuota > 0 ? Math.min((totalUsed / totalQuota) * 100, 100) : 0;
     const isTotalQuotaUnlimited = totalQuota <= 0;
+    const hasTotalQuotaWarning = !isTotalQuotaUnlimited && totalQuotaPercentage >= quotaWarningThreshold;
+    const quotaWarningKeys = apiKeys.filter((key) => (
+        key.quota_limit > 0 && (key.quota_used / key.quota_limit) * 100 >= quotaWarningThreshold
+    ));
     const now = Date.now();
     const activeKeys = apiKeys.filter((key) => key.status === 1 && (!key.expires_at || new Date(key.expires_at).getTime() > now));
 
@@ -200,13 +207,29 @@ export function ApiKeysPage() {
                     </div>
                 </div>
                 <div className="key-quota-track">
-                    <span style={{ width: `${totalQuotaPercentage}%` }} />
+                    <span className={hasTotalQuotaWarning ? "is-warning" : ""} style={{ width: `${totalQuotaPercentage}%` }} />
                 </div>
                 <div className="key-overview-meta">
-                    <span>{isTotalQuotaUnlimited ? "总配额未限制" : `已使用 ${Math.round(totalQuotaPercentage)}%`}</span>
+                    <span className={hasTotalQuotaWarning ? "text-warning" : ""}>
+                        {isTotalQuotaUnlimited ? "总配额未限制" : `已使用 ${Math.round(totalQuotaPercentage)}%`}
+                    </span>
                     <span>今日调用 {dashboard?.today_requests ?? 0}</span>
                 </div>
             </section>
+
+            {quotaWarningKeys.length > 0 || hasTotalQuotaWarning ? (
+                <section className="quota-alert-summary mt-4" role="status">
+                    <TriangleAlert size={18} />
+                    <div>
+                        <strong>配额告警</strong>
+                        <span>
+                            {hasTotalQuotaWarning ? "网关总配额已接近上限" : "存在接近配额上限的密钥"}
+                            {quotaWarningKeys.length > 0 ? ` · ${quotaWarningKeys.length} 个密钥需要关注` : ""}
+                        </span>
+                    </div>
+                    <StatusBadge status="warning">阈值 {quotaWarningThreshold}%</StatusBadge>
+                </section>
+            ) : null}
 
             <section className="panel mt-4 min-w-0">
                 <div className="panel-header">
@@ -231,7 +254,10 @@ export function ApiKeysPage() {
                         </thead>
                         <tbody>
                             {apiKeys.map((apiKey) => {
-                                const percentage = apiKey.quota_limit <= 0 ? 0 : Math.min((apiKey.quota_used / apiKey.quota_limit) * 100, 100);
+                                const rawPercentage = apiKey.quota_limit <= 0 ? 0 : (apiKey.quota_used / apiKey.quota_limit) * 100;
+                                const percentage = Math.min(rawPercentage, 100);
+                                const isQuotaExhausted = apiKey.quota_limit > 0 && rawPercentage >= 100;
+                                const hasQuotaWarning = apiKey.quota_limit > 0 && rawPercentage >= quotaWarningThreshold;
                                 const isExpired = apiKey.expires_at
                                     ? new Date(apiKey.expires_at).getTime() <= now
                                     : false;
@@ -266,8 +292,15 @@ export function ApiKeysPage() {
                                                     <span>{formatQuota(apiKey.quota_limit)}</span>
                                                 </div>
                                                 <div className="quota-progress">
-                                                    <span className={percentage > 85 ? "is-warning" : ""} style={{ width: `${percentage}%` }} />
+                                                    <span className={hasQuotaWarning ? "is-warning" : ""} style={{ width: `${percentage}%` }} />
                                                 </div>
+                                                {hasQuotaWarning ? (
+                                                    <div className="mt-1.5">
+                                                        <StatusBadge status={isQuotaExhausted ? "danger" : "warning"}>
+                                                            {isQuotaExhausted ? "已耗尽" : `已达 ${Math.round(rawPercentage)}%`}
+                                                        </StatusBadge>
+                                                    </div>
+                                                ) : null}
                                             </div>
                                         </td>
                                         <td className="text-xs text-muted">

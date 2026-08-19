@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
     Check,
     CircleHelp,
+    DownloadCloud,
     Gauge,
     Globe2,
     Monitor,
@@ -13,14 +14,17 @@ import {
     ShieldCheck,
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { getVersion } from "@tauri-apps/api/app";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check as checkForAppUpdate, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import { DEFAULT_SETTINGS } from "../config/defaults";
 import { settingsApi } from "../lib/api";
 import { MAX_QUOTA, normalizeQuota } from "../lib/quota";
 import { errorMessage, queryKeys } from "../lib/query";
-import type { Settings } from "../types";
-import { PageTitle, SegmentedControl, Toast, Toggle } from "../components/ui";
+import type { Settings, UiTheme } from "../types";
+import { PageTitle, Toast, Toggle } from "../components/ui";
 
-type SettingsTab = "service" | "quota" | "general" | "interface" | "retry";
+type SettingsTab = "service" | "quota" | "general" | "interface" | "retry" | "update";
 
 const tabs: Array<{ id: SettingsTab; label: string; icon: typeof Server }> = [
     { id: "service", label: "服务配置", icon: Server },
@@ -28,13 +32,18 @@ const tabs: Array<{ id: SettingsTab; label: string; icon: typeof Server }> = [
     { id: "general", label: "通用设置", icon: Settings2 },
     { id: "interface", label: "界面设置", icon: Palette },
     { id: "retry", label: "重试策略", icon: RefreshCcw },
+    { id: "update", label: "软件更新", icon: DownloadCloud },
 ];
 
-const themeOptions = [
-    { value: "light", label: "浅色" },
-    { value: "system", label: "跟随系统" },
-    { value: "dark", label: "深色" },
-] as const;
+const themeOptions: ReadonlyArray<{ value: UiTheme; label: string; colors: readonly [string, string, string] }> = [
+    { value: "light", label: "浅色", colors: ["#f4f6f5", "#11815d", "#3d73c3"] },
+    { value: "system", label: "跟随系统", colors: ["#f4f6f5", "#121714", "#3db88a"] },
+    { value: "dark", label: "深色", colors: ["#121714", "#3db88a", "#76a4e5"] },
+    { value: "mist", label: "雾青", colors: ["#eef3f5", "#087f72", "#3a6fc8"] },
+    { value: "ember", label: "余烬", colors: ["#181616", "#df6258", "#68a4d7"] },
+];
+
+type UpdatePhase = "idle" | "checking" | "downloading" | "installing" | "current" | "error";
 
 export function SettingsPage() {
     const queryClient = useQueryClient();
@@ -45,6 +54,11 @@ export function SettingsPage() {
     const [activeTab, setActiveTab] = useState<SettingsTab>("service");
     const [draft, setDraft] = useState<Settings>(() => ({ ...DEFAULT_SETTINGS }));
     const [toast, setToast] = useState("");
+    const [currentVersion, setCurrentVersion] = useState("--");
+    const [latestVersion, setLatestVersion] = useState<string | null>(null);
+    const [updatePhase, setUpdatePhase] = useState<UpdatePhase>("idle");
+    const [updateProgress, setUpdateProgress] = useState(0);
+    const [updateError, setUpdateError] = useState("");
     const saveMutation = useMutation({
         mutationFn: settingsApi.save,
         onSuccess: (_, savedSettings) => {
@@ -60,6 +74,10 @@ export function SettingsPage() {
         }
     }, [settings]);
 
+    useEffect(() => {
+        void getVersion().then(setCurrentVersion).catch(() => setCurrentVersion("0.1.0"));
+    }, []);
+
     function updateSetting<K extends keyof Settings>(key: K, value: Settings[K]) {
         setDraft((current) => ({ ...current, [key]: value }));
     }
@@ -69,6 +87,53 @@ export function SettingsPage() {
             await saveMutation.mutateAsync(draft);
         } catch {
             // Mutation error is rendered with the settings form.
+        }
+    };
+
+    const checkAndInstallUpdate = async () => {
+        let update: Update | null = null;
+        setUpdatePhase("checking");
+        setUpdateProgress(0);
+        setUpdateError("");
+        setLatestVersion(null);
+
+        try {
+            update = await checkForAppUpdate({ timeout: 10_000 });
+            if (!update) {
+                setUpdatePhase("current");
+                return;
+            }
+
+            setLatestVersion(update.version);
+            setUpdatePhase("downloading");
+            let downloadedBytes = 0;
+            let contentLength = 0;
+            const handleDownloadEvent = (event: DownloadEvent) => {
+                if (event.event === "Started") {
+                    contentLength = event.data.contentLength ?? 0;
+                    downloadedBytes = 0;
+                } else if (event.event === "Progress") {
+                    downloadedBytes += event.data.chunkLength;
+                    if (contentLength > 0) {
+                        setUpdateProgress(Math.min(99, Math.round((downloadedBytes / contentLength) * 100)));
+                    }
+                } else {
+                    setUpdateProgress(100);
+                    setUpdatePhase("installing");
+                }
+            };
+
+            await update.downloadAndInstall(handleDownloadEvent, { timeout: 120_000 });
+            await update.close();
+            update = null;
+            await relaunch();
+        } catch (updateFailure) {
+            setUpdatePhase("error");
+            setUpdateError(errorMessage(updateFailure));
+        } finally {
+            if (update) {
+                await update.close().catch(() => undefined);
+            }
         }
     };
 
@@ -167,9 +232,28 @@ export function SettingsPage() {
                                         />
                                         <small>所有密钥累计 Token 上限，0 表示不限制</small>
                                     </label>
+                                    <label className="field-label">
+                                        <span>配额告警阈值</span>
+                                        <div className="quota-threshold-field">
+                                            <input
+                                                className="field-input font-mono"
+                                                type="number"
+                                                min="1"
+                                                max="100"
+                                                step="1"
+                                                value={draft.quota_warning_threshold}
+                                                onChange={(event) => updateSetting(
+                                                    "quota_warning_threshold",
+                                                    Math.min(100, Math.max(1, Math.trunc(Number(event.target.value) || 1))),
+                                                )}
+                                            />
+                                            <span>%</span>
+                                        </div>
+                                        <small>单个密钥或总配额达到该比例时显示告警</small>
+                                    </label>
                                 </div>
                             </div>
-                            <div className="settings-note"><CircleHelp size={17} /><span>总配额保存后立即应用，默认密钥配额用于之后创建的密钥。</span></div>
+                            <div className="settings-note"><CircleHelp size={17} /><span>总配额和告警阈值保存后立即应用，默认密钥配额用于之后创建的密钥。</span></div>
                         </div>
                     ) : null}
 
@@ -223,24 +307,27 @@ export function SettingsPage() {
                             <div className="settings-form-block">
                                 <div className="field-label">
                                     <span>主题</span>
-                                    <SegmentedControl
-                                        value={draft.ui_theme as "light" | "system" | "dark"}
-                                        options={themeOptions}
-                                        onChange={(value) => updateSetting("ui_theme", value)}
-                                        label="界面主题"
-                                    />
                                 </div>
-                                <div className="theme-previews" aria-hidden="true">
+                                <div className="theme-choice-grid" role="radiogroup" aria-label="界面主题">
                                     {themeOptions.map((option) => (
                                         <button
                                             key={option.value}
                                             type="button"
-                                            tabIndex={-1}
-                                            className={`theme-preview theme-preview-${option.value} ${draft.ui_theme === option.value ? "is-selected" : ""}`}
+                                            role="radio"
+                                            aria-checked={draft.ui_theme === option.value}
+                                            className={`theme-choice theme-choice-${option.value} ${draft.ui_theme === option.value ? "is-selected" : ""}`}
                                             onClick={() => updateSetting("ui_theme", option.value)}
                                         >
-                                            <span className="theme-preview-sidebar" />
-                                            <span className="theme-preview-content"><i /><i /><i /></span>
+                                            <span className="theme-choice-preview" aria-hidden="true">
+                                                <i /><i /><i />
+                                            </span>
+                                            <span className="theme-choice-footer">
+                                                <span className="theme-swatches" aria-hidden="true">
+                                                    {option.colors.map((color) => <i key={color} style={{ background: color }} />)}
+                                                </span>
+                                                <strong>{option.label}</strong>
+                                                {draft.ui_theme === option.value ? <Check size={14} /> : null}
+                                            </span>
                                         </button>
                                     ))}
                                 </div>
@@ -287,6 +374,39 @@ export function SettingsPage() {
                                     <div className="retry-condition"><Check size={15} />连接超时或中断</div>
                                 </div>
                             </div>
+                        </div>
+                    ) : null}
+
+                    {activeTab === "update" ? (
+                        <div className="settings-section page-enter" key="update">
+                            <div className="settings-heading">
+                                <span className="settings-heading-icon settings-heading-blue"><DownloadCloud size={19} /></span>
+                                <div><h2>软件更新</h2><p>检查并安装 CrowAPI 新版本</p></div>
+                            </div>
+                            <div className="update-status-panel">
+                                <div className="update-version-row">
+                                    <div><span>当前版本</span><strong>v{currentVersion}</strong></div>
+                                    <div><span>最新版本</span><strong>{latestVersion ? `v${latestVersion}` : "--"}</strong></div>
+                                    <button
+                                        type="button"
+                                        className="button-primary"
+                                        disabled={["checking", "downloading", "installing"].includes(updatePhase)}
+                                        onClick={() => void checkAndInstallUpdate()}
+                                    >
+                                        {updatePhase === "checking" ? <span className="button-spinner is-inverse" /> : <RefreshCcw size={16} />}
+                                        {updatePhase === "checking" ? "正在检查" : "检查更新"}
+                                    </button>
+                                </div>
+                                {updatePhase === "downloading" || updatePhase === "installing" ? (
+                                    <div className="update-progress" role="status" aria-live="polite">
+                                        <div><span>{updatePhase === "downloading" ? "正在下载更新" : "正在安装更新"}</span><strong>{updateProgress}%</strong></div>
+                                        <div><span style={{ width: `${updateProgress}%` }} /></div>
+                                    </div>
+                                ) : null}
+                                {updatePhase === "current" ? <p className="update-message is-success"><Check size={15} />当前已是最新版本</p> : null}
+                                {updatePhase === "error" ? <p className="update-message is-error"><CircleHelp size={15} />{updateError}</p> : null}
+                            </div>
+                            <div className="settings-note"><CircleHelp size={17} /><span>发现新版本后会直接下载并安装，完成后自动重启应用。</span></div>
                         </div>
                     ) : null}
                 </section>

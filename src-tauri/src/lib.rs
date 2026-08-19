@@ -34,6 +34,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -126,6 +128,7 @@ pub fn run() {
             commands::channel::get_channel,
             commands::channel::create_channel,
             commands::channel::update_channel,
+            commands::channel::reorder_channels,
             commands::channel::toggle_channel,
             commands::channel::delete_channel,
             commands::channel::test_channel,
@@ -141,6 +144,7 @@ pub fn run() {
             commands::log::delete_all_logs,
             commands::log::get_log_stats,
             commands::stats::get_dashboard_stats,
+            commands::stats::get_usage_stats,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::apply_theme,

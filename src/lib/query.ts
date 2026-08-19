@@ -4,6 +4,7 @@ export const queryKeys = {
     logs: ["logs"] as const,
     logSecurityFindings: (logId: string) => ["logs", logId, "security-findings"] as const,
     dashboard: ["dashboard"] as const,
+    usageStats: (period: string) => ["usage-stats", period] as const,
     settings: ["settings"] as const,
     serverStatus: ["server-status"] as const,
 };

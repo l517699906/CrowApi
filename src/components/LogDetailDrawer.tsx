@@ -22,6 +22,7 @@ import { useQuery } from "@tanstack/react-query";
 import { formatDateTime, formatDuration, formatTokenCount } from "../lib/format";
 import { logApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
+import { getProtocolMeta } from "../lib/protocol";
 import type { RequestLog } from "../types";
 import { IconButton, StatusBadge } from "./ui";
 import { LogRiskBadge } from "./LogRiskBadge";
@@ -214,6 +215,7 @@ export function LogDetailDrawer({ log, onClose }: LogDetailDrawerProps) {
     }, []);
 
     const requestLabel = log.seq === null ? log.id.slice(0, 8) : `#${log.seq}`;
+    const protocol = getProtocolMeta(log.mode);
 
     return (
         <div
@@ -238,9 +240,10 @@ export function LogDetailDrawer({ log, onClose }: LogDetailDrawerProps) {
                         <div className="flex flex-wrap items-center gap-2">
                             <h2 id={titleId}>请求 {requestLabel}</h2>
                             <StatusBadge status={getStatusTone(log.status_code)}>{log.status_code}</StatusBadge>
+                            <span className={`protocol-badge protocol-${protocol.tone}`}>{protocol.label}</span>
                             <LogRiskBadge level={log.risk_level} score={log.risk_score} />
                         </div>
-                        <p>{formatDateTime(log.created_at)} · {log.mode} · {log.is_stream ? "流式" : "非流式"}</p>
+                        <p>{formatDateTime(log.created_at)} · {log.is_stream ? "流式" : "非流式"}</p>
                     </div>
                     <IconButton label="关闭日志详情" onClick={onClose} className="-mr-1 -mt-1">
                         <X size={18} />
@@ -254,6 +257,7 @@ export function LogDetailDrawer({ log, onClose }: LogDetailDrawerProps) {
                             <div><dt>上游模型</dt><dd>{log.upstream_model ?? "未路由"}</dd></div>
                             <div><dt>密钥</dt><dd>{log.api_key_name ?? "未识别"}</dd></div>
                             <div><dt>渠道</dt><dd>{log.channel_name ?? "未路由"}</dd></div>
+                            <div><dt>Trace ID</dt><dd className="log-detail-trace">{log.trace_id ?? "未提供"}</dd></div>
                             <div><dt>Token</dt><dd>{formatTokenCount(log.total_tokens)}</dd></div>
                             <div><dt>延迟</dt><dd>{formatDuration(log.duration_ms)}</dd></div>
                         </dl>

@@ -2,10 +2,11 @@ import { useMemo, useState } from "react";
 import { Coins, Database, Gauge, Layers3, TriangleAlert } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { formatCompactNumber, formatNumber } from "../lib/format";
-import { channelApi, logApi } from "../lib/api";
+import { statsApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
+import { getProtocolMeta, protocolTotal } from "../lib/protocol";
+import { materializeUsageSeries, rollingUsageStatsInput } from "../lib/statistics";
 import { PageTitle, ProviderMark, SegmentedControl } from "../components/ui";
-import type { RequestLog } from "../types";
 
 type UsagePeriod = "24h" | "7d" | "30d";
 
@@ -23,66 +24,33 @@ const periodDays: Record<UsagePeriod, number> = {
 
 const modelColors = ["var(--accent)", "var(--data-blue)", "var(--warning)", "var(--coral)"];
 
-function periodStart(period: UsagePeriod): Date {
-    return new Date(Date.now() - periodDays[period] * 86_400_000);
-}
-
-function buildSeries(logs: RequestLog[], period: UsagePeriod): number[] {
+function usageStatsInput(period: UsagePeriod) {
     const bucketCount = period === "24h" ? 24 : periodDays[period];
-    const bucketMs = period === "24h" ? 3_600_000 : 86_400_000;
-    const start = periodStart(period).getTime();
-    const values = Array.from({ length: bucketCount }, () => 0);
-
-    logs.forEach((log) => {
-        const index = Math.floor((new Date(log.created_at).getTime() - start) / bucketMs);
-        if (index >= 0 && index < values.length) {
-            values[index] += 1;
-        }
-    });
-    return values;
+    const bucketSeconds = period === "24h" ? 3_600 : 86_400;
+    return rollingUsageStatsInput(bucketCount, bucketSeconds);
 }
 
 export function UsagePage() {
     const [period, setPeriod] = useState<UsagePeriod>("24h");
-    const start = periodStart(period).toISOString();
-    const { data: logs = [], isPending, error } = useQuery({
-        queryKey: [...queryKeys.logs, "usage", period],
-        queryFn: () => logApi.getAll({ date_from: start, limit: 5_000 }),
+    const { data: usageStats, isPending, error } = useQuery({
+        queryKey: queryKeys.usageStats(period),
+        queryFn: () => statsApi.getUsage(usageStatsInput(period)),
+        refetchInterval: 5_000,
     });
-    const { data: channels = [] } = useQuery({
-        queryKey: queryKeys.channels,
-        queryFn: channelApi.getAll,
-    });
-    const series = useMemo(() => buildSeries(logs, period), [logs, period]);
+    const series = useMemo(
+        () => materializeUsageSeries(usageStats?.series ?? [], period === "24h" ? 24 : periodDays[period]),
+        [period, usageStats?.series],
+    );
     const chartMax = Math.max(...series, 1);
-    const totalRequests = logs.length;
-    const totalTokens = logs.reduce((sum, log) => sum + log.total_tokens, 0);
+    const totalRequests = usageStats?.total_requests ?? 0;
+    const totalTokens = usageStats?.total_tokens ?? 0;
     const averageTokens = totalRequests > 0 ? Math.round(totalTokens / totalRequests) : 0;
-    const failedRequests = logs.filter((log) => log.status_code >= 400).length;
+    const failedRequests = usageStats?.failed_requests ?? 0;
     const successRate = totalRequests > 0 ? ((totalRequests - failedRequests) / totalRequests) * 100 : 100;
-    const modelUsage = useMemo(() => {
-        const usage = new Map<string, { name: string; requests: number; tokens: number }>();
-        logs.forEach((log) => {
-            const current = usage.get(log.model) ?? { name: log.model, requests: 0, tokens: 0 };
-            current.requests += 1;
-            current.tokens += log.total_tokens;
-            usage.set(log.model, current);
-        });
-        return [...usage.values()].sort((left, right) => right.tokens - left.tokens);
-    }, [logs]);
-    const channelUsage = useMemo(() => {
-        const usage = new Map<string, number>();
-        logs.forEach((log) => {
-            const name = log.channel_name ?? "未分配渠道";
-            usage.set(name, (usage.get(name) ?? 0) + 1);
-        });
-        return [...usage.entries()]
-            .map(([name, requests]) => {
-                const channel = channels.find((item) => item.name === name);
-                return { id: channel?.id ?? name, name, type: channel?.type ?? "custom", requests };
-            })
-            .sort((left, right) => right.requests - left.requests);
-    }, [channels, logs]);
+    const protocolStats = usageStats?.protocols ?? [];
+    const totalProtocolRequests = protocolTotal(protocolStats);
+    const modelUsage = usageStats?.models ?? [];
+    const channelUsage = usageStats?.channels ?? [];
 
     return (
         <div className="page-enter">
@@ -133,8 +101,13 @@ export function UsagePage() {
                         <div className="usage-chart-column" key={`${value}-${index}`}>
                             <span
                                 className="usage-chart-bar"
-                                style={{ height: `${Math.max((value / chartMax) * 100, 5)}%` }}
+                                style={{
+                                    height: value === 0 ? 0 : `${Math.max((value / chartMax) * 100, 5)}%`,
+                                    minHeight: value === 0 ? 0 : undefined,
+                                }}
                                 title={`${value} 次请求`}
+                                role="img"
+                                aria-label={`第 ${index + 1} 个时间段，${value} 次请求`}
                             />
                         </div>
                     ))}
@@ -154,17 +127,17 @@ export function UsagePage() {
                     </div>
                     <div className="model-usage-list">
                         {modelUsage.map((model, index) => {
-                            const percentage = modelUsage[0]?.tokens ? (model.tokens / modelUsage[0].tokens) * 100 : 0;
+                            const percentage = modelUsage[0]?.total_tokens ? (model.total_tokens / modelUsage[0].total_tokens) * 100 : 0;
                             return (
                                 <div className="usage-list-row" key={model.name}>
                                     <div className="flex items-center justify-between gap-4">
                                         <span className="model-name">{model.name}</span>
-                                        <span className="font-mono text-xs font-semibold text-ink">{formatCompactNumber(model.tokens)}</span>
+                                        <span className="font-mono text-xs font-semibold text-ink">{formatCompactNumber(model.total_tokens)}</span>
                                     </div>
                                     <div className="usage-progress"><span style={{ width: `${percentage}%`, background: modelColors[index % modelColors.length] }} /></div>
                                     <div className="flex items-center justify-between text-[11px] text-subtle">
-                                        <span>{formatNumber(model.requests)} 次</span>
-                                        <span>{totalTokens > 0 ? Math.round((model.tokens / totalTokens) * 100) : 0}%</span>
+                                        <span>{formatNumber(model.request_count)} 次</span>
+                                        <span>{totalTokens > 0 ? Math.round((model.total_tokens / totalTokens) * 100) : 0}%</span>
                                     </div>
                                 </div>
                             );
@@ -182,17 +155,46 @@ export function UsagePage() {
                         {channelUsage.map((channel, index) => (
                             <div className="channel-usage-row" key={channel.id}>
                                 <span className="font-mono text-xs text-subtle">{String(index + 1).padStart(2, "0")}</span>
-                                <ProviderMark type={channel.type} size="sm" />
+                                <ProviderMark type={channel.channel_type} size="sm" />
                                 <div className="min-w-0 flex-1">
                                     <p className="truncate text-sm font-medium text-ink">{channel.name}</p>
                                     <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-soft">
-                                        <span className="block h-full rounded-full bg-data-blue" style={{ width: `${channelUsage[0]?.requests ? (channel.requests / channelUsage[0].requests) * 100 : 0}%` }} />
+                                        <span className="block h-full rounded-full bg-data-blue" style={{ width: `${channelUsage[0]?.request_count ? (channel.request_count / channelUsage[0].request_count) * 100 : 0}%` }} />
                                     </div>
                                 </div>
-                                <strong className="font-mono text-xs text-ink">{formatNumber(channel.requests)}</strong>
+                                <strong className="font-mono text-xs text-ink">{formatNumber(channel.request_count)}</strong>
                             </div>
                         ))}
                         {channelUsage.length === 0 ? <div className="empty-state"><Database size={22} /><strong>暂无渠道用量</strong></div> : null}
+                    </div>
+                </article>
+
+                <article className="panel protocol-usage-panel">
+                    <div className="panel-header">
+                        <div><h2>协议维度</h2><p>请求数与 Token 消耗</p></div>
+                        <span className="text-xs text-muted">{formatNumber(totalProtocolRequests)} 次</span>
+                    </div>
+                    <div className="protocol-usage-list">
+                        {protocolStats.map((item) => {
+                            const protocol = getProtocolMeta(item.mode);
+                            const percentage = totalProtocolRequests > 0 ? (item.request_count / totalProtocolRequests) * 100 : 0;
+                            return (
+                                <div className="protocol-usage-row" key={item.mode}>
+                                    <div className="protocol-usage-heading">
+                                        <span className={`protocol-badge protocol-${protocol.tone}`}>{protocol.label}</span>
+                                        <span>{percentage.toFixed(1)}%</span>
+                                    </div>
+                                    <div className="usage-progress">
+                                        <span className={`protocol-fill protocol-fill-${protocol.tone}`} style={{ width: `${percentage}%` }} />
+                                    </div>
+                                    <div className="protocol-usage-values">
+                                        <span>{formatNumber(item.request_count)} 次请求</span>
+                                        <strong>{formatCompactNumber(item.total_tokens)} Token</strong>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                        {protocolStats.length === 0 ? <div className="empty-state"><Layers3 size={22} /><strong>暂无协议用量</strong></div> : null}
                     </div>
                 </article>
             </section>

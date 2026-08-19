@@ -3,6 +3,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_store::StoreExt;
 
+const DEFAULT_THEME: &str = "light";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
     #[serde(default = "default_port")]
@@ -27,6 +29,8 @@ pub struct Settings {
     pub default_key_quota: i64,
     #[serde(default = "default_total_quota")]
     pub total_quota: i64,
+    #[serde(default = "default_quota_warning_threshold")]
+    pub quota_warning_threshold: i64,
     #[serde(default = "default_security_enabled")]
     pub security_enabled: bool,
     #[serde(default = "default_security_mode")]
@@ -47,7 +51,7 @@ pub struct Settings {
 
 fn default_port() -> u16 { 8777 }
 fn default_host() -> String { "127.0.0.1".to_string() }
-fn default_theme() -> String { "dark".to_string() }
+fn default_theme() -> String { DEFAULT_THEME.to_string() }
 fn default_language() -> String { "zh-CN".to_string() }
 fn default_true() -> bool { true }
 fn default_false() -> bool { false }
@@ -55,6 +59,7 @@ fn default_retry_enabled() -> bool { true }
 fn default_retry_times() -> i32 { 2 }
 fn default_key_quota() -> i64 { crate::config::DEFAULT_KEY_QUOTA }
 fn default_total_quota() -> i64 { crate::config::DEFAULT_TOTAL_QUOTA }
+fn default_quota_warning_threshold() -> i64 { 85 }
 fn default_security_enabled() -> bool { true }
 fn default_security_mode() -> String { "audit".to_string() }
 
@@ -72,6 +77,7 @@ impl Default for Settings {
             retry_times: default_retry_times(),
             default_key_quota: default_key_quota(),
             total_quota: default_total_quota(),
+            quota_warning_threshold: default_quota_warning_threshold(),
             security_enabled: default_security_enabled(),
             security_mode: default_security_mode(),
             security_scan_unicode: default_true(),
@@ -112,7 +118,7 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
     let settings = Settings {
         server_port: get_u64(&store, "server.port", 8777) as u16,
         server_host: get_str(&store, "server.host", "127.0.0.1"),
-        ui_theme: get_str(&store, "ui.theme", "dark"),
+        ui_theme: get_str(&store, "ui.theme", DEFAULT_THEME),
         ui_language: get_str(&store, "ui.language", "zh-CN"),
         minimize_to_tray: get_bool(&store, "general.minimize_to_tray", true),
         close_to_tray: get_bool(&store, "general.close_to_tray", true),
@@ -129,6 +135,7 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
             "quota.total_limit",
             crate::config::DEFAULT_TOTAL_QUOTA,
         ),
+        quota_warning_threshold: get_u64(&store, "quota.warning_threshold", 85).clamp(1, 100) as i64,
         security_enabled: get_bool(&store, "security.enabled", true),
         security_mode: get_str(&store, "security.mode", "audit"),
         security_scan_unicode: get_bool(&store, "security.scan_unicode", true),
@@ -146,6 +153,12 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     if settings.default_key_quota < 0 || settings.total_quota < 0 {
         return Err("配额不能小于 0".to_string());
     }
+    if !(1..=100).contains(&settings.quota_warning_threshold) {
+        return Err("配额告警阈值必须在 1 到 100 之间".to_string());
+    }
+    if !matches!(settings.ui_theme.as_str(), "light" | "system" | "dark" | "mist" | "ember") {
+        return Err("不支持的界面主题".to_string());
+    }
 
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
     store.set("server.port", serde_json::json!(settings.server_port));
@@ -159,6 +172,7 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     store.set("retry.times", settings.retry_times);
     store.set("quota.default_key_limit", serde_json::json!(settings.default_key_quota));
     store.set("quota.total_limit", serde_json::json!(settings.total_quota));
+    store.set("quota.warning_threshold", serde_json::json!(settings.quota_warning_threshold));
     store.set("security.enabled", settings.security_enabled);
     store.set("security.mode", serde_json::json!(settings.security_mode));
     store.set("security.scan_unicode", settings.security_scan_unicode);

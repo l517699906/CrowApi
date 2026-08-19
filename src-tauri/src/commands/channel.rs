@@ -3,6 +3,7 @@ use crate::db::repository::Repository;
 use crate::AppState;
 use crate::adaptor::{get_adaptor, ChannelConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChannelDto {
@@ -93,6 +94,30 @@ pub async fn update_channel(input: UpdateChannelInput, state: tauri::State<'_, s
     }
     let repo = Repository::new(state.db.pool.clone());
     repo.update_channel(&input).await.map_err(|e| e.to_string()).map(to_dto)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReorderChannelsInput {
+    pub ordered_ids: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn reorder_channels(
+    input: ReorderChannelsInput,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<(), String> {
+    let repo = Repository::new(state.db.pool.clone());
+    let channels = repo.get_all_channels().await.map_err(|e| e.to_string())?;
+    let current_ids: HashSet<&str> = channels.iter().map(|channel| channel.id.as_str()).collect();
+    let ordered_ids: HashSet<&str> = input.ordered_ids.iter().map(String::as_str).collect();
+
+    if input.ordered_ids.len() != channels.len() || ordered_ids.len() != channels.len() || ordered_ids != current_ids {
+        return Err("渠道列表已变化，请刷新后重试".to_string());
+    }
+
+    repo.reorder_channels(&input.ordered_ids)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

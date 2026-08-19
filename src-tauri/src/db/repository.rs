@@ -1,5 +1,5 @@
 use super::models::*;
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 pub struct Repository {
     pool: SqlitePool,
@@ -109,6 +109,29 @@ impl Repository {
         q.build().execute(&self.pool).await?;
 
         self.get_channel(&input.id).await
+    }
+
+    pub async fn reorder_channels(&self, ordered_ids: &[String]) -> Result<(), sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let now = now_iso();
+        let total = ordered_ids.len() as i64;
+
+        for (index, id) in ordered_ids.iter().enumerate() {
+            let result = sqlx::query(
+                "UPDATE channels SET priority = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(total - index as i64)
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+
+            if result.rows_affected() != 1 {
+                return Err(sqlx::Error::RowNotFound);
+            }
+        }
+
+        transaction.commit().await
     }
 
     pub async fn update_channel_status(&self, id: &str, status: i64) -> Result<(), sqlx::Error> {
@@ -341,10 +364,20 @@ impl Repository {
 
     pub async fn get_logs(&self, limit: i64, offset: i64) -> Result<Vec<RequestLog>, sqlx::Error> {
         sqlx::query_as::<_, RequestLog>(
-            "SELECT * FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            "SELECT * FROM request_logs ORDER BY rowid DESC LIMIT ? OFFSET ?"
         )
         .bind(limit)
         .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_logs_after(&self, after_seq: i64, limit: i64) -> Result<Vec<RequestLog>, sqlx::Error> {
+        sqlx::query_as::<_, RequestLog>(
+            "SELECT * FROM request_logs WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
+        )
+        .bind(after_seq)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
     }
@@ -361,74 +394,66 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RequestLog>, sqlx::Error> {
-        let mut q = sqlx::QueryBuilder::new("SELECT * FROM request_logs WHERE 1=1");
+        let mut q = QueryBuilder::new("SELECT * FROM request_logs WHERE 1=1");
+        push_log_filters(
+            &mut q,
+            keyword,
+            api_key_name,
+            channel_name,
+            model,
+            date_from,
+            date_to,
+            trace_id,
+        );
 
-        if let Some(kw) = keyword {
-            let pattern = format!("%{}%", kw);
-            q.push(" AND (api_key_name LIKE ").push_bind(pattern.clone());
-            q.push(" OR channel_name LIKE ").push_bind(pattern.clone());
-            q.push(" OR model LIKE ").push_bind(pattern.clone());
-            q.push(" OR upstream_model LIKE ").push_bind(pattern.clone());
-            q.push(" OR api_key_id LIKE ").push_bind(pattern.clone());
-            q.push(" OR id LIKE ").push_bind(pattern);
-            q.push(")");
-        }
-
-        if let Some(name) = api_key_name {
-            let pattern = format!("%{}%", name);
-            q.push(" AND api_key_name LIKE ").push_bind(pattern);
-        }
-
-        if let Some(name) = channel_name {
-            let pattern = format!("%{}%", name);
-            q.push(" AND channel_name LIKE ").push_bind(pattern);
-        }
-
-        if let Some(m) = model {
-            let pattern = format!("%{}%", m);
-            q.push(" AND (model LIKE ").push_bind(pattern.clone());
-            q.push(" OR upstream_model LIKE ").push_bind(pattern);
-            q.push(")");
-        }
-
-        if let Some(from) = date_from {
-            q.push(" AND created_at >= ").push_bind(from);
-        }
-
-        if let Some(to) = date_to {
-            q.push(" AND created_at <= ").push_bind(to);
-        }
-
-        if let Some(tid) = trace_id {
-            let pattern = format!("%{}%", tid);
-            q.push(" AND trace_id LIKE ").push_bind(pattern);
-        }
-
-        q.push(" ORDER BY created_at DESC LIMIT ").push_bind(limit);
+        q.push(" ORDER BY request_logs.rowid DESC LIMIT ").push_bind(limit);
         q.push(" OFFSET ").push_bind(offset);
 
         q.build_query_as::<RequestLog>().fetch_all(&self.pool).await
     }
 
-    pub async fn get_dashboard_stats(&self) -> Result<DashboardStats, sqlx::Error> {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let today_prefix = format!("{}%", today);
+    pub async fn search_logs_after(
+        &self,
+        keyword: Option<&str>,
+        api_key_name: Option<&str>,
+        channel_name: Option<&str>,
+        model: Option<&str>,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+        trace_id: Option<&str>,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<RequestLog>, sqlx::Error> {
+        let mut q = QueryBuilder::new("SELECT * FROM request_logs WHERE request_logs.rowid > ");
+        q.push_bind(after_seq);
+        push_log_filters(
+            &mut q,
+            keyword,
+            api_key_name,
+            channel_name,
+            model,
+            date_from,
+            date_to,
+            trace_id,
+        );
+        q.push(" ORDER BY request_logs.rowid ASC LIMIT ").push_bind(limit);
+        q.build_query_as::<RequestLog>().fetch_all(&self.pool).await
+    }
 
-        let today_requests: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM request_logs WHERE created_at LIKE ?"
-        )
-        .bind(&today_prefix)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
-
-        let today_total_tokens: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs WHERE created_at LIKE ?"
-        )
-        .bind(&today_prefix)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+    pub async fn get_dashboard_stats(
+        &self,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+    ) -> Result<DashboardStats, sqlx::Error> {
+        let mut today_query = QueryBuilder::new(
+            "SELECT COUNT(*) AS request_count, COALESCE(SUM(total_tokens), 0) AS total_tokens, \
+             COALESCE(AVG(duration_ms), 0) AS avg_latency FROM request_logs WHERE 1=1",
+        );
+        push_stats_date_range(&mut today_query, date_from, date_to);
+        let (today_requests, today_total_tokens, avg_latency) = today_query
+            .build_query_as::<(i64, i64, f64)>()
+            .fetch_one(&self.pool)
+            .await?;
 
         let active_channels: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM channels WHERE status = 1"
@@ -457,13 +482,7 @@ impl Repository {
         .await
         .unwrap_or(0);
 
-        let avg_latency: f64 = sqlx::query_scalar(
-            "SELECT COALESCE(AVG(duration_ms), 0) FROM request_logs WHERE created_at LIKE ?"
-        )
-        .bind(&today_prefix)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0.0);
+        let protocols = self.get_protocol_usage(None, None).await?;
 
         Ok(DashboardStats {
             today_requests,
@@ -474,7 +493,129 @@ impl Repository {
             total_api_keys,
             total_requests,
             total_tokens,
+            protocols,
         })
+    }
+
+    pub async fn get_usage_stats(
+        &self,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+        bucket_seconds: i64,
+        bucket_count: i64,
+    ) -> Result<UsageStats, sqlx::Error> {
+        let mut query = QueryBuilder::new(
+            "SELECT COUNT(*) AS total_requests, COALESCE(SUM(total_tokens), 0) AS total_tokens, \
+             COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS failed_requests \
+             FROM request_logs WHERE 1=1",
+        );
+        push_stats_date_range(&mut query, date_from, date_to);
+        let (total_requests, total_tokens, failed_requests) = query
+            .build_query_as::<(i64, i64, i64)>()
+            .fetch_one(&self.pool)
+            .await?;
+        let protocols = self.get_protocol_usage(date_from, date_to).await?;
+        let series = self
+            .get_usage_series(date_from, date_to, bucket_seconds, bucket_count)
+            .await?;
+        let models = self.get_model_usage(date_from, date_to).await?;
+        let channels = self.get_channel_usage(date_from, date_to).await?;
+
+        Ok(UsageStats {
+            total_requests,
+            total_tokens,
+            failed_requests,
+            protocols,
+            series,
+            models,
+            channels,
+        })
+    }
+
+    pub async fn get_protocol_usage(
+        &self,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+    ) -> Result<Vec<ProtocolUsageStat>, sqlx::Error> {
+        let mut query = QueryBuilder::new(
+            "SELECT mode, COUNT(*) AS request_count, COALESCE(SUM(total_tokens), 0) AS total_tokens \
+             FROM request_logs WHERE 1=1",
+        );
+        push_stats_date_range(&mut query, date_from, date_to);
+        query.push(" GROUP BY mode ORDER BY request_count DESC, mode ASC");
+        query
+            .build_query_as::<ProtocolUsageStat>()
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    async fn get_usage_series(
+        &self,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+        bucket_seconds: i64,
+        bucket_count: i64,
+    ) -> Result<Vec<UsageBucketStat>, sqlx::Error> {
+        let Some(from) = date_from else {
+            return Ok(Vec::new());
+        };
+
+        let mut query = QueryBuilder::new("SELECT CAST((unixepoch(created_at) - unixepoch(");
+        query.push_bind(from.to_string());
+        query.push(")) / ").push_bind(bucket_seconds);
+        query.push(
+            " AS INTEGER) AS bucket_index, COUNT(*) AS request_count \
+             FROM request_logs WHERE 1=1",
+        );
+        push_stats_date_range(&mut query, date_from, date_to);
+        query.push(" GROUP BY bucket_index HAVING bucket_index >= 0 AND bucket_index < ");
+        query.push_bind(bucket_count);
+        query.push(" ORDER BY bucket_index ASC");
+        query
+            .build_query_as::<UsageBucketStat>()
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    async fn get_model_usage(
+        &self,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+    ) -> Result<Vec<ModelUsageStat>, sqlx::Error> {
+        let mut query = QueryBuilder::new(
+            "SELECT model AS name, COUNT(*) AS request_count, \
+             COALESCE(SUM(total_tokens), 0) AS total_tokens \
+             FROM request_logs WHERE 1=1",
+        );
+        push_stats_date_range(&mut query, date_from, date_to);
+        query.push(" GROUP BY model ORDER BY total_tokens DESC, request_count DESC, name ASC");
+        query
+            .build_query_as::<ModelUsageStat>()
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    async fn get_channel_usage(
+        &self,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+    ) -> Result<Vec<ChannelUsageStat>, sqlx::Error> {
+        let mut query = QueryBuilder::new(
+            "SELECT COALESCE(request_logs.channel_id, request_logs.channel_name, 'unassigned') AS id, \
+             COALESCE(request_logs.channel_name, '未分配渠道') AS name, \
+             COALESCE(channels.type, 'custom') AS channel_type, COUNT(*) AS request_count \
+             FROM request_logs LEFT JOIN channels ON channels.id = request_logs.channel_id \
+             WHERE 1=1",
+        );
+        push_stats_date_range_qualified(&mut query, date_from, date_to);
+        query.push(
+            " GROUP BY request_logs.channel_id, request_logs.channel_name, channels.type \
+             ORDER BY request_count DESC, name ASC",
+        );
+        query
+            .build_query_as::<ChannelUsageStat>()
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn get_log_stats(&self, days: i64) -> Result<Vec<LogStats>, sqlx::Error> {
@@ -495,4 +636,87 @@ impl Repository {
         .fetch_all(&self.pool)
         .await
     }
+}
+
+fn push_date_range(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) {
+    if let Some(from) = date_from {
+        query.push(" AND created_at >= ").push_bind(from.to_string());
+    }
+    if let Some(to) = date_to {
+        query.push(" AND created_at <= ").push_bind(to.to_string());
+    }
+}
+
+fn push_stats_date_range(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) {
+    if let Some(from) = date_from {
+        query.push(" AND created_at >= ").push_bind(from.to_string());
+    }
+    if let Some(to) = date_to {
+        query.push(" AND created_at < ").push_bind(to.to_string());
+    }
+}
+
+fn push_stats_date_range_qualified(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) {
+    if let Some(from) = date_from {
+        query
+            .push(" AND request_logs.created_at >= ")
+            .push_bind(from.to_string());
+    }
+    if let Some(to) = date_to {
+        query
+            .push(" AND request_logs.created_at < ")
+            .push_bind(to.to_string());
+    }
+}
+
+fn push_log_filters(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    keyword: Option<&str>,
+    api_key_name: Option<&str>,
+    channel_name: Option<&str>,
+    model: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    trace_id: Option<&str>,
+) {
+    if let Some(keyword) = keyword {
+        let pattern = format!("%{}%", keyword);
+        query.push(" AND (api_key_name LIKE ").push_bind(pattern.clone());
+        query.push(" OR channel_name LIKE ").push_bind(pattern.clone());
+        query.push(" OR model LIKE ").push_bind(pattern.clone());
+        query.push(" OR upstream_model LIKE ").push_bind(pattern.clone());
+        query.push(" OR api_key_id LIKE ").push_bind(pattern.clone());
+        query.push(" OR trace_id LIKE ").push_bind(pattern.clone());
+        query.push(" OR id LIKE ").push_bind(pattern);
+        query.push(")");
+    }
+
+    if let Some(name) = api_key_name {
+        query.push(" AND api_key_name LIKE ").push_bind(format!("%{}%", name));
+    }
+    if let Some(name) = channel_name {
+        query.push(" AND channel_name LIKE ").push_bind(format!("%{}%", name));
+    }
+    if let Some(model) = model {
+        let pattern = format!("%{}%", model);
+        query.push(" AND (model LIKE ").push_bind(pattern.clone());
+        query.push(" OR upstream_model LIKE ").push_bind(pattern);
+        query.push(")");
+    }
+    if let Some(trace_id) = trace_id {
+        query.push(" AND trace_id LIKE ").push_bind(format!("%{}%", trace_id));
+    }
+    push_date_range(query, date_from, date_to);
 }

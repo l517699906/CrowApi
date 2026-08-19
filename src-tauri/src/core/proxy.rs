@@ -25,6 +25,7 @@ pub async fn handle_request(
     api_key_name: &str,
     body: serde_json::Value,
     is_stream: bool,
+    request_mode: &str,
     request_body: Option<String>,
     trace_id: Option<String>,
 ) -> Result<ProxyResult, (u16, String)> {
@@ -54,7 +55,7 @@ pub async fn handle_request(
             channel_name: None,
             model: model.clone(),
             upstream_model: None,
-            mode: "chat".to_string(),
+            mode: request_mode.to_string(),
             status_code: 451,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -74,9 +75,15 @@ pub async fn handle_request(
             blocked_reason: security_result.blocked_reason.clone(),
             trace_id: trace_id.clone(),
         };
-        let log_id = log.id.clone();
-        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
-        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+        if let Err(error) = crate::core::log_events::persist_log(
+            repo,
+            app,
+            &log,
+            &security_result.findings,
+            security_result.action.as_str(),
+        ).await {
+            tracing::warn!(%error, "failed to persist blocked request log");
+        }
         return Err((451, security_result.summary));
     }
 
@@ -153,7 +160,7 @@ pub async fn handle_request(
                     channel_name: Some(channel.name.clone()),
                     model: model.clone(),
                     upstream_model: Some(upstream_model.clone()),
-                    mode: "chat".to_string(),
+                    mode: request_mode.to_string(),
                     status_code: status as i64,
                     prompt_tokens: usage.as_ref().map(|u| u.prompt_tokens as i64).unwrap_or(0),
                     completion_tokens: usage.as_ref().map(|u| u.completion_tokens as i64).unwrap_or(0),
@@ -173,9 +180,15 @@ pub async fn handle_request(
                     blocked_reason: security_result.blocked_reason.clone(),
                     trace_id: trace_id.clone(),
                 };
-                let log_id = log.id.clone();
-                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
-                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                if let Err(error) = crate::core::log_events::persist_log(
+                    repo,
+                    app,
+                    &log,
+                    &security_result.findings,
+                    security_result.action.as_str(),
+                ).await {
+                    tracing::warn!(%error, "failed to persist successful request log");
+                }
 
                 if let Some(ref u) = usage {
                     if let Err(e) = repo.increment_quota(api_key_id, u.total_tokens as i64).await { eprintln!("[WARN] increment_quota failed: {}", e); }
@@ -200,7 +213,7 @@ pub async fn handle_request(
                     channel_name: Some(channel.name.clone()),
                     model: model.clone(),
                     upstream_model: Some(upstream_model.clone()),
-                    mode: "chat".to_string(),
+                    mode: request_mode.to_string(),
                     status_code: 502,
                     prompt_tokens: 0,
                     completion_tokens: 0,
@@ -220,9 +233,15 @@ pub async fn handle_request(
                     blocked_reason: security_result.blocked_reason.clone(),
                     trace_id: trace_id.clone(),
                 };
-                let log_id = log.id.clone();
-                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
-                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                if let Err(error) = crate::core::log_events::persist_log(
+                    repo,
+                    app,
+                    &log,
+                    &security_result.findings,
+                    security_result.action.as_str(),
+                ).await {
+                    tracing::warn!(%error, "failed to persist failed request log");
+                }
                 last_error = Some(error_message);
             }
         }

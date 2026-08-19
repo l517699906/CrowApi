@@ -1,7 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Channel, CreateChannelInput, UpdateChannelInput, TestChannelResult,
+import type { Channel, CreateChannelInput, ReorderChannelsInput, UpdateChannelInput, TestChannelResult,
     ApiKey, CreateApiKeyInput, UpdateApiKeyInput, RequestLog, RequestSecurityFinding, LogStats,
-    DashboardStats, Settings, GetLogsInput, ServerStatus } from "../types";
+    DashboardStats, DashboardStatsInput, Settings, GetLogsInput, ServerStatus, UsageStats,
+    UsageStatsInput } from "../types";
 
 // 渠道管理 API
 export const channelApi = {
@@ -9,6 +10,7 @@ export const channelApi = {
     get: (id: string) => invoke<Channel>("get_channel", { id }),
     create: (input: CreateChannelInput) => invoke<Channel>("create_channel", { input }),
     update: (input: UpdateChannelInput) => invoke<Channel>("update_channel", { input }),
+    reorder: (input: ReorderChannelsInput) => invoke<void>("reorder_channels", { input }),
     toggle: (id: string, status: number) => invoke<void>("toggle_channel", { id, status }),
     delete: (id: string) => invoke<void>("delete_channel", { id }),
     test: (id: string) => invoke<TestChannelResult>("test_channel", { id }),
@@ -33,7 +35,10 @@ export const logApi = {
 
 // 仪表盘 API
 export const statsApi = {
-    getDashboard: () => invoke<DashboardStats>("get_dashboard_stats"),
+    getDashboard: (input?: DashboardStatsInput) => invoke<DashboardStats>("get_dashboard_stats", { input: input || {} }),
+    getUsage: (input?: UsageStatsInput) => (
+        invoke<UsageStats>("get_usage_stats", { input: input || {} })
+    ),
 };
 
 // 设置 API
@@ -45,4 +50,10 @@ export const settingsApi = {
 export const serverApi = {
     getStatus: () => invoke<ServerStatus>("get_server_status"),
     restart: () => invoke<void>("restart_server"),
+};
+
+export const fileApi = {
+    saveExport: (content: string, defaultName: string) => (
+        invoke<boolean>("save_export_file", { content, defaultName })
+    ),
 };
