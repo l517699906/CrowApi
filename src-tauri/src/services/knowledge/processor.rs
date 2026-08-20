@@ -149,7 +149,12 @@ async fn process_document_inner(
 
     for batch in chunks.chunks(batch_size) {
         let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
-        let embeddings = embedder::embed(&texts, emb_model, &main_repo).await?;
+        let embeddings = embedder::embed_with_channel(
+            &texts,
+            emb_model,
+            &main_repo,
+            kb.embedding_channel_id.as_deref(),
+        ).await?;
 
         // Validate embedding dimensions
         if let Some(dim) = expected_dim {
@@ -177,7 +182,9 @@ async fn process_document_inner(
     if expected_dim.is_none() && !all_embeddings.is_empty() {
         let detected_dim = all_embeddings[0].len() as i64;
         tracing::info!("Auto-detected embedding dim {} for KB {}", detected_dim, kb_id);
-        repo.update_kb_embedding_dim(kb_id, detected_dim).await.ok();
+        if let Err(error) = repo.update_kb_embedding_dim(kb_id, detected_dim).await {
+            tracing::warn!(%error, knowledge_base_id = %kb_id, "failed to persist embedding dimension");
+        }
     }
 
     // 4. Store chunks with embeddings

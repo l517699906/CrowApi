@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useLocation } from "react-router-dom";
-import { PageTitle } from "../components/ui";
+import { ServiceSwitcher } from "../components/ServiceSwitcher";
+import { Modal, PageTitle } from "../components/ui";
 import {
   kbApi,
   channelApi,
@@ -68,36 +69,15 @@ function kbErrorMessage(error: unknown): string {
 
 export function KnowledgeBasePage() {
   const location = useLocation();
-  const initialTab: ServiceTab = location.pathname.includes("/mcp") ? "mcp" : "knowledge";
-  const [serviceTab, setServiceTab] = useState<ServiceTab>(initialTab);
-
-  const serviceTabs: { key: ServiceTab; label: string; icon: typeof BookOpen }[] = [
-    { key: "knowledge", label: "知识库", icon: BookOpen },
-    { key: "mcp", label: "MCP 服务", icon: Terminal },
-  ];
+  const serviceTab: ServiceTab = location.pathname.startsWith("/services/mcp") ? "mcp" : "knowledge";
+  const isMcp = serviceTab === "mcp";
 
   return (
     <div className="page-enter kb-page">
       <PageTitle
-        title="知识库"
-        meta="本地文档向量化、语义检索与 RAG 问答服务"
-        action={(
-          <div className="kb-service-switcher" role="tablist" aria-label="知识库服务视图">
-          {serviceTabs.map(({ key, label, icon: Icon }) => (
-            <button
-              key={key}
-              type="button"
-              role="tab"
-              aria-selected={serviceTab === key}
-              onClick={() => setServiceTab(key)}
-              className={serviceTab === key ? "is-active" : ""}
-            >
-              <Icon size={16} />
-              {label}
-            </button>
-          ))}
-          </div>
-        )}
+        title={isMcp ? "MCP 服务" : "知识库"}
+        meta={isMcp ? "本地 MCP 端点、工具与接入配置" : "本地文档向量化、语义检索与 RAG 问答服务"}
+        action={<ServiceSwitcher />}
       />
 
       <div className="kb-service-content">
@@ -129,11 +109,12 @@ function McpSection() {
   const [services, setServices] = useState<ServiceStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState("");
 
   useEffect(() => {
     serviceApi.getStatuses()
       .then(setServices)
-      .catch(console.error)
+      .catch(() => setServices([]))
       .finally(() => setLoading(false));
   }, []);
 
@@ -152,10 +133,16 @@ function McpSection() {
   const sseEndpoint = `${baseUrl}/mcp/sse`;
   const tools = (mcpService?.stats?.tools as { name: string; label: string; desc: string }[]) || [];
 
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const handleCopy = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyError("");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+      setCopyError("当前环境无法访问剪贴板，请手动复制地址。");
+    }
   };
 
   if (loading) {
@@ -257,6 +244,7 @@ function McpSection() {
           <div className="kb-notice kb-notice-warning">
             MCP 端点仅接受 JSON-RPC POST 请求，浏览器直接打开会返回 405。
           </div>
+          {copyError ? <div className="kb-notice kb-notice-warning" role="status">{copyError}</div> : null}
         </div>
       </section>
 
@@ -330,6 +318,8 @@ function KnowledgeBaseSection() {
   const [loading, setLoading] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<KnowledgeBase | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const fetchKbs = useCallback(async () => {
     setLoading(true);
@@ -362,14 +352,19 @@ function KnowledgeBaseSection() {
     }
   }, [kbs, selectedKb]);
 
-  const handleDelete = async (id: string) => {
-    if (!confirm("确定删除此知识库？所有文档和切片将一并删除。")) return;
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    const id = deleteTarget.id;
+    setDeleting(true);
     try {
       await kbApi.delete(id);
       await fetchKbs();
       if (selectedKb?.id === id) setSelectedKb(null);
+      setDeleteTarget(null);
     } catch (e) {
       setError(kbErrorMessage(e));
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -396,9 +391,9 @@ function KnowledgeBaseSection() {
   return (
     <>
       {error && (
-        <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-600">
+        <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-600" role="alert">
           {error}
-          <button onClick={() => setError(null)} className="ml-2 text-red-400 hover:text-red-600">✕</button>
+          <button type="button" aria-label="关闭错误提示" onClick={() => setError(null)} className="ml-2 text-red-400 hover:text-red-600">✕</button>
         </div>
       )}
 
@@ -415,7 +410,7 @@ function KnowledgeBaseSection() {
           kbs={kbs}
           loading={loading}
           onSelect={handleSelectKb}
-          onDelete={handleDelete}
+          onDelete={setDeleteTarget}
           onCreate={() => setShowCreate(true)}
           onToggleStatus={handleToggleStatus}
           onToggleMcp={handleToggleMcp}
@@ -430,6 +425,25 @@ function KnowledgeBaseSection() {
             await fetchKbs();
           }}
         />
+      )}
+
+      {deleteTarget && (
+        <Modal
+          title="删除知识库"
+          description="删除后无法恢复，关联文档、切片与索引也会一并移除。"
+          onClose={() => { if (!deleting) setDeleteTarget(null); }}
+          footer={(
+            <>
+              <button type="button" className="action-secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>取消</button>
+              <button type="button" className="button-danger" disabled={deleting} onClick={() => void handleDelete()}>
+                {deleting ? <Loader2 className="animate-spin" size={15} /> : <Trash2 size={15} />}
+                删除知识库
+              </button>
+            </>
+          )}
+        >
+          <p className="text-sm text-muted">确定删除 <strong className="text-ink">{deleteTarget.name}</strong>？</p>
+        </Modal>
       )}
     </>
   );
@@ -505,7 +519,7 @@ function KbList({
   kbs: KnowledgeBase[];
   loading: boolean;
   onSelect: (kb: KnowledgeBase) => void;
-  onDelete: (id: string) => void;
+  onDelete: (kb: KnowledgeBase) => void;
   onCreate: () => void;
   onToggleStatus: (kb: KnowledgeBase, newStatus: number) => void;
   onToggleMcp: (kb: KnowledgeBase, newMcp: number) => void;
@@ -559,6 +573,15 @@ function KbList({
               <div
                 className="min-w-0 flex-1 cursor-pointer"
                 onClick={() => onSelect(kb)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onSelect(kb);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                aria-label={`打开知识库 ${kb.name}`}
               >
                 <div className="flex items-center gap-2">
                   <h3 className="text-base font-semibold text-slate-900">{kb.name}</h3>
@@ -593,6 +616,7 @@ function KbList({
                 <div className="kb-list-card-controls">
                   {/* MCP toggle */}
                   <button
+                    type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       onToggleMcp(kb, kb.mcp_enabled === 1 ? 0 : 1);
@@ -603,6 +627,8 @@ function KbList({
                         : "bg-slate-100 text-slate-400 hover:bg-slate-200"
                     }`}
                     title="MCP 暴露开关"
+                    aria-label={`${kb.name} MCP 暴露${kb.mcp_enabled === 1 ? "已开启" : "已关闭"}`}
+                    aria-pressed={kb.mcp_enabled === 1}
                   >
                     <Terminal size={11} />
                     MCP {kb.mcp_enabled === 1 ? "已暴露" : "未暴露"}
@@ -610,6 +636,7 @@ function KbList({
 
                   {/* Status toggle */}
                   <button
+                    type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       onToggleStatus(kb, kb.status === 1 ? 0 : 1);
@@ -618,6 +645,8 @@ function KbList({
                       kb.status === 1 ? "bg-emerald-500" : "bg-slate-300"
                     }`}
                     title="知识库开关"
+                    aria-label={`${kb.name} ${kb.status === 1 ? "已启用" : "已停用"}`}
+                    aria-pressed={kb.status === 1}
                   >
                     <span
                       className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
@@ -628,7 +657,8 @@ function KbList({
 
                   {/* Delete */}
                   <button
-                    onClick={(e) => { e.stopPropagation(); onDelete(kb.id); }}
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onDelete(kb); }}
                     className="kb-delete-button rounded-lg p-1.5 text-slate-400 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-red-50 hover:text-red-500"
                     aria-label={`删除知识库 ${kb.name}`}
                     title="删除知识库"
@@ -696,6 +726,8 @@ function KbDetail({
               key={key}
               type="button"
               role="tab"
+              id={`kb-tab-${key}`}
+              aria-controls={`kb-panel-${key}`}
               aria-selected={tab === key}
               onClick={() => setTab(key)}
               className={tab === key ? "is-active" : ""}
@@ -707,7 +739,7 @@ function KbDetail({
         </div>
       </div>
 
-      <div className="kb-detail-content">
+      <div id={`kb-panel-${tab}`} className="kb-detail-content" role="tabpanel" aria-labelledby={`kb-tab-${tab}`}>
         {tab === "documents" && <DocumentsTab kb={kb} onRefresh={onRefresh} />}
         {tab === "sources" && <SourcesTab kb={kb} onRefresh={onRefresh} />}
         {tab === "search" && <SearchTab kb={kb} />}
@@ -727,6 +759,9 @@ function SourcesTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => voi
   const [loading, setLoading] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [progressMap, setProgressMap] = useState<Record<string, { progress: number; detail: string }>>({});
+  const [deleteTarget, setDeleteTarget] = useState<KbSource | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
 
   const fetchSources = useCallback(async () => {
     setLoading(true);
@@ -734,7 +769,7 @@ function SourcesTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => voi
       const data = await kbApi.getSources(kb.id);
       setSources(data);
     } catch (e) {
-      console.error(e);
+      setError(kbErrorMessage(e));
     } finally {
       setLoading(false);
     }
@@ -781,21 +816,27 @@ function SourcesTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => voi
     };
   }, [kb.id, fetchSources, onRefresh]);
 
-  const handleDelete = async (sourceId: string) => {
-    if (!confirm("删除此来源？关联的文档将保留但不再标记来源。")) return;
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    setError("");
     try {
-      await kbApi.deleteSource(sourceId, kb.id);
+      await kbApi.deleteSource(deleteTarget.id, kb.id);
       await fetchSources();
       onRefresh();
+      setDeleteTarget(null);
     } catch (e) {
-      alert(`删除失败: ${e}`);
+      setError(`删除来源失败：${kbErrorMessage(e)}`);
+    } finally {
+      setDeleting(false);
     }
   };
 
   return (
     <div className="space-y-4">
+      {error ? <div className="kb-notice kb-notice-warning" role="alert">{error}</div> : null}
       <div className="flex justify-end">
-        <button onClick={() => setShowImport(true)} className="action-primary">
+        <button type="button" onClick={() => setShowImport(true)} className="action-primary">
           <Plus size={16} />
           导入来源
         </button>
@@ -856,9 +897,11 @@ function SourcesTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => voi
                   )}
                 </div>
                 <button
-                  onClick={() => handleDelete(src.id)}
+                  type="button"
+                  onClick={() => setDeleteTarget(src)}
                   className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-500"
                   title="删除"
+                  aria-label={`删除来源 ${src.source_url || src.source_path || src.source_type}`}
                 >
                   <Trash2 size={15} />
                 </button>
@@ -878,6 +921,25 @@ function SourcesTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => voi
             onRefresh();
           }}
         />
+      )}
+
+      {deleteTarget && (
+        <Modal
+          title="删除来源"
+          description="关联文档会保留，但不会再标记为来自该来源。"
+          onClose={() => { if (!deleting) setDeleteTarget(null); }}
+          footer={(
+            <>
+              <button type="button" className="action-secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>取消</button>
+              <button type="button" className="button-danger" disabled={deleting} onClick={() => void handleDelete()}>
+                {deleting ? <Loader2 className="animate-spin" size={15} /> : <Trash2 size={15} />}
+                删除来源
+              </button>
+            </>
+          )}
+        >
+          <p className="break-all text-sm text-muted">{deleteTarget.source_url || deleteTarget.source_path || deleteTarget.source_type}</p>
+        </Modal>
       )}
     </div>
   );
@@ -1162,6 +1224,8 @@ function IndexTab({ kb }: { kb: KnowledgeBase }) {
   const [building, setBuilding] = useState(false);
   const [buildMsg, setBuildMsg] = useState("");
   const [buildProgress, setBuildProgress] = useState(0);
+  const [showDropConfirm, setShowDropConfirm] = useState(false);
+  const [dropping, setDropping] = useState(false);
 
   const fetchIndex = useCallback(async () => {
     setLoading(true);
@@ -1224,18 +1288,21 @@ function IndexTab({ kb }: { kb: KnowledgeBase }) {
       // Progress will come via Tauri event listener
     } catch (e) {
       setBuilding(false);
-      setBuildMsg("");
-      alert(`构建失败: ${e}`);
+      setBuildMsg(`构建失败：${kbErrorMessage(e)}`);
     }
   };
 
   const handleDrop = async () => {
-    if (!confirm("确定删除索引？删除后需重新构建。")) return;
+    setDropping(true);
+    setBuildMsg("");
     try {
       await kbApi.dropIndex(kb.id);
       await fetchIndex();
+      setShowDropConfirm(false);
     } catch (e) {
-      alert(`删除失败: ${e}`);
+      setBuildMsg(`删除索引失败：${kbErrorMessage(e)}`);
+    } finally {
+      setDropping(false);
     }
   };
 
@@ -1248,7 +1315,8 @@ function IndexTab({ kb }: { kb: KnowledgeBase }) {
   }
 
   return (
-    <div className="grid gap-4 lg:grid-cols-2">
+    <>
+      <div className="grid gap-4 lg:grid-cols-2">
       {/* Index status */}
       <div className="surface data-card rounded-2xl">
         <div className="mb-4 flex items-center gap-2">
@@ -1315,7 +1383,8 @@ function IndexTab({ kb }: { kb: KnowledgeBase }) {
             </div>
           )}
           <button
-            onClick={handleBuild}
+            type="button"
+            onClick={() => void handleBuild()}
             disabled={building}
             className="action-primary w-full disabled:opacity-50"
           >
@@ -1326,8 +1395,9 @@ function IndexTab({ kb }: { kb: KnowledgeBase }) {
             )}
           </button>
           <button
-            onClick={handleDrop}
-            disabled={!indexMeta || indexMeta.status === "none"}
+            type="button"
+            onClick={() => setShowDropConfirm(true)}
+            disabled={dropping || !indexMeta || indexMeta.status === "none"}
             className="w-full rounded-xl border border-red-200 px-4 py-2 text-sm text-red-600 hover:bg-red-50 disabled:opacity-50"
           >
             <Trash2 size={16} />
@@ -1338,7 +1408,27 @@ function IndexTab({ kb }: { kb: KnowledgeBase }) {
           </div>
         </div>
       </div>
-    </div>
+      </div>
+
+      {showDropConfirm && (
+        <Modal
+          title="删除向量索引"
+          description="删除后，知识库需要重新构建索引才能恢复向量检索。"
+          onClose={() => { if (!dropping) setShowDropConfirm(false); }}
+          footer={(
+            <>
+              <button type="button" className="action-secondary" disabled={dropping} onClick={() => setShowDropConfirm(false)}>取消</button>
+              <button type="button" className="button-danger" disabled={dropping} onClick={() => void handleDrop()}>
+                {dropping ? <Loader2 className="animate-spin" size={15} /> : <Trash2 size={15} />}
+                删除索引
+              </button>
+            </>
+          )}
+        >
+          <p className="text-sm text-muted">当前索引包含 {indexMeta?.chunk_count ?? 0} 个切片。</p>
+        </Modal>
+      )}
+    </>
   );
 }
 
@@ -1351,6 +1441,15 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
   const [uploadTotal, setUploadTotal] = useState(0);
   const [errorNotices, setErrorNotices] = useState<{ doc_id: string; filename: string; error: string }[]>([]);
   const [progressMap, setProgressMap] = useState<Record<string, { stage: string; progress: number; detail: string }>>({});
+  const [deleteTarget, setDeleteTarget] = useState<KbDocument | null>(null);
+  const [deletingDocumentId, setDeletingDocumentId] = useState<string | null>(null);
+
+  const addErrorNotice = (docId: string, filename: string, error: unknown) => {
+    setErrorNotices((current) => [
+      ...current.filter((notice) => notice.doc_id !== docId),
+      { doc_id: docId, filename, error: kbErrorMessage(error) },
+    ]);
+  };
 
   const fetchDocs = useCallback(async () => {
     setLoading(true);
@@ -1451,7 +1550,7 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
         });
       } catch (e) {
         console.error(`Upload failed for ${file.name}:`, e);
-        alert(`上传失败 ${file.name}: ${e}`);
+        addErrorNotice(`upload-${file.name}-${Date.now()}`, file.name, e);
       }
       setUploadingCount(prev => prev + 1);
     }
@@ -1461,14 +1560,18 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
     onRefresh();
   };
 
-  const handleDelete = async (docId: string) => {
-    if (!confirm("删除此文档？")) return;
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setDeletingDocumentId(deleteTarget.id);
     try {
-      await kbApi.deleteDocument(docId, kb.id);
+      await kbApi.deleteDocument(deleteTarget.id, kb.id);
       await fetchDocs();
       onRefresh();
+      setDeleteTarget(null);
     } catch (e) {
-      alert(`删除失败: ${e}`);
+      addErrorNotice(deleteTarget.id, deleteTarget.filename, `删除失败：${kbErrorMessage(e)}`);
+    } finally {
+      setDeletingDocumentId(null);
     }
   };
 
@@ -1477,7 +1580,8 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
       await kbApi.reindexDocument(docId);
       await fetchDocs();
     } catch (e) {
-      alert(`重新索引失败: ${e}`);
+      const document = docs.find((doc) => doc.id === docId);
+      addErrorNotice(docId, document?.filename ?? "文档", `重新索引失败：${kbErrorMessage(e)}`);
     }
   };
 
@@ -1492,7 +1596,7 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
           accept=".md,.txt,.json,.yaml,.yml,.rs,.ts,.tsx,.js,.py,.go,.java,.c,.cpp,.h,.sh,.toml,.xml,.html,.css,.pdf"
           onChange={(e) => {
             const files = Array.from(e.target.files || []);
-            if (files.length > 0) handleUploadBatch(files);
+            if (files.length > 0) void handleUploadBatch(files);
             e.target.value = "";
           }}
           disabled={uploadTotal > 0}
@@ -1527,6 +1631,8 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
                 <div className="mt-0.5 text-xs text-red-600">{notice.error}</div>
               </div>
               <button
+                type="button"
+                aria-label={`关闭 ${notice.filename} 错误提示`}
                 onClick={() =>
                   setErrorNotices((prev) =>
                     prev.filter((n) => n.doc_id !== notice.doc_id)
@@ -1601,16 +1707,20 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
 
               <div className="flex items-center gap-1">
                 <button
-                  onClick={() => handleReindex(doc.id)}
+                  type="button"
+                  onClick={() => void handleReindex(doc.id)}
                   className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
                   title="重新索引"
+                  aria-label={`重新索引 ${doc.filename}`}
                 >
                   <RefreshCw size={15} />
                 </button>
                 <button
-                  onClick={() => handleDelete(doc.id)}
+                  type="button"
+                  onClick={() => setDeleteTarget(doc)}
                   className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-500"
                   title="删除"
+                  aria-label={`删除文档 ${doc.filename}`}
                 >
                   <Trash2 size={15} />
                 </button>
@@ -1619,6 +1729,25 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
             );
           })}
         </div>
+      )}
+
+      {deleteTarget && (
+        <Modal
+          title="删除文档"
+          description="文档及其切片会从知识库中移除，此操作无法恢复。"
+          onClose={() => { if (!deletingDocumentId) setDeleteTarget(null); }}
+          footer={(
+            <>
+              <button type="button" className="action-secondary" disabled={Boolean(deletingDocumentId)} onClick={() => setDeleteTarget(null)}>取消</button>
+              <button type="button" className="button-danger" disabled={Boolean(deletingDocumentId)} onClick={() => void handleDelete()}>
+                {deletingDocumentId ? <Loader2 className="animate-spin" size={15} /> : <Trash2 size={15} />}
+                删除文档
+              </button>
+            </>
+          )}
+        >
+          <p className="break-all text-sm text-muted">{deleteTarget.filename}</p>
+        </Modal>
       )}
     </div>
   );
@@ -1795,7 +1924,7 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
         setSelectedChannelId(first.id);
         setSelectedModel(first.models[0]);
       }
-    }).catch(console.error);
+    }).catch(() => setChannels([]));
   }, [storageKey]);
 
   // Persist preferences when they change
@@ -2185,12 +2314,12 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   handleAsk();
                 }
               }}
-              placeholder="输入问题，Enter 发送，Shift+Enter 换行..."
+              placeholder="输入问题，Ctrl/Command+Enter 发送，Enter 换行..."
               rows={1}
               className="flex-1 resize-none rounded-2xl border border-border bg-white px-3.5 py-2.5 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 max-h-32"
               style={{ minHeight: "42px" }}
@@ -2230,15 +2359,17 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
   const [mcpEnabled, setMcpEnabled] = useState(kb.mcp_enabled ?? 1);
   const [chunkSize, setChunkSize] = useState(kb.chunk_size || 512);
   const [chunkOverlap, setChunkOverlap] = useState(kb.chunk_overlap || 64);
+  const [embeddingBatchSize, setEmbeddingBatchSize] = useState(kb.embedding_batch_size || 32);
   const [excludedDirs, setExcludedDirs] = useState(kb.excluded_dirs || "");
   const [excludedFiles, setExcludedFiles] = useState(kb.excluded_files || "");
   const [includedFiles, setIncludedFiles] = useState(kb.included_files || "");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const [showChannelPicker, setShowChannelPicker] = useState(false);
 
   useEffect(() => {
-    channelApi.getAll().then(setChannels).catch(console.error);
+    channelApi.getAll().then(setChannels).catch(() => setChannels([]));
   }, []);
 
   const activeChannels = channels.filter(c => c.status === 1);
@@ -2247,6 +2378,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
   const handleSave = async () => {
     setSaving(true);
     setSaved(false);
+    setSaveError("");
     try {
       await kbApi.update(kb.id, {
         name: name.trim(),
@@ -2257,6 +2389,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
         mcp_enabled: mcpEnabled,
         chunk_size: chunkSize,
         chunk_overlap: chunkOverlap,
+        embedding_batch_size: embeddingBatchSize,
         excluded_dirs: excludedDirs,
         excluded_files: excludedFiles,
         included_files: includedFiles,
@@ -2265,7 +2398,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
       onRefresh();
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
-      alert(`保存失败: ${e}`);
+      setSaveError(`保存失败：${kbErrorMessage(e)}`);
     } finally {
       setSaving(false);
     }
@@ -2439,6 +2572,19 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
               />
               <p className="mt-1 text-xs text-slate-400">默认 64，保持上下文连续性</p>
             </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Embedding 批量大小</label>
+              <input
+                type="number"
+                value={embeddingBatchSize}
+                onChange={(e) => setEmbeddingBatchSize(Math.max(1, Number(e.target.value) || 32))}
+                min={1}
+                max={256}
+                step={1}
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              />
+              <p className="mt-1 text-xs text-slate-400">每次发送给 embedding 渠道的文本数量，默认 32</p>
+            </div>
           </div>
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-700">排除目录（逗号分隔）</label>
@@ -2496,9 +2642,11 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
       </div>
 
       {/* Save */}
-      <div className="surface data-card rounded-2xl flex items-center justify-end gap-3">
+      <div className="surface data-card rounded-2xl flex flex-wrap items-center justify-end gap-3">
+        {saveError ? <div className="kb-notice kb-notice-warning mr-auto" role="alert">{saveError}</div> : null}
         <button
-          onClick={handleSave}
+          type="button"
+          onClick={() => void handleSave()}
           disabled={saving}
           className="action-primary disabled:opacity-50"
         >
@@ -2520,6 +2668,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
 function McpTab({ kb }: { kb: KnowledgeBase }) {
   const [serverUrl, setServerUrl] = useState("http://127.0.0.1:8777");
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState("");
 
   useEffect(() => {
     serverApi.getStatus().then(s => {
@@ -2530,10 +2679,16 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
   const baseUrl = serverUrl;
   const mcpEndpoint = `${baseUrl}/mcp`;
 
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const handleCopy = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyError("");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+      setCopyError("当前环境无法访问剪贴板，请手动复制地址。");
+    }
   };
 
   const mcpTools = [
@@ -2585,6 +2740,7 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
           <div className="kb-notice kb-notice-info">
             支持 MCP 的客户端可通过此端点发现工具，并检索或问答当前私有知识库。
           </div>
+          {copyError ? <div className="kb-notice kb-notice-warning" role="status">{copyError}</div> : null}
 
           {/* 未暴露提示 */}
           {kb.mcp_enabled !== 1 && (

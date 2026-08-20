@@ -9,7 +9,8 @@ export interface Channel {
     priority: number;
     weight: number;
     config: Record<string, unknown>;
-    model_mapping: Record<string, string>;
+    model_mapping: Record<string, string | string[]>;
+    timeout_secs: number;
     created_at: string;
     updated_at: string;
     last_test_at: string | null;
@@ -26,11 +27,23 @@ export interface CreateChannelInput {
     models: string[];
     priority: number;
     weight: number;
+    config?: Record<string, unknown>;
+    model_mapping?: Record<string, string | string[]>;
+    timeout_secs?: number;
 }
 
 export interface UpdateChannelInput extends Partial<CreateChannelInput> {
     id: string;
     status?: number;
+    name?: string;
+    base_url?: string;
+    api_key?: string;
+    models?: string[];
+    priority?: number;
+    weight?: number;
+    config?: Record<string, unknown>;
+    model_mapping?: Record<string, string | string[]>;
+    timeout_secs?: number;
 }
 
 export interface ReorderChannelsInput {
@@ -42,6 +55,92 @@ export interface TestChannelResult {
     latency_ms: number;
     message: string;
     models?: string[];
+}
+
+export interface ChannelStats {
+    channel_id: string;
+    total_calls: number;
+    success_calls: number;
+    failed_calls: number;
+    total_tokens: number;
+    prompt_tokens: number;
+    completion_tokens: number;
+    avg_latency_ms: number;
+    last_call_at: string | null;
+}
+
+export interface ApiKeyStats {
+    api_key_id: string;
+    total_calls: number;
+    success_calls: number;
+    failed_calls: number;
+    total_tokens: number;
+    prompt_tokens: number;
+    completion_tokens: number;
+    avg_latency_ms: number;
+    last_call_at: string | null;
+}
+
+export interface ImportResult {
+    imported: number;
+    skipped: number;
+    errors: string[];
+}
+
+export interface ScannedSource {
+    source: string;
+    name: string;
+    base_url: string;
+    api_key: string;
+    models: string[];
+    api_format: string;
+    raw: Record<string, unknown>;
+}
+
+export interface ScanResult {
+    sources: ScannedSource[];
+}
+
+export type SecurityRuleSeverity = "info" | "low" | "medium" | "high" | "critical";
+
+export interface BuiltinRule {
+    id: string;
+    rule_id: string;
+    category: string;
+    severity: SecurityRuleSeverity;
+    title: string;
+    description: string | null;
+    toggle_key: string | null;
+    enabled: number;
+    created_at: string;
+}
+
+export interface CustomRule {
+    id: string;
+    rule_type: string;
+    category: string;
+    pattern: string;
+    severity: SecurityRuleSeverity;
+    action: string;
+    enabled: number;
+    description: string | null;
+    created_at: string;
+}
+
+export interface CreateCustomRuleInput {
+    rule_type: string;
+    category: string;
+    pattern: string;
+    severity?: SecurityRuleSeverity;
+    action?: string;
+    description?: string;
+}
+
+export interface UpdateBuiltinRuleInput {
+    severity?: SecurityRuleSeverity;
+    title?: string;
+    description?: string;
+    enabled?: boolean;
 }
 
 export interface ApiKey {
@@ -251,6 +350,7 @@ export interface KnowledgeBase {
     included_files: string;
     embedding_dim: number;
     index_status: string;
+    embedding_batch_size: number;
     created_at: string;
     updated_at: string;
 }

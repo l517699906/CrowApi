@@ -28,7 +28,8 @@ import { LogsPage } from "../pages/LogsPage";
 import { SettingsPage } from "../pages/SettingsPage";
 import { UsagePage } from "../pages/UsagePage";
 import { KnowledgeBasePage } from "../pages/KnowledgeBasePage";
-import { IconButton } from "./ui";
+import { WikiPage } from "../pages/WikiPage";
+import { IconButton, Toast } from "./ui";
 
 const navItems = [
     { to: "/dashboard", label: "仪表盘", icon: LayoutDashboard },
@@ -41,6 +42,13 @@ const navItems = [
 ] as const;
 
 const pageNames = new Map<string, string>(navItems.map((item) => [item.to, item.label]));
+
+function resolvePageName(pathname: string) {
+    if (pathname.startsWith("/services/wiki")) return "Wiki";
+    if (pathname.startsWith("/services/mcp")) return "MCP 服务";
+    if (pathname.startsWith("/services")) return "知识库";
+    return pageNames.get(pathname) ?? "仪表盘";
+}
 
 export function AppShell() {
     const location = useLocation();
@@ -59,9 +67,9 @@ export function AppShell() {
     });
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [endpointCopied, setEndpointCopied] = useState(false);
-    const pageName = location.pathname.startsWith("/services")
-        ? "知识库"
-        : pageNames.get(location.pathname) ?? "仪表盘";
+    const [notificationOpen, setNotificationOpen] = useState(false);
+    const [toastMessage, setToastMessage] = useState<string | null>(null);
+    const pageName = resolvePageName(location.pathname);
     const isRunning = serverStatus?.running ?? false;
     const endpointBase = serverStatus?.port ? serverStatus.url : `http://${settings.server_host}:${settings.server_port}`;
     const endpoint = `${endpointBase}/v1`;
@@ -88,15 +96,24 @@ export function AppShell() {
 
     useEffect(() => {
         setSidebarOpen(false);
+        setNotificationOpen(false);
     }, [location.pathname]);
+
+    useEffect(() => {
+        if (!toastMessage) return;
+        const timer = window.setTimeout(() => setToastMessage(null), 2200);
+        return () => window.clearTimeout(timer);
+    }, [toastMessage]);
 
     const copyEndpoint = async () => {
         try {
             await navigator.clipboard.writeText(endpoint);
             setEndpointCopied(true);
+            setToastMessage("API 地址已复制");
             window.setTimeout(() => setEndpointCopied(false), 1600);
         } catch {
             setEndpointCopied(false);
+            setToastMessage("当前环境无法访问剪贴板");
         }
     };
 
@@ -108,7 +125,7 @@ export function AppShell() {
                 aria-label="关闭导航"
                 onClick={() => setSidebarOpen(false)}
             />
-            <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`}>
+            <aside id="app-sidebar" className={`sidebar ${sidebarOpen ? "is-open" : ""}`}>
                 <div className="sidebar-brand">
                     <img
                         className="brand-mark"
@@ -150,7 +167,7 @@ export function AppShell() {
                             <span className={`live-dot ${isRunning ? "" : "is-offline"}`} />
                             {isRunning ? "网关运行中" : "网关未连接"}
                         </span>
-                        <span className="font-mono text-[10px] text-sidebar-muted">v0.1.0</span>
+                        <span className="font-mono text-[10px] text-sidebar-muted">v0.1.5</span>
                     </div>
                     <div className="mt-3 flex items-end justify-between">
                         <div>
@@ -169,7 +186,7 @@ export function AppShell() {
             <div className="app-workspace">
                 <header className="topbar">
                     <div className="flex min-w-0 items-center gap-3">
-                        <IconButton label="打开导航" className="mobile-menu-button" onClick={() => setSidebarOpen(true)}>
+                        <IconButton label="打开导航" aria-expanded={sidebarOpen} aria-controls="app-sidebar" className="mobile-menu-button" onClick={() => setSidebarOpen(true)}>
                             <Menu size={19} />
                         </IconButton>
                         <div className="hidden items-center gap-2 text-sm text-muted sm:flex">
@@ -191,10 +208,21 @@ export function AppShell() {
                             <span className="endpoint-text">{endpoint}</span>
                             {endpointCopied ? <Check size={14} /> : <Copy size={14} />}
                         </button>
-                        <IconButton label="通知">
-                            <Bell size={18} />
-                            <span className="notification-dot" />
-                        </IconButton>
+                        <div className="relative">
+                            <IconButton label="通知" aria-expanded={notificationOpen} onClick={() => setNotificationOpen((open) => !open)}>
+                                <Bell size={18} />
+                                {!isRunning ? <span className="notification-dot" /> : null}
+                            </IconButton>
+                            {notificationOpen ? (
+                                <div className="notification-popover" role="dialog" aria-label="运行状态通知">
+                                    <strong>{isRunning ? "网关运行正常" : "网关未连接"}</strong>
+                                    <p>{isRunning ? `${activeChannels} 个渠道处于启用状态。` : "启动服务后才能接收本地 API 请求。"}</p>
+                                    <NavLink to={isRunning ? "/logs" : "/settings"} onClick={() => setNotificationOpen(false)}>
+                                        {isRunning ? "查看请求日志" : "打开服务设置"}
+                                    </NavLink>
+                                </div>
+                            ) : null}
+                        </div>
                         <div className="user-avatar" aria-label="本地管理员">Crow</div>
                     </div>
                 </header>
@@ -204,6 +232,7 @@ export function AppShell() {
                         <Route path="/dashboard" element={<DashboardPage />} />
                         <Route path="/usage" element={<UsagePage />} />
                         <Route path="/channels" element={<ChannelsPage />} />
+                        <Route path="/services/wiki" element={<WikiPage />} />
                         <Route path="/services/*" element={<KnowledgeBasePage />} />
                         <Route path="/keys" element={<ApiKeysPage />} />
                         <Route path="/logs" element={<LogsPage />} />
@@ -212,6 +241,7 @@ export function AppShell() {
                     </Routes>
                 </main>
             </div>
+            {toastMessage ? <Toast message={toastMessage} /> : null}
         </div>
     );
 }

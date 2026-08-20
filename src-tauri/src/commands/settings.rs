@@ -150,6 +150,16 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
 
 #[tauri::command]
 pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), String> {
+    let server_host = settings.server_host.trim();
+    if server_host.is_empty() {
+        return Err("监听地址不能为空".to_string());
+    }
+    if settings.server_port < 1024 {
+        return Err("服务端口必须在 1024 到 65535 之间".to_string());
+    }
+    if !(0..=5).contains(&settings.retry_times) {
+        return Err("最大重试次数必须在 0 到 5 之间".to_string());
+    }
     if settings.default_key_quota < 0 || settings.total_quota < 0 {
         return Err("配额不能小于 0".to_string());
     }
@@ -159,10 +169,13 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     if !crate::config::is_supported_ui_theme(&settings.ui_theme) {
         return Err("不支持的界面主题".to_string());
     }
+    if !matches!(settings.security_mode.as_str(), "audit" | "redact" | "block") {
+        return Err("安全模式必须是 audit、redact 或 block".to_string());
+    }
 
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
     store.set("server.port", serde_json::json!(settings.server_port));
-    store.set("server.host", serde_json::json!(settings.server_host));
+    store.set("server.host", serde_json::json!(server_host));
     store.set("ui.theme", serde_json::json!(settings.ui_theme));
     store.set("ui.language", serde_json::json!(settings.ui_language));
     store.set("general.minimize_to_tray", settings.minimize_to_tray);

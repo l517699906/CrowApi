@@ -119,14 +119,18 @@ pub async fn import_url(
     let hash_hex = hex::encode(hash);
 
     // Check duplicate
-    if let Ok(Some(_)) = repo.find_document_by_hash(kb_id, &hash_hex).await {
-        emit_import_progress(app, kb_id, source_id, 100, "URL content already exists");
-        return Ok(0);
+    match repo.find_document_by_hash(kb_id, &hash_hex).await {
+        Ok(Some(_)) => {
+            emit_import_progress(app, kb_id, source_id, 100, "URL content already exists");
+            return Ok(0);
+        }
+        Ok(None) => {}
+        Err(error) => return Err(format!("Failed to check duplicate document: {}", error)),
     }
 
     let doc = repo.create_document_with_source(
         kb_id, &filename, None, &file_type, content.len() as i64, &hash_hex,
-        "url", Some(url), None,
+        Some(source_id), "url", Some(url), None,
     ).await.map_err(|e| e.to_string())?;
 
     // Get KB embedding model
@@ -224,9 +228,13 @@ async fn process_directory_files(
         let hash_hex = hex::encode(hash);
 
         // Check duplicate
-        if let Ok(Some(_)) = repo.find_document_by_hash(kb_id, &hash_hex).await {
-            skipped += 1;
-            continue;
+        match repo.find_document_by_hash(kb_id, &hash_hex).await {
+            Ok(Some(_)) => {
+                skipped += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("Failed to check duplicate document: {}", error)),
         }
 
         let file_type = parser::get_file_type(&filename);
@@ -242,9 +250,12 @@ async fn process_directory_files(
             kb_id, &filename,
             Some(&file_path.to_string_lossy()),
             &file_type, file_size, &hash_hex,
-            source_type, source_url, Some(&rel_path),
+            Some(source_id), source_type, source_url, Some(&rel_path),
         ).await {
             Ok(d) => d,
+            Err(sqlx::Error::RowNotFound) => {
+                return Err("Import source no longer exists".to_string());
+            }
             Err(e) => {
                 tracing::warn!("Failed to create document record for {}: {}", filename, e);
                 skipped += 1;
@@ -264,7 +275,9 @@ async fn process_directory_files(
     }
 
     // Update KB counts
-    repo.update_kb_counts(kb_id).await.ok();
+    repo.update_kb_counts(kb_id)
+        .await
+        .map_err(|error| format!("Failed to update knowledge base counts: {}", error))?;
 
     emit_import_progress(app, kb_id, source_id, 100, &format!("Done: {} processed, {} skipped", processed, skipped));
     Ok(processed)

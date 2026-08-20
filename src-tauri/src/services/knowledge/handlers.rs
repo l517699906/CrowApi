@@ -108,8 +108,14 @@ pub async fn upload_document(
     let hash = sha2::Sha256::digest(&content);
     let hash_hex = hex::encode(hash);
 
-    if let Ok(Some(_)) = repo.find_document_by_hash(&kb_id, &hash_hex).await {
-        return (StatusCode::CONFLICT, "Document with same content already exists").into_response();
+    match repo.find_document_by_hash(&kb_id, &hash_hex).await {
+        Ok(Some(_)) => return (StatusCode::CONFLICT, "Document with same content already exists").into_response(),
+        Ok(None) => {}
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+    }
+
+    if let Err(error) = super::safe_path_component(&input.filename, "filename") {
+        return (StatusCode::BAD_REQUEST, error).into_response();
     }
 
     let file_type = super::parser::get_file_type(&input.filename);
@@ -117,10 +123,14 @@ pub async fn upload_document(
 
     let app_data_dir = shared.app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
-    std::fs::create_dir_all(&kb_dir).ok();
+    if let Err(error) = std::fs::create_dir_all(&kb_dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create document directory: {}", error)).into_response();
+    }
     let doc_id = uuid::Uuid::new_v4().to_string();
     let file_path = kb_dir.join(format!("{}_{}", &doc_id, &input.filename));
-    std::fs::write(&file_path, &content).ok();
+    if let Err(error) = std::fs::write(&file_path, &content) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save document: {}", error)).into_response();
+    }
     let file_path_str = file_path.to_string_lossy().to_string();
 
     let doc = match repo.create_document(
@@ -132,7 +142,12 @@ pub async fn upload_document(
         &hash_hex,
     ).await {
         Ok(d) => d,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => {
+            if let Err(remove_error) = std::fs::remove_file(&file_path) {
+                tracing::warn!(%remove_error, path = %file_path.display(), "failed to remove document after DB insert error");
+            }
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response();
+        }
     };
 
     let kb = match repo.get_kb(&kb_id).await {
@@ -180,15 +195,34 @@ pub async fn delete_document(
 ) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
 
-    if let Ok(doc) = repo.get_document(&doc_id).await {
+    let doc = match repo.get_document(&doc_id).await {
+        Ok(doc) if doc.kb_id == kb_id => doc,
+        Ok(_) => return (StatusCode::NOT_FOUND, "Document not found").into_response(),
+        Err(sqlx::Error::RowNotFound) => return (StatusCode::NOT_FOUND, "Document not found").into_response(),
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+    };
+
+    if doc.source_type == "upload" {
         if let Some(path) = &doc.file_path {
-            std::fs::remove_file(path).ok();
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to delete document file: {}", error),
+                ).into_response(),
+            }
         }
     }
 
     match repo.delete_document(&doc_id).await {
         Ok(_) => {
-            repo.update_kb_counts(&kb_id).await.ok();
+            if let Err(error) = repo.update_kb_counts(&kb_id).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Document deleted but failed to update knowledge base counts: {}", error),
+                ).into_response();
+            }
             (StatusCode::NO_CONTENT, "").into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
@@ -229,17 +263,26 @@ pub async fn search(
 ) -> Response {
     let repo = Repository::new(shared.state.db.pool.clone());
 
-    let emb_model = if let Some(kb_id) = &query.kb_id {
+    let (emb_model, embedding_channel_id) = if let Some(kb_id) = &query.kb_id {
         let kb_repo = KbRepository::new(shared.state.db.pool.clone());
-        kb_repo.get_kb(kb_id).await
-            .ok()
-            .and_then(|kb| kb.embedding_model)
-            .unwrap_or_else(|| "text-embedding-3-small".to_string())
+        let kb = match kb_repo.get_kb(kb_id).await {
+            Ok(kb) => kb,
+            Err(error) => return (StatusCode::NOT_FOUND, format!("KB not found: {}", error)).into_response(),
+        };
+        (
+            kb.embedding_model.unwrap_or_else(|| "text-embedding-3-small".to_string()),
+            kb.embedding_channel_id,
+        )
     } else {
-        "text-embedding-3-small".to_string()
+        ("text-embedding-3-small".to_string(), None)
     };
 
-    let embeddings = match embedder::embed(&[query.q.clone()], &emb_model, &repo).await {
+    let embeddings = match embedder::embed_with_channel(
+        &[query.q.clone()],
+        &emb_model,
+        &repo,
+        embedding_channel_id.as_deref(),
+    ).await {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding failed: {}", e)).into_response(),
     };
@@ -272,9 +315,11 @@ pub async fn ask(
 
     let emb_model = if !kb_id.is_empty() {
         let kb_repo = KbRepository::new(shared.state.db.pool.clone());
-        kb_repo.get_kb(&kb_id).await
-            .ok()
-            .and_then(|kb| kb.embedding_model)
+        let kb = match kb_repo.get_kb(&kb_id).await {
+            Ok(kb) => kb,
+            Err(error) => return (StatusCode::NOT_FOUND, format!("KB not found: {}", error)).into_response(),
+        };
+        kb.embedding_model
             .unwrap_or_else(|| "text-embedding-3-small".to_string())
     } else {
         "text-embedding-3-small".to_string()
@@ -335,13 +380,19 @@ pub async fn kb_stats(
         Err(_) => return (StatusCode::NOT_FOUND, "KB not found").into_response(),
     };
 
-    let docs = repo.get_documents(&kb_id).await.unwrap_or_default();
+    let docs = match repo.get_documents(&kb_id).await {
+        Ok(docs) => docs,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+    };
     let ready_count = docs.iter().filter(|d| d.status == "ready").count();
     let processing_count = docs.iter().filter(|d| d.status == "processing").count();
     let failed_count = docs.iter().filter(|d| d.status == "failed").count();
     let pending_count = docs.iter().filter(|d| d.status == "pending").count();
 
-    let index_meta = repo.get_index_meta(&kb_id).await.ok().flatten();
+    let index_meta = match repo.get_index_meta(&kb_id).await {
+        Ok(index_meta) => index_meta,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+    };
 
     Json(serde_json::json!({
         "kb": kb,
@@ -402,12 +453,18 @@ pub async fn delete_source(
     Path((kb_id, source_id)): Path<(String, String)>,
 ) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
-    match repo.delete_source(&source_id).await {
+    match repo.delete_source_with_documents(&kb_id, &source_id).await {
         Ok(_) => {
-            repo.update_kb_counts(&kb_id).await.ok();
+            if let Err(error) = repo.update_kb_counts(&kb_id).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Source deleted but failed to update knowledge base counts: {}", error),
+                ).into_response();
+            }
             (StatusCode::NO_CONTENT, "").into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(sqlx::Error::RowNotFound) => (StatusCode::NOT_FOUND, "Source not found").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
     }
 }
 
@@ -456,10 +513,14 @@ pub async fn import_source(
         let repo = KbRepository::new(pool.clone());
         match result {
             Ok(count) => {
-                repo.update_source_status(&source_id, "done", count as i64, None).await.ok();
+                if let Err(error) = repo.update_source_status(&source_id, "done", count as i64, None).await {
+                    tracing::warn!(%error, source_id = %source_id, "failed to persist knowledge source completion");
+                }
             }
             Err(e) => {
-                repo.update_source_status(&source_id, "error", 0, Some(&e)).await.ok();
+                if let Err(error) = repo.update_source_status(&source_id, "error", 0, Some(&e)).await {
+                    tracing::warn!(%error, source_id = %source_id, "failed to persist knowledge source failure");
+                }
                 tracing::error!("Import failed: {}", e);
             }
         }
@@ -491,7 +552,9 @@ pub async fn build_index(
 
     // Update index status to building immediately
     let repo = KbRepository::new(pool.clone());
-    repo.update_kb_index_status(&kb_id_clone, "building").await.ok();
+    if let Err(error) = repo.update_kb_index_status(&kb_id_clone, "building").await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update index status: {}", error)).into_response();
+    }
 
     // Spawn on blocking thread pool — HNSW build is CPU-intensive
     tokio::task::spawn_blocking(move || {
@@ -519,7 +582,9 @@ pub async fn build_index(
                 Err(e) => {
                     tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id, e);
                     let repo = KbRepository::new(pool.clone());
-                    repo.update_kb_index_status(&kb_id, "error").await.ok();
+                    if let Err(error) = repo.update_kb_index_status(&kb_id, "error").await {
+                        tracing::warn!(%error, knowledge_base_id = %kb_id, "failed to persist index failure status");
+                    }
                     let _ = app.emit("kb-index-progress", serde_json::json!({
                         "kb_id": &kb_id,
                         "status": "error",

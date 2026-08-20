@@ -1,4 +1,3 @@
-use super::models::*;
 use super::project;
 use super::repository::WikiRepository;
 use crate::core::proxy;
@@ -6,7 +5,7 @@ use crate::db::repository::Repository;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 /// Ingest a source file: read → parse → generate wiki pages via LLM → write to disk+DB.
 pub async fn ingest_source(
@@ -26,6 +25,7 @@ pub async fn ingest_source(
     // 2. Update task status
     let task_id = repo.create_task(project_id, Some(source_id), "ingest").await?;
     repo.update_task_status(&task_id, "running", 0, 0, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "processing", 0, "准备摄入");
 
     // 3. Read source file content
     let content = if let Some(ref file_path) = source.file_path {
@@ -44,6 +44,7 @@ pub async fn ingest_source(
 
     // 4. Parse content into sections/chunks
     repo.update_task_status(&task_id, "running", 10, 0, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "parsing", 10, "解析文档");
     let sections = parse_content(&content, &file_ext);
 
     // 5. Get project config for LLM
@@ -63,6 +64,7 @@ pub async fn ingest_source(
 
     // 6. Generate wiki pages via LLM
     repo.update_task_status(&task_id, "running", 30, 1, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "generating", 30, "LLM 生成页面");
     let pages = generate_wiki_pages(
         app,
         &db_repo,
@@ -76,6 +78,7 @@ pub async fn ingest_source(
 
     // 7. Write pages to disk + DB
     repo.update_task_status(&task_id, "running", 60, 2, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "writing", 60, "写入页面");
     let mut written_pages = Vec::new();
     for page in &pages {
         let page_path = &page.path;
@@ -93,6 +96,11 @@ pub async fn ingest_source(
         let wikilinks = extract_wikilinks(&page.content);
         let wikilinks_json = serde_json::to_string(&wikilinks).unwrap_or_else(|_| "[]".to_string());
 
+        // Extract tags from frontmatter
+        let tags = extract_tags_from_frontmatter(&page.content);
+        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+        let frontmatter = extract_frontmatter(&page.content).unwrap_or("{}");
+
         // Upsert into DB
         repo.upsert_page(
             project_id,
@@ -102,19 +110,19 @@ pub async fn ingest_source(
             &hash,
             token_count,
             &wikilinks_json,
-            "{}",
+            frontmatter,
+            &tags_json,
         ).await?;
 
         written_pages.push(WrittenPage {
             path: page_path.clone(),
-            title: page.title.clone(),
-            page_type: page.page_type.clone(),
             wikilinks,
         });
     }
 
     // 8. Update graph edges from wikilinks
     repo.update_task_status(&task_id, "running", 80, 2, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "linking", 80, "更新知识图谱");
     update_graph_edges(pool, project_id, &written_pages).await?;
 
     // 9. Update source status
@@ -123,11 +131,19 @@ pub async fn ingest_source(
     // Update project counts
     let page_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM wiki_pages WHERE project_id = ? AND status = 'active'"
-    ).bind(project_id).fetch_one(pool).await.unwrap_or(0);
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
 
     let source_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM wiki_sources WHERE project_id = ? AND status = 'ingested'"
-    ).bind(project_id).fetch_one(pool).await.unwrap_or(0);
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
 
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -137,7 +153,14 @@ pub async fn ingest_source(
     .execute(pool).await.map_err(|e| format!("DB error: {}", e))?;
 
     // Append log
-    let _ = project::append_log(project_id, &format!("ingest | {} → {} pages", source_filename, written_pages.len())).await;
+    if let Err(error) = project::append_log(
+        project_id,
+        &format!("ingest | {} → {} pages", source_filename, written_pages.len()),
+    )
+    .await
+    {
+        tracing::warn!(%error, project_id, "failed to append Wiki ingest log");
+    }
 
     // Update task
     let result_json = serde_json::json!({
@@ -145,6 +168,7 @@ pub async fn ingest_source(
         "source": source_filename,
     }).to_string();
     repo.update_task_status(&task_id, "done", 100, 3, 3, Some(&result_json), None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "done", 100, &format!("完成，生成 {} 个页面", written_pages.len()));
 
     Ok(IngestResult {
         pages_created: written_pages.len(),
@@ -165,10 +189,33 @@ struct GeneratedPage {
     content: String,
 }
 
+/// Emit wiki source ingest progress event to frontend.
+fn emit_wiki_progress(
+    app: &AppHandle,
+    source_id: &str,
+    project_id: &str,
+    filename: &str,
+    stage: &str,
+    progress: u8,
+    detail: &str,
+) {
+    if let Err(error) = app.emit(
+        "wiki-source-progress",
+        serde_json::json!({
+            "source_id": source_id,
+            "project_id": project_id,
+            "filename": filename,
+            "stage": stage,
+            "progress": progress,
+            "detail": detail,
+        }),
+    ) {
+        tracing::warn!(%error, source_id, project_id, "failed to emit Wiki ingest progress");
+    }
+}
+
 struct WrittenPage {
     path: String,
-    title: String,
-    page_type: String,
     wikilinks: Vec<String>,
 }
 
@@ -383,6 +430,7 @@ Generate 3-8 pages depending on document complexity. Focus on the most important
         "Wiki Ingest",
         chat_request,
         false,
+        "chat",
         Some(chat_request_str),
         Some(format!("wiki-ingest_{}", project_id)),
         None,
@@ -482,7 +530,7 @@ fn parse_generated_pages(text: &str, source_filename: &str) -> Vec<GeneratedPage
         }
         if !current_path.is_empty() {
             pages.push(build_page(&current_path, &current_content, source_filename));
-        } else if let Some(page) = build_page_from_content(&current_content, source_filename) {
+        } else if let Some(page) = build_page_from_content(&current_content) {
             pages.push(page);
         }
     }
@@ -578,7 +626,7 @@ fn build_page(path: &str, raw_content: &str, source_filename: &str) -> Generated
     }
 }
 
-fn build_page_from_content(content: &str, source_filename: &str) -> Option<GeneratedPage> {
+fn build_page_from_content(content: &str) -> Option<GeneratedPage> {
     let title = extract_title_from_content(content, "");
     if title.is_empty() {
         return None;
@@ -592,7 +640,7 @@ fn build_page_from_content(content: &str, source_filename: &str) -> Option<Gener
     })
 }
 
-fn extract_title_from_content(content: &str, fallback_path: &str) -> String {
+pub fn extract_title_from_content(content: &str, fallback_path: &str) -> String {
     // Try frontmatter title
     if content.starts_with("---") {
         let end = content[3..].find("---");
@@ -667,6 +715,37 @@ fn extract_wikilinks(content: &str) -> Vec<String> {
     links
 }
 
+/// Rebuild graph edges for a project based on current page wikilinks.
+/// Called after page save/delete to keep the knowledge graph up-to-date.
+pub async fn rebuild_graph_edges(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> Result<(), String> {
+    // Load all pages from DB
+    let existing_pages: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT path, wikilinks, title FROM wiki_pages WHERE project_id = ? AND status = 'active'"
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+
+    let mut all_links: Vec<(String, String)> = Vec::new();
+
+    for (path, wikilinks_json, _title) in &existing_pages {
+        let links: Vec<String> = serde_json::from_str(wikilinks_json).unwrap_or_default();
+        for link in links {
+            let target = resolve_wikilink_to_path(pool, project_id, &link).await;
+            // Check if target exists
+            if existing_pages.iter().any(|(p, _, _)| p == &target) {
+                all_links.push((path.clone(), target));
+            }
+        }
+    }
+
+    replace_graph_edges(pool, project_id, &all_links).await
+}
+
 /// Update graph_edges table based on wikilinks in pages.
 async fn update_graph_edges(
     pool: &sqlx::SqlitePool,
@@ -690,8 +769,8 @@ async fn update_graph_edges(
     // From new pages
     for page in pages {
         for link in &page.wikilinks {
-            // Normalize link to path
-            let target = normalize_wikilink(link);
+            // Resolve wikilink to actual page path via title matching
+            let target = resolve_wikilink_to_path(pool, project_id, link).await;
             if valid_paths.contains(&target) || existing_pages.iter().any(|(p, _)| p == &target) {
                 all_links.push((page.path.clone(), target));
             }
@@ -702,7 +781,7 @@ async fn update_graph_edges(
     for (path, wikilinks_json) in &existing_pages {
         let links: Vec<String> = serde_json::from_str(wikilinks_json).unwrap_or_default();
         for link in links {
-            let target = normalize_wikilink(&link);
+            let target = resolve_wikilink_to_path(pool, project_id, &link).await;
             // Check if target exists (in new pages or existing)
             if valid_paths.contains(&target) || existing_pages.iter().any(|(p, _)| p == &target) {
                 all_links.push((path.clone(), target));
@@ -710,25 +789,86 @@ async fn update_graph_edges(
         }
     }
 
-    // Clear old edges and insert new ones
+    replace_graph_edges(pool, project_id, &all_links).await
+}
+
+async fn replace_graph_edges(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    links: &[(String, String)],
+) -> Result<(), String> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+
     sqlx::query("DELETE FROM wiki_graph_edges WHERE project_id = ?")
         .bind(project_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|e| format!("DB error: {}", e))?;
 
     let now = chrono::Utc::now().to_rfc3339();
-    for (source, target) in all_links {
+    for (source, target) in links {
         let id = uuid::Uuid::new_v4().to_string();
-        let _ = sqlx::query(
+        sqlx::query(
             "INSERT OR IGNORE INTO wiki_graph_edges (id, project_id, source_page, target_page, edge_type, weight, created_at)
              VALUES (?, ?, ?, ?, 'wikilink', 1.0, ?)"
         )
-        .bind(&id).bind(project_id).bind(&source).bind(&target).bind(&now)
-        .execute(pool).await;
+        .bind(&id)
+        .bind(project_id)
+        .bind(source)
+        .bind(target)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
     }
 
-    Ok(())
+    transaction
+        .commit()
+        .await
+        .map_err(|e| format!("DB error: {}", e))
+}
+
+/// Extract tags from YAML frontmatter of a wiki page.
+pub fn extract_tags_from_frontmatter(content: &str) -> Vec<String> {
+    let Some(frontmatter) = extract_frontmatter(content) else {
+        return vec![];
+    };
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("tags:") {
+            let tags_part = trimmed[5..].trim();
+            // Parse array format: [tag1, tag2] or ["tag1", "tag2"]
+            let cleaned = tags_part
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim();
+            if cleaned.is_empty() {
+                return vec![];
+            }
+            return cleaned
+                .split(',')
+                .map(|t| t.trim().trim_matches('"').trim_matches('\'').trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+        }
+    }
+    vec![]
+}
+
+/// Return the YAML frontmatter exactly as stored in the Markdown page.
+pub fn extract_frontmatter(content: &str) -> Option<&str> {
+    let rest = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))?;
+    let end = rest
+        .find("\n---\n")
+        .or_else(|| rest.find("\r\n---\r\n"))
+        .or_else(|| rest.strip_suffix("\n---").map(|value| value.len()))
+        .or_else(|| rest.strip_suffix("\r\n---").map(|value| value.len()))?;
+    Some(rest[..end].trim())
 }
 
 fn normalize_wikilink(link: &str) -> String {
@@ -743,4 +883,57 @@ fn normalize_wikilink(link: &str) -> String {
         .collect();
     let slug = slug.trim_matches('-');
     format!("entities/{}.md", slug)
+}
+
+/// Resolve a wikilink to an actual page path by matching against known page titles.
+/// Falls back to `normalize_wikilink` if no title match is found.
+async fn resolve_wikilink_to_path(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    link: &str,
+) -> String {
+    let link = link.trim();
+    // If it already looks like a path, use as-is
+    if link.contains('/') && link.ends_with(".md") {
+        return link.to_string();
+    }
+    // Try exact title match (case-insensitive)
+    let title_match: Option<(String,)> = sqlx::query_as(
+        "SELECT path FROM wiki_pages WHERE project_id = ? AND status = 'active' AND LOWER(title) = LOWER(?) LIMIT 1"
+    )
+    .bind(project_id)
+    .bind(link)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some((path,)) = title_match {
+        return path;
+    }
+    // Fallback to slug-based normalization
+    normalize_wikilink(link)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_frontmatter, extract_tags_from_frontmatter};
+
+    #[test]
+    fn frontmatter_and_tags_are_preserved() {
+        let content = "---\ntitle: Example\ntags: [rust, \"wiki\"]\nsource: notes.md\n---\n# Example";
+
+        assert_eq!(
+            extract_frontmatter(content),
+            Some("title: Example\ntags: [rust, \"wiki\"]\nsource: notes.md")
+        );
+        assert_eq!(extract_tags_from_frontmatter(content), vec!["rust", "wiki"]);
+    }
+
+    #[test]
+    fn text_without_frontmatter_is_not_misclassified() {
+        let content = "# Example\n\nA horizontal rule follows.\n\n---\n";
+
+        assert_eq!(extract_frontmatter(content), None);
+        assert!(extract_tags_from_frontmatter(content).is_empty());
+    }
 }

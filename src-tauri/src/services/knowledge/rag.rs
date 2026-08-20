@@ -1,14 +1,14 @@
 use super::embedder;
-use super::retriever;
-use super::models::{RagAnswer, RetrievalDetail, SourceInfo, UsageInfo, ConversationMessage};
+use super::models::{ConversationMessage, RagAnswer, RetrievalDetail, SourceInfo, UsageInfo};
 use super::repository::KbRepository;
+use super::retriever;
 use crate::core::proxy;
 use crate::db::repository::Repository;
-use tauri::AppHandle;
-use std::sync::Arc;
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use tauri::AppHandle;
 
-/// RAG: Retrieve relevant chunks, then generate answer via CrowAPI proxy
+/// RAG: Retrieve relevant chunks, then generate an answer through the CrowAPI proxy.
 /// Enhanced with conversation history, token limit fallback, and configurable search modes.
 pub async fn ask(
     pool: &SqlitePool,
@@ -22,10 +22,20 @@ pub async fn ask(
     app: &AppHandle,
 ) -> Result<RagAnswer, String> {
     ask_with_config(
-        pool, kb_id, query, embedding_model, chat_model, top_k,
-        mcp_only, history, app,
-        0.7, 0.3, "hybrid",
-    ).await
+        pool,
+        kb_id,
+        query,
+        embedding_model,
+        chat_model,
+        top_k,
+        mcp_only,
+        history,
+        app,
+        0.7,
+        0.3,
+        "hybrid",
+    )
+    .await
 }
 
 /// RAG with configurable search parameters.
@@ -45,10 +55,24 @@ pub async fn ask_with_config(
 ) -> Result<RagAnswer, String> {
     let repo = Repository::new(pool.clone());
     let kb_repo = KbRepository::new(pool.clone());
+    let embedding_channel_id = if kb_id.is_empty() {
+        None
+    } else {
+        kb_repo
+            .get_kb(kb_id)
+            .await
+            .map_err(|e| format!("Failed to load knowledge base: {}", e))?
+            .embedding_channel_id
+    };
 
     // 1. Embed the query (needed for vector and hybrid modes)
     let query_emb_opt = if search_mode != "keyword" {
-        let embeddings = embedder::embed(&[query.to_string()], embedding_model, &repo)
+        let embeddings = embedder::embed_with_channel(
+            &[query.to_string()],
+            embedding_model,
+            &repo,
+            embedding_channel_id.as_deref(),
+        )
             .await
             .map_err(|e| format!("Embedding failed: {}", e))?;
         if embeddings.is_empty() {
@@ -65,70 +89,108 @@ pub async fn ask_with_config(
         let kw_results = if kb_id.is_empty() {
             // For search_all with keyword mode, we still need embeddings for cross-KB search
             // Fallback: embed and use hybrid
-            let embeddings = embedder::embed(&[query.to_string()], embedding_model, &repo)
+            let embeddings = embedder::embed_with_channel(
+                &[query.to_string()],
+                embedding_model,
+                &repo,
+                embedding_channel_id.as_deref(),
+            )
                 .await
                 .map_err(|e| format!("Embedding failed: {}", e))?;
             retriever::hybrid_search_with_details(
-                pool, kb_id, query, &embeddings[0], top_k, vector_weight, keyword_weight,
-            ).await?
+                pool,
+                kb_id,
+                query,
+                &embeddings[0],
+                top_k,
+                vector_weight,
+                keyword_weight,
+            )
+            .await?
         } else {
             let kw = retriever::keyword_only_search(pool, kb_id, query, top_k).await?;
-            kw.into_iter().map(|r| {
-                let score = r.score;
-                retriever::ScoredSearchResult {
-                    result: r,
-                    vector_score: None,
-                    keyword_score: Some(score),
-                }
-            }).collect()
+            kw.into_iter()
+                .map(|r| {
+                    let score = r.score;
+                    retriever::ScoredSearchResult {
+                        result: r,
+                        vector_score: None,
+                        keyword_score: Some(score),
+                    }
+                })
+                .collect()
         };
         kw_results
     } else if search_mode == "vector" {
         // Vector-only search
-        let query_emb = query_emb_opt.as_ref().ok_or("Embedding required for vector search")?;
+        let query_emb = query_emb_opt
+            .as_ref()
+            .ok_or("Embedding required for vector search")?;
         let v_results = if kb_id.is_empty() {
             retriever::search_all(pool, query_emb, top_k, mcp_only).await?
         } else {
             retriever::search(pool, kb_id, query_emb, top_k).await?
         };
-        v_results.into_iter().map(|r| {
+        v_results
+            .into_iter()
+            .map(|r| {
                 let score = r.score;
                 retriever::ScoredSearchResult {
                     result: r,
                     vector_score: Some(score),
                     keyword_score: None,
                 }
-            }).collect()
+            })
+            .collect()
     } else {
         // Hybrid search (default)
-        let query_emb = query_emb_opt.as_ref().ok_or("Embedding required for hybrid search")?;
+        let query_emb = query_emb_opt
+            .as_ref()
+            .ok_or("Embedding required for hybrid search")?;
         if kb_id.is_empty() {
             // Cross-KB: use search_all then compute details
             let results = retriever::search_all(pool, query_emb, top_k, mcp_only).await?;
-            results.into_iter().map(|r| {
-                let score = r.score;
-                retriever::ScoredSearchResult {
-                    result: r,
-                    vector_score: Some(score),
-                    keyword_score: None,
-                }
-            }).collect()
+            results
+                .into_iter()
+                .map(|r| {
+                    let score = r.score;
+                    retriever::ScoredSearchResult {
+                        result: r,
+                        vector_score: Some(score),
+                        keyword_score: None,
+                    }
+                })
+                .collect()
         } else {
             retriever::hybrid_search_with_details(
-                pool, kb_id, query, query_emb, top_k, vector_weight, keyword_weight,
-            ).await?
+                pool,
+                kb_id,
+                query,
+                query_emb,
+                top_k,
+                vector_weight,
+                keyword_weight,
+            )
+            .await?
         }
     };
 
     // Extract plain results for context building
-    let results: Vec<super::models::SearchResult> = scored_results.iter().map(|s| s.result.clone()).collect();
+    let results: Vec<super::models::SearchResult> =
+        scored_results.iter().map(|s| s.result.clone()).collect();
 
     if results.is_empty() {
         // Save to conversation history
         if !kb_id.is_empty() {
-            let answer = "知识库中没有找到相关内容。".to_string();
-            kb_repo.add_conversation(kb_id, "user", query, None, Some(chat_model), 0).await.ok();
-            kb_repo.add_conversation(kb_id, "assistant", &answer, None, Some(chat_model), 0).await.ok();
+            let answer = "RAG 中没有找到相关内容。".to_string();
+            kb_repo
+                .add_conversation(kb_id, "user", query, None, Some(chat_model), 0)
+                .await
+                .ok();
+            kb_repo
+                .add_conversation(kb_id, "assistant", &answer, None, Some(chat_model), 0)
+                .await
+                .ok();
             return Ok(RagAnswer {
                 answer,
                 sources: vec![],
@@ -137,7 +199,7 @@ pub async fn ask_with_config(
             });
         }
         return Ok(RagAnswer {
-            answer: "知识库中没有找到相关内容。".to_string(),
+            answer: "RAG 中没有找到相关内容。".to_string(),
             sources: vec![],
             usage: None,
             retrieval_details: Some(vec![]),
@@ -160,11 +222,12 @@ pub async fn ask_with_config(
         let trimmed = trim_context(&results, query, history, context_limit);
         if retriever::estimate_tokens(&trimmed.0) > context_limit {
             // Stage 2: Remove history, keep only latest message
-            let no_history = build_rag_prompt(&context, query, &history[history.len().saturating_sub(2)..]);
+            let no_history =
+                build_rag_prompt(&context, query, &history[history.len().saturating_sub(2)..]);
             if retriever::estimate_tokens(&no_history) > context_limit {
                 // Stage 3: Remove context entirely
                 let bare = format!(
-                    "注意：由于 token 限制，无法附上知识库上下文。\n\n问题: {}",
+                    "注意：由于 token 限制，无法附上 RAG 上下文。\n\n问题: {}",
                     query
                 );
                 (bare, false)
@@ -180,28 +243,31 @@ pub async fn ask_with_config(
 
     tracing::info!(
         "RAG prompt: estimated {} tokens, limit {}, context_used: {}",
-        estimated_tokens, context_limit, context_used
+        estimated_tokens,
+        context_limit,
+        context_used
     );
 
     // 6. Call LLM via proxy
     let chat_request = serde_json::json!({
         "model": chat_model,
         "messages": [
-            {"role": "system", "content": "你是知识库助手。基于检索到的知识库内容回答问题。回答要准确、简洁，并标注信息来源。如果知识库中没有相关信息，请明确说明。"},
+            {"role": "system", "content": "你是 RAG 助手。基于检索到的内容回答问题。回答要准确、简洁，并标注信息来源。如果没有相关信息，请明确说明。"},
             {"role": "user", "content": final_prompt}
         ],
         "stream": false
     });
-
+    let chat_request_str: String = serde_json::to_string(&chat_request).unwrap_or_default();
     let proxy_result = proxy::handle_request(
         &Arc::new(repo),
         app,
         "kb-internal",
-        "知识库RAG",
+        "RAG",
         chat_request,
         false,
         "chat",
-        None,
+        Some(chat_request_str),
+        Some(format!("kb-internal_{}", kb_id)),
         None,
     )
     .await;
@@ -245,8 +311,14 @@ pub async fn ask_with_config(
                         vector_score: s.vector_score,
                         keyword_score: s.keyword_score,
                         snippet: s.result.content.chars().take(200).collect(),
-                        symbol_name: meta.get("symbol_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        symbol_kind: meta.get("symbol_kind").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        symbol_name: meta
+                            .get("symbol_name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        symbol_kind: meta
+                            .get("symbol_kind")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                     }
                 })
                 .collect();
@@ -255,8 +327,21 @@ pub async fn ask_with_config(
             if !kb_id.is_empty() {
                 let sources_json = serde_json::to_string(&sources).ok();
                 let tokens = usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0);
-                kb_repo.add_conversation(kb_id, "user", query, None, Some(chat_model), 0).await.ok();
-                kb_repo.add_conversation(kb_id, "assistant", &answer, sources_json.as_deref(), Some(chat_model), tokens).await.ok();
+                kb_repo
+                    .add_conversation(kb_id, "user", query, None, Some(chat_model), 0)
+                    .await
+                    .ok();
+                kb_repo
+                    .add_conversation(
+                        kb_id,
+                        "assistant",
+                        &answer,
+                        sources_json.as_deref(),
+                        Some(chat_model),
+                        tokens,
+                    )
+                    .await
+                    .ok();
             }
 
             Ok(RagAnswer {
@@ -278,12 +363,21 @@ fn build_context(results: &[super::models::SearchResult]) -> String {
         .enumerate()
         .map(|(i, r)| {
             // 从 metadata 中提取符号信息
-            let symbol_info = r.metadata
+            let symbol_info = r
+                .metadata
                 .get("symbol_name")
                 .and_then(|n| n.as_str())
                 .map(|name| {
-                    let kind = r.metadata.get("symbol_kind").and_then(|k| k.as_str()).unwrap_or("");
-                    let sig = r.metadata.get("signature").and_then(|s| s.as_str()).unwrap_or("");
+                    let kind = r
+                        .metadata
+                        .get("symbol_kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("");
+                    let sig = r
+                        .metadata
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
                     if sig.is_empty() {
                         format!(" [{}: {}]", kind, name)
                     } else {
@@ -312,12 +406,10 @@ fn build_rag_prompt(context: &str, query: &str, history: &[ConversationMessage])
     } else {
         let h: String = history
             .iter()
-            .map(|msg| {
-                match msg.role.as_str() {
-                    "user" => format!("User: {}", msg.content),
-                    "assistant" => format!("Assistant: {}", msg.content),
-                    _ => msg.content.clone(),
-                }
+            .map(|msg| match msg.role.as_str() {
+                "user" => format!("User: {}", msg.content),
+                "assistant" => format!("Assistant: {}", msg.content),
+                _ => msg.content.clone(),
             })
             .collect::<Vec<_>>()
             .join("\n\n");
@@ -325,10 +417,10 @@ fn build_rag_prompt(context: &str, query: &str, history: &[ConversationMessage])
     };
 
     format!(
-        r#"基于以下知识库内容回答问题。如果知识库中没有相关信息，请明确说明。
+        r#"基于以下 RAG 内容回答问题。如果没有相关信息，请明确说明。
 
 规则：
-1. 只基于知识库内容回答，不要编造信息
+1. 只基于 RAG 内容回答，不要编造信息
 2. 如果是多轮对话，注意上下文连贯性
 3. 回答要准确、简洁，标注信息来源
 
@@ -352,11 +444,17 @@ fn trim_context(
     target_tokens: usize,
 ) -> (String, bool) {
     // Sort by score ascending (remove lowest first)
-    let mut indexed: Vec<(usize, &super::models::SearchResult)> = results.iter().enumerate().collect();
-    indexed.sort_by(|a, b| a.1.score.partial_cmp(&b.1.score).unwrap_or(std::cmp::Ordering::Equal));
+    let mut indexed: Vec<(usize, &super::models::SearchResult)> =
+        results.iter().enumerate().collect();
+    indexed.sort_by(|a, b| {
+        a.1.score
+            .partial_cmp(&b.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut removed = std::collections::HashSet::new();
-    let mut current_estimate = retriever::estimate_tokens(&build_rag_prompt(&build_context(results), query, history));
+    let mut current_estimate =
+        retriever::estimate_tokens(&build_rag_prompt(&build_context(results), query, history));
 
     for (idx, r) in &indexed {
         if current_estimate <= target_tokens {
@@ -392,6 +490,11 @@ pub async fn deep_research(
 ) -> Result<RagAnswer, String> {
     let repo = Repository::new(pool.clone());
     let kb_repo = KbRepository::new(pool.clone());
+    let embedding_channel_id = kb_repo
+        .get_kb(kb_id)
+        .await
+        .map_err(|e| format!("Failed to load knowledge base: {}", e))?
+        .embedding_channel_id;
 
     let mut all_findings: Vec<String> = Vec::new();
     let mut history: Vec<ConversationMessage> = Vec::new();
@@ -413,7 +516,9 @@ pub async fn deep_research(
 
 请生成下一步需要搜索的关键词或问题（直接返回查询文本，不要加引号或其他格式）:"#,
                 query = query,
-                findings = all_findings.iter().enumerate()
+                findings = all_findings
+                    .iter()
+                    .enumerate()
                     .map(|(i, f)| format!("第{}轮: {}", i + 1, f))
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -428,6 +533,8 @@ pub async fn deep_research(
                 "stream": false
             });
 
+            let follow_up_request_str: String =
+                serde_json::to_string(&follow_up_request).unwrap_or_default();
             match proxy::handle_request(
                 &Arc::new(Repository::new(pool.clone())),
                 app,
@@ -436,26 +543,33 @@ pub async fn deep_research(
                 follow_up_request,
                 false,
                 "chat",
+                Some(follow_up_request_str),
+                Some(format!("kb-research_{}", kb_id)),
                 None,
-                None,
-            ).await {
-                Ok(result) => {
-                    result.body
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or(query)
-                        .trim()
-                        .to_string()
-                }
+            )
+            .await
+            {
+                Ok(result) => result
+                    .body
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or(query)
+                    .trim()
+                    .to_string(),
                 Err(_) => query.to_string(),
             }
         };
 
         // 2. Embed and search
-        let embeddings = embedder::embed(&[round_query.clone()], embedding_model, &repo)
+        let embeddings = embedder::embed_with_channel(
+            &[round_query.clone()],
+            embedding_model,
+            &repo,
+            embedding_channel_id.as_deref(),
+        )
             .await
             .map_err(|e| format!("Embedding failed: {}", e))?;
 
@@ -463,7 +577,9 @@ pub async fn deep_research(
             break;
         }
 
-        let results = retriever::search(pool, kb_id, &embeddings[0], top_k).await.unwrap_or_default();
+        let results = retriever::search(pool, kb_id, &embeddings[0], top_k)
+            .await
+            .unwrap_or_default();
 
         if results.is_empty() && round > 0 {
             break; // No more relevant content found
@@ -473,14 +589,16 @@ pub async fn deep_research(
 
         // 3. Generate round answer
         let context = build_context(&results);
-        let findings_str = all_findings.iter().enumerate()
+        let findings_str = all_findings
+            .iter()
+            .enumerate()
             .map(|(i, f)| format!("第{}轮发现: {}", i + 1, f))
             .collect::<Vec<_>>()
             .join("\n");
 
         let round_prompt = if round == 0 {
             format!(
-                r#"你是一个深度研究助手。请分析以下知识库内容，并给出初步发现。
+                r#"你是一个深度研究助手。请分析以下 RAG 内容，并给出初步发现。
 
 原始问题: {query}
 
@@ -490,7 +608,7 @@ pub async fn deep_research(
 
 请完成：
 1. 理解问题的核心需求
-2. 从知识库中提取相关信息
+2. 从 RAG 中提取相关信息
 3. 给出初步发现
 4. 如果信息不足，指出还需要哪些方面"#,
                 query = query,
@@ -523,12 +641,13 @@ pub async fn deep_research(
         let chat_request = serde_json::json!({
             "model": chat_model,
             "messages": [
-                {"role": "system", "content": "你是深度研究助手。基于知识库内容进行多轮迭代研究，逐步深入分析。"},
+                {"role": "system", "content": "你是深度研究助手。基于 RAG 内容进行多轮迭代研究，逐步深入分析。"},
                 {"role": "user", "content": round_prompt}
             ],
             "stream": false
         });
 
+        let chat_request_str: String = serde_json::to_string(&chat_request).unwrap_or_default();
         let proxy_result = proxy::handle_request(
             &Arc::new(Repository::new(pool.clone())),
             app,
@@ -537,30 +656,36 @@ pub async fn deep_research(
             chat_request,
             false,
             "chat",
+            Some(chat_request_str),
+            Some(format!("kb-research_{}", kb_id)),
             None,
-            None,
-        ).await;
+        )
+        .await;
 
         let round_answer = match proxy_result {
-            Ok(result) => {
-                result.body
-                    .get("choices")
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("message"))
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("分析失败")
-                    .to_string()
-            }
+            Ok(result) => result
+                .body
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("分析失败")
+                .to_string(),
             Err((code, msg)) => {
                 tracing::warn!("Deep research round {} failed: {} {}", round + 1, code, msg);
                 break;
             }
         };
-
         all_findings.push(round_answer.clone());
-        history.push(ConversationMessage { role: "user".into(), content: round_query });
-        history.push(ConversationMessage { role: "assistant".into(), content: round_answer });
+        history.push(ConversationMessage {
+            role: "user".into(),
+            content: round_query,
+        });
+        history.push(ConversationMessage {
+            role: "assistant".into(),
+            content: round_answer,
+        });
 
         // Check if we have enough info (after round 2)
         if round >= 2 && round == max_rounds - 1 {
@@ -569,7 +694,9 @@ pub async fn deep_research(
     }
 
     // Final synthesis
-    let findings_summary = all_findings.iter().enumerate()
+    let findings_summary = all_findings
+        .iter()
+        .enumerate()
         .map(|(i, f)| format!("### 第{}轮发现\n{}", i + 1, f))
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -596,6 +723,7 @@ pub async fn deep_research(
         "stream": false
     });
 
+    let final_request_str: String = serde_json::to_string(&final_request).unwrap_or_default();
     let proxy_result = proxy::handle_request(
         &Arc::new(repo),
         app,
@@ -604,13 +732,16 @@ pub async fn deep_research(
         final_request,
         false,
         "chat",
+        Some(final_request_str),
+        Some(format!("kb-research_{}", kb_id)),
         None,
-        None,
-    ).await;
+    )
+    .await;
 
     match proxy_result {
         Ok(result) => {
-            let answer = result.body
+            let answer = result
+                .body
                 .get("choices")
                 .and_then(|c| c.get(0))
                 .and_then(|c| c.get("message"))
@@ -641,8 +772,21 @@ pub async fn deep_research(
             if !kb_id.is_empty() {
                 let sources_json = serde_json::to_string(&sources).ok();
                 let tokens = usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0);
-                kb_repo.add_conversation(kb_id, "user", query, None, Some(chat_model), 0).await.ok();
-                kb_repo.add_conversation(kb_id, "assistant", &answer, sources_json.as_deref(), Some(chat_model), tokens).await.ok();
+                kb_repo
+                    .add_conversation(kb_id, "user", query, None, Some(chat_model), 0)
+                    .await
+                    .ok();
+                kb_repo
+                    .add_conversation(
+                        kb_id,
+                        "assistant",
+                        &answer,
+                        sources_json.as_deref(),
+                        Some(chat_model),
+                        tokens,
+                    )
+                    .await
+                    .ok();
             }
 
             Ok(RagAnswer {

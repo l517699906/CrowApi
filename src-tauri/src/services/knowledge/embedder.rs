@@ -10,6 +10,15 @@ pub async fn embed(
     model: &str,
     repo: &Repository,
 ) -> Result<Vec<Vec<f32>>, String> {
+    embed_with_channel(texts, model, repo, None).await
+}
+
+pub async fn embed_with_channel(
+    texts: &[String],
+    model: &str,
+    repo: &Repository,
+    preferred_channel_id: Option<&str>,
+) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
         return Ok(vec![]);
     }
@@ -20,15 +29,31 @@ pub async fn embed(
         .await
         .map_err(|e| format!("Failed to get channels: {}", e))?;
 
-    // Select channels that support this model (same logic as dispatcher)
-    let selected = Dispatcher::select_channels(&channels, model);
-
-    let candidates = if selected.is_empty() {
-        // Fallback: try all enabled channels
-        channels.clone()
+    let candidates = if let Some(channel_id) = preferred_channel_id.filter(|id| !id.is_empty()) {
+        let channel = channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
+            .ok_or_else(|| format!("Configured embedding channel is unavailable: {}", channel_id))?;
+        if !supports_embeddings(channel) {
+            return Err(format!(
+                "Configured channel {} is not OpenAI-compatible and cannot provide embeddings",
+                channel.name,
+            ));
+        }
+        vec![channel.clone()]
     } else {
-        selected
+        Dispatcher::select_channels(&channels, model)
+            .into_iter()
+            .filter(|channel| supports_embeddings(channel))
+            .collect()
     };
+
+    if candidates.is_empty() {
+        return Err(format!(
+            "No OpenAI-compatible channel declares embedding model: {}",
+            model,
+        ));
+    }
 
     for channel in &candidates {
         match try_embed_with_channel(texts, model, channel).await {
@@ -66,7 +91,8 @@ async fn try_embed_with_channel(
     let base_url = channel.base_url.trim_end_matches('/');
 
     // Apply model mapping if configured
-    let actual_model = apply_model_mapping(model, &channel.model_mapping);
+    let mapping = serde_json::from_str(&channel.model_mapping).unwrap_or_default();
+    let actual_model = crate::adaptor::resolve_model_mapping(model, &mapping);
 
     let url = format!("{}/embeddings", base_url);
     let body = serde_json::json!({
@@ -81,7 +107,7 @@ async fn try_embed_with_channel(
         .header("Authorization", format!("Bearer {}", channel.api_key))
         .header("Content-Type", "application/json")
         .json(&body)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(channel.timeout_secs.max(1) as u64))
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
@@ -140,16 +166,45 @@ async fn try_embed_with_channel(
     Ok(embeddings)
 }
 
-fn apply_model_mapping(model: &str, mapping_json: &str) -> String {
-    if mapping_json.is_empty() || mapping_json == "{}" {
-        return model.to_string();
-    }
-    let mapping: serde_json::Value = serde_json::from_str(mapping_json).unwrap_or_default();
-    if let Some(mapped) = mapping.get(model).and_then(|m| m.as_str()) {
-        return mapped.to_string();
-    }
-    model.to_string()
+fn supports_embeddings(channel: &Channel) -> bool {
+    matches!(channel.channel_type.as_str(), "openai" | "custom")
 }
 
 // Re-export Dispatcher for select_channels
 use crate::core::dispatcher::Dispatcher;
+
+#[cfg(test)]
+mod tests {
+    use super::supports_embeddings;
+    use crate::db::models::Channel;
+
+    fn channel(channel_type: &str) -> Channel {
+        Channel {
+            id: "channel-1".to_string(),
+            name: "test".to_string(),
+            channel_type: channel_type.to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            api_key: "secret".to_string(),
+            models: "[]".to_string(),
+            status: 1,
+            priority: 0,
+            weight: 1,
+            config: "{}".to_string(),
+            model_mapping: "{}".to_string(),
+            timeout_secs: 60,
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_test_at: None,
+            last_test_ok: None,
+        }
+    }
+
+    #[test]
+    fn only_openai_compatible_channels_are_embedding_candidates() {
+        assert!(supports_embeddings(&channel("openai")));
+        assert!(supports_embeddings(&channel("custom")));
+        assert!(!supports_embeddings(&channel("claude")));
+        assert!(!supports_embeddings(&channel("gemini")));
+        assert!(!supports_embeddings(&channel("deepseek")));
+    }
+}

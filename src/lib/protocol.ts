@@ -10,6 +10,7 @@ export interface ProtocolMeta {
 
 const PROTOCOLS: Record<string, ProtocolMeta> = {
     chat: { label: "OpenAI Chat", shortLabel: "Chat", tone: "chat" },
+    completion: { label: "OpenAI Completions", shortLabel: "Completions", tone: "chat" },
     anthropic: { label: "Anthropic Messages", shortLabel: "Messages", tone: "anthropic" },
     responses: { label: "OpenAI Responses", shortLabel: "Responses", tone: "responses" },
     embedding: { label: "OpenAI Embeddings", shortLabel: "Embeddings", tone: "embedding" },

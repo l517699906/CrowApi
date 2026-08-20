@@ -6,11 +6,13 @@ import {
     ChevronRight,
     Clock3,
     Download,
+    Eraser,
     FilterX,
     FileJson2,
     Search,
     ShieldAlert,
     TableProperties,
+    Trash2,
     TriangleAlert,
 } from "lucide-react";
 import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -23,7 +25,7 @@ import { errorMessage, queryKeys } from "../lib/query";
 import type { GetLogsInput, RequestLog } from "../types";
 import { LogDetailDrawer } from "../components/LogDetailDrawer";
 import { LogRiskBadge } from "../components/LogRiskBadge";
-import { PageTitle, StatusBadge, Toast } from "../components/ui";
+import { Modal, PageTitle, StatusBadge, Toast } from "../components/ui";
 
 const PAGE_SIZE = 50;
 const LIVE_BATCH_SIZE = 200;
@@ -146,6 +148,9 @@ export function LogsPage() {
     const [pendingLiveLogs, setPendingLiveLogs] = useState(0);
     const [exportingFormat, setExportingFormat] = useState<"csv" | "json" | null>(null);
     const [toast, setToast] = useState("");
+    const [maintenanceOpen, setMaintenanceOpen] = useState(false);
+    const [maintenanceDate, setMaintenanceDate] = useState("");
+    const [maintenanceBusy, setMaintenanceBusy] = useState<"before" | "all" | null>(null);
     const queryClient = useQueryClient();
     const logsQueryKey = useMemo(
         () => [...queryKeys.logs, "paged", appliedFilters] as const,
@@ -551,11 +556,64 @@ export function LogsPage() {
         }
     };
 
+    const resetLogView = async () => {
+        syncedSeqRef.current = 0;
+        targetSeqRef.current = 0;
+        liveSyncAgainRef.current = false;
+        setPendingLiveLogs(0);
+        setSelectedLog(null);
+        setSelectedLogIds(new Set());
+        await queryClient.invalidateQueries({ queryKey: queryKeys.logs });
+    };
+
+    const deleteBeforeDate = async () => {
+        if (!maintenanceDate) {
+            setToast("请选择日期");
+            window.setTimeout(() => setToast(""), 2200);
+            return;
+        }
+        setMaintenanceBusy("before");
+        try {
+            const before = new Date(`${maintenanceDate}T00:00:00`).toISOString();
+            const deleted = await logApi.deleteBefore(before);
+            await resetLogView();
+            setMaintenanceOpen(false);
+            setToast(`已删除 ${formatNumber(deleted)} 条历史日志`);
+            window.setTimeout(() => setToast(""), 2200);
+        } catch (error) {
+            setToast(errorMessage(error));
+            window.setTimeout(() => setToast(""), 2600);
+        } finally {
+            setMaintenanceBusy(null);
+        }
+    };
+
+    const deleteAllLogs = async () => {
+        setMaintenanceBusy("all");
+        try {
+            const deleted = await logApi.deleteAll();
+            await resetLogView();
+            setMaintenanceOpen(false);
+            setToast(`已清空 ${formatNumber(deleted)} 条日志`);
+            window.setTimeout(() => setToast(""), 2200);
+        } catch (error) {
+            setToast(errorMessage(error));
+            window.setTimeout(() => setToast(""), 2600);
+        } finally {
+            setMaintenanceBusy(null);
+        }
+    };
+
     return (
         <div className="page-enter">
             <PageTitle
                 title="请求日志"
                 meta={`已加载 ${formatNumber(logs.length)} 条 · 每页 ${PAGE_SIZE} 条`}
+                action={(
+                    <button type="button" className="button-secondary" onClick={() => setMaintenanceOpen(true)}>
+                        <Eraser size={15} />日志管理
+                    </button>
+                )}
             />
 
             <form className="toolbar-row log-filter-bar" onSubmit={applyFilters}>
@@ -774,6 +832,36 @@ export function LogsPage() {
             </section>
 
             {selectedLog ? <LogDetailDrawer log={selectedLog} onClose={() => setSelectedLog(null)} /> : null}
+            {maintenanceOpen ? (
+                <Modal
+                    title="日志管理"
+                    description="清理操作会删除本地请求日志，且无法恢复。"
+                    size="sm"
+                    onClose={() => { if (!maintenanceBusy) setMaintenanceOpen(false); }}
+                    footer={<button type="button" className="button-secondary" disabled={maintenanceBusy !== null} onClick={() => setMaintenanceOpen(false)}>取消</button>}
+                >
+                    <div className="space-y-5">
+                        <label className="field-label">
+                            <span>删除此日期之前的日志</span>
+                            <input
+                                className="field-input"
+                                type="date"
+                                value={maintenanceDate}
+                                onChange={(event) => setMaintenanceDate(event.target.value)}
+                            />
+                        </label>
+                        <button type="button" className="button-secondary w-full justify-center" disabled={maintenanceBusy !== null || !maintenanceDate} onClick={() => void deleteBeforeDate()}>
+                            {maintenanceBusy === "before" ? <span className="button-spinner" /> : <Trash2 size={15} />}删除指定日期之前
+                        </button>
+                        <div className="border-t border-line pt-4">
+                            <p className="mb-2 text-xs text-muted">清空全部日志会立即重置实时日志游标。</p>
+                            <button type="button" className="button-danger w-full justify-center" disabled={maintenanceBusy !== null} onClick={() => void deleteAllLogs()}>
+                                {maintenanceBusy === "all" ? <span className="button-spinner is-inverse" /> : <Trash2 size={15} />}清空全部日志
+                            </button>
+                        </div>
+                    </div>
+                </Modal>
+            ) : null}
             {toast ? <Toast message={toast} /> : null}
         </div>
     );

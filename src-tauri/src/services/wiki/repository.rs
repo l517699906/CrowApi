@@ -3,6 +3,32 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 use chrono::Utc;
 
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn content_snippet(content: &str, query: &str) -> String {
+    let lower_content = content.to_lowercase();
+    let lower_query = query.to_lowercase();
+    let position = if lower_query.is_empty() {
+        None
+    } else {
+        lower_content.find(&lower_query)
+    };
+    let start_hint = position.unwrap_or(0).min(content.len());
+    let start = content.floor_char_boundary(start_hint.saturating_sub(60));
+    let end = content.ceil_char_boundary(start.saturating_add(200).min(content.len()));
+    let snippet = content[start..end].replace('\n', " ");
+    if position.is_some() {
+        format!("...{}...", snippet)
+    } else {
+        snippet
+    }
+}
+
 pub struct WikiRepository {
     pool: SqlitePool,
 }
@@ -41,6 +67,10 @@ impl WikiRepository {
 
     pub async fn create_project(&self, input: &CreateProjectInput, wiki_dir: &str) -> Result<WikiProject, String> {
         let id = Self::uuid();
+        self.create_project_with_id(&id, input, wiki_dir).await
+    }
+
+    pub async fn create_project_with_id(&self, id: &str, input: &CreateProjectInput, wiki_dir: &str) -> Result<WikiProject, String> {
         let now = Self::now();
         let schema = input.schema_text.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
 
@@ -143,16 +173,17 @@ impl WikiRepository {
         token_count: i64,
         wikilinks: &str,
         frontmatter: &str,
+        tags: &str,
     ) -> Result<(), String> {
         let now = Self::now();
         sqlx::query(
-            "INSERT INTO wiki_pages (id, project_id, path, title, page_type, content_hash, token_count, wikilinks, frontmatter, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            "INSERT INTO wiki_pages (id, project_id, path, title, page_type, content_hash, token_count, wikilinks, frontmatter, tags, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
              ON CONFLICT(project_id, path) DO UPDATE SET
                title=excluded.title, page_type=excluded.page_type,
                content_hash=excluded.content_hash, token_count=excluded.token_count,
                wikilinks=excluded.wikilinks, frontmatter=excluded.frontmatter,
-               status='active', updated_at=excluded.updated_at"
+               tags=excluded.tags, status='active', updated_at=excluded.updated_at"
         )
         .bind(Self::uuid())
         .bind(project_id)
@@ -163,6 +194,7 @@ impl WikiRepository {
         .bind(token_count)
         .bind(wikilinks)
         .bind(frontmatter)
+        .bind(tags)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -182,13 +214,14 @@ impl WikiRepository {
     }
 
     pub async fn search_pages(&self, project_id: &str, query: &str, top_k: usize) -> Result<Vec<WikiSearchResult>, String> {
-        // Try FTS5 full-text search first, fallback to LIKE
-        let pattern = format!("%{}%", query);
+        // The current schema has no FTS table. Escape wildcard characters so
+        // literal searches cannot broaden the result set unexpectedly.
+        let pattern = format!("%{}%", escape_like_pattern(query));
 
         // First try LIKE on title and path for quick matches
         let like_rows = sqlx::query_as::<_, WikiPage>(
             "SELECT * FROM wiki_pages WHERE project_id = ? AND status = 'active'
-             AND (title LIKE ? OR path LIKE ?)
+             AND (title LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')
              ORDER BY title LIMIT ?"
         )
         .bind(project_id)
@@ -232,11 +265,7 @@ impl WikiRepository {
                     let content_lower = content.to_lowercase();
                     let query_lower = query.to_lowercase();
                     if content_lower.contains(&query_lower) {
-                        // Extract snippet around match
-                        let pos = content_lower.find(&query_lower).unwrap_or(0);
-                        let start = if pos > 60 { pos - 60 } else { 0 };
-                        let end = std::cmp::min(start + 200, content.len());
-                        let snippet = format!("...{}...", &content[start..end].replace('\n', " "));
+                        let snippet = content_snippet(&content, query);
 
                         results.push(WikiSearchResult {
                             page_id: page.id.clone(),
@@ -257,16 +286,7 @@ impl WikiRepository {
             // Add snippets for LIKE matches too
             for r in &mut results {
                 if let Ok(content) = crate::services::wiki::project::read_page(project_id, &r.path).await {
-                    let content_lower = content.to_lowercase();
-                    let query_lower = query.to_lowercase();
-                    if let Some(pos) = content_lower.find(&query_lower) {
-                        let start = if pos > 60 { pos - 60 } else { 0 };
-                        let end = std::cmp::min(start + 200, content.len());
-                        r.snippet = format!("...{}...", &content[start..end].replace('\n', " "));
-                    } else {
-                        // Use first 200 chars as snippet
-                        r.snippet = content.chars().take(200).collect::<String>();
-                    }
+                    r.snippet = content_snippet(&content, query);
                 }
             }
         }
@@ -282,6 +302,16 @@ impl WikiRepository {
         )
         .bind(project_id)
         .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))
+    }
+
+    pub async fn get_source(&self, source_id: &str) -> Result<WikiSource, String> {
+        sqlx::query_as::<_, WikiSource>(
+            "SELECT * FROM wiki_sources WHERE id = ?"
+        )
+        .bind(source_id)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| format!("DB error: {}", e))
     }
@@ -390,32 +420,6 @@ impl WikiRepository {
         .map_err(|e| format!("DB error: {}", e))
     }
 
-    // ── Reviews ──
-
-    pub async fn list_reviews(&self, project_id: &str, resolved: Option<bool>) -> Result<Vec<WikiReview>, String> {
-        let query = match resolved {
-            None => "SELECT * FROM wiki_reviews WHERE project_id = ? ORDER BY created_at DESC",
-            Some(false) => "SELECT * FROM wiki_reviews WHERE project_id = ? AND resolved = 0 ORDER BY created_at DESC",
-            Some(true) => "SELECT * FROM wiki_reviews WHERE project_id = ? AND resolved = 1 ORDER BY created_at DESC",
-        };
-        sqlx::query_as::<_, WikiReview>(query)
-            .bind(project_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| format!("DB error: {}", e))
-    }
-
-    pub async fn resolve_review(&self, review_id: &str) -> Result<(), String> {
-        let now = Self::now();
-        sqlx::query("UPDATE wiki_reviews SET resolved = 1, resolved_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(review_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-        Ok(())
-    }
-
     // ── Sessions ──
 
     pub async fn list_sessions(&self, project_id: &str) -> Result<Vec<WikiSession>, String> {
@@ -457,6 +461,39 @@ impl WikiRepository {
         Ok(())
     }
 
+    // ── Tags ──
+
+    pub async fn get_tags(&self, project_id: &str, limit: usize) -> Result<Vec<crate::services::wiki::models::WikiTag>, String> {
+        // Collect tags from all active pages in the project
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT tags FROM wiki_pages WHERE project_id = ? AND status = 'active'"
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+
+        let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (tags_json,) in &rows {
+            let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+            for tag in tags {
+                let tag = tag.trim().to_lowercase();
+                if !tag.is_empty() {
+                    *freq.entry(tag).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut freq_vec: Vec<(String, usize)> = freq.into_iter().collect();
+        freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+        Ok(freq_vec
+            .into_iter()
+            .take(limit)
+            .map(|(word, count)| crate::services::wiki::models::WikiTag { word, count })
+            .collect())
+    }
+
     // ── Graph ──
 
     pub async fn get_graph(&self, project_id: &str) -> Result<GraphData, String> {
@@ -474,7 +511,7 @@ impl WikiRepository {
         }).collect();
 
         let edges_rows = sqlx::query_as::<_, WikiGraphEdgeRow>(
-            "SELECT * FROM wiki_graph_edges WHERE project_id = ? ORDER BY weight DESC"
+            "SELECT source_page, target_page, edge_type, weight FROM wiki_graph_edges WHERE project_id = ? ORDER BY weight DESC"
         )
         .bind(project_id)
         .fetch_all(&self.pool)
@@ -500,7 +537,7 @@ impl WikiRepository {
         .bind(project_id)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(0);
+        .map_err(|e| format!("DB error: {}", e))?;
 
         let source_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM wiki_sources WHERE project_id = ? AND status = 'ingested'"
@@ -508,7 +545,7 @@ impl WikiRepository {
         .bind(project_id)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(0);
+        .map_err(|e| format!("DB error: {}", e))?;
 
         let review_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM wiki_reviews WHERE project_id = ? AND resolved = 0"
@@ -516,7 +553,7 @@ impl WikiRepository {
         .bind(project_id)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(0);
+        .map_err(|e| format!("DB error: {}", e))?;
 
         let page_types: Vec<(String, i64)> = sqlx::query_as(
             "SELECT page_type, COUNT(*) as cnt FROM wiki_pages WHERE project_id = ? AND status = 'active' GROUP BY page_type"
@@ -524,7 +561,7 @@ impl WikiRepository {
         .bind(project_id)
         .fetch_all(&self.pool)
         .await
-        .unwrap_or_default();
+        .map_err(|e| format!("DB error: {}", e))?;
 
         let type_map: serde_json::Map<String, serde_json::Value> = page_types.into_iter()
             .map(|(t, c)| (t, serde_json::Value::Number(c.into())))
@@ -539,15 +576,30 @@ impl WikiRepository {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{content_snippet, escape_like_pattern};
+
+    #[test]
+    fn like_patterns_escape_sql_wildcards() {
+        assert_eq!(escape_like_pattern("50%_done\\"), "50\\%\\_done\\\\");
+    }
+
+    #[test]
+    fn snippets_preserve_utf8_boundaries() {
+        let content = "前置内容 ".repeat(40) + "目标词" + &" 后续内容".repeat(40);
+        let snippet = content_snippet(&content, "目标词");
+        assert!(snippet.contains("目标词"));
+        assert!(std::str::from_utf8(snippet.as_bytes()).is_ok());
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct WikiGraphEdgeRow {
-    id: String,
-    project_id: String,
     source_page: String,
     target_page: String,
     edge_type: String,
     weight: f64,
-    created_at: String,
 }
 
 pub const DEFAULT_SCHEMA: &str = r#"# Wiki Schema

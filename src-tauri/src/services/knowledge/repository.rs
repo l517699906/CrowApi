@@ -32,8 +32,8 @@ impl KbRepository {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
-            "INSERT INTO kb_knowledge_bases (id, name, description, status, doc_count, chunk_count, total_tokens, embedding_model, embedding_channel_id, mcp_enabled, chunk_size, chunk_overlap, excluded_dirs, excluded_files, included_files, embedding_dim, index_status, created_at, updated_at)
-             VALUES (?, ?, ?, 1, 0, 0, 0, ?, ?, 1, 512, 64, '', '', '', 0, 'none', ?, ?)"
+            "INSERT INTO kb_knowledge_bases (id, name, description, status, doc_count, chunk_count, total_tokens, embedding_model, embedding_channel_id, mcp_enabled, chunk_size, chunk_overlap, excluded_dirs, excluded_files, included_files, embedding_dim, index_status, embedding_batch_size, created_at, updated_at)
+             VALUES (?, ?, ?, 1, 0, 0, 0, ?, ?, 1, 512, 64, '', '', '', 0, 'none', 32, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
@@ -86,6 +86,9 @@ impl KbRepository {
         if let Some(included_files) = &input.included_files {
             q.push(", included_files = ").push_bind(included_files);
         }
+        if let Some(embedding_batch_size) = input.embedding_batch_size {
+            q.push(", embedding_batch_size = ").push_bind(embedding_batch_size.max(1));
+        }
 
         q.push(" WHERE id = ").push_bind(id);
         q.build().execute(&self.pool).await?;
@@ -102,29 +105,18 @@ impl KbRepository {
     }
 
     pub async fn update_kb_counts(&self, kb_id: &str) -> Result<(), sqlx::Error> {
-        let doc_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_documents WHERE kb_id = ?")
-            .bind(kb_id)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-
-        let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_chunks WHERE kb_id = ?")
-            .bind(kb_id)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-
-        let total_tokens: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(token_count), 0) FROM kb_chunks WHERE kb_id = ?")
-            .bind(kb_id)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-
         let now = now_iso();
-        sqlx::query("UPDATE kb_knowledge_bases SET doc_count = ?, chunk_count = ?, total_tokens = ?, updated_at = ? WHERE id = ?")
-            .bind(doc_count)
-            .bind(chunk_count)
-            .bind(total_tokens)
+        sqlx::query(
+            "UPDATE kb_knowledge_bases
+             SET doc_count = (SELECT COUNT(*) FROM kb_documents WHERE kb_id = ?),
+                 chunk_count = (SELECT COUNT(*) FROM kb_chunks WHERE kb_id = ?),
+                 total_tokens = (SELECT COALESCE(SUM(token_count), 0) FROM kb_chunks WHERE kb_id = ?),
+                 updated_at = ?
+             WHERE id = ?"
+        )
+            .bind(kb_id)
+            .bind(kb_id)
+            .bind(kb_id)
             .bind(&now)
             .bind(kb_id)
             .execute(&self.pool)
@@ -201,27 +193,68 @@ impl KbRepository {
         self.get_document(&id).await
     }
 
-    pub async fn create_document_with_source(&self, kb_id: &str, filename: &str, file_path: Option<&str>, file_type: &str, file_size: i64, content_hash: &str, source_type: &str, source_url: Option<&str>, source_path: Option<&str>) -> Result<KbDocument, sqlx::Error> {
+    pub async fn create_document_with_source(
+        &self,
+        kb_id: &str,
+        filename: &str,
+        file_path: Option<&str>,
+        file_type: &str,
+        file_size: i64,
+        content_hash: &str,
+        source_id: Option<&str>,
+        source_type: &str,
+        source_url: Option<&str>,
+        source_path: Option<&str>,
+    ) -> Result<KbDocument, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
-        sqlx::query(
-            "INSERT INTO kb_documents (id, kb_id, filename, file_path, file_type, file_size, content_hash, chunk_count, token_count, status, source_type, source_url, source_path, doc_meta, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'pending', ?, ?, ?, '{}', ?, ?)"
-        )
-        .bind(&id)
-        .bind(kb_id)
-        .bind(filename)
-        .bind(file_path)
-        .bind(file_type)
-        .bind(file_size)
-        .bind(content_hash)
-        .bind(source_type)
-        .bind(source_url)
-        .bind(source_path)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        let result = if let Some(source_id) = source_id {
+            sqlx::query(
+                "INSERT INTO kb_documents (id, kb_id, filename, file_path, file_type, file_size, content_hash, chunk_count, token_count, status, source_id, source_type, source_url, source_path, doc_meta, created_at, updated_at)
+                 SELECT ?, ?, ?, ?, ?, ?, ?, 0, 0, 'pending', ?, ?, ?, ?, '{}', ?, ?
+                 FROM kb_sources
+                 WHERE id = ? AND kb_id = ?"
+            )
+            .bind(&id)
+            .bind(kb_id)
+            .bind(filename)
+            .bind(file_path)
+            .bind(file_type)
+            .bind(file_size)
+            .bind(content_hash)
+            .bind(source_id)
+            .bind(source_type)
+            .bind(source_url)
+            .bind(source_path)
+            .bind(&now)
+            .bind(&now)
+            .bind(source_id)
+            .bind(kb_id)
+            .execute(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "INSERT INTO kb_documents (id, kb_id, filename, file_path, file_type, file_size, content_hash, chunk_count, token_count, status, source_id, source_type, source_url, source_path, doc_meta, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'pending', NULL, ?, ?, ?, '{}', ?, ?)"
+            )
+            .bind(&id)
+            .bind(kb_id)
+            .bind(filename)
+            .bind(file_path)
+            .bind(file_type)
+            .bind(file_size)
+            .bind(content_hash)
+            .bind(source_type)
+            .bind(source_url)
+            .bind(source_path)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?
+        };
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
 
         self.get_document(&id).await
     }
@@ -266,9 +299,11 @@ impl KbRepository {
         let symbol_name = meta.get("symbol_name").and_then(|v| v.as_str());
         let symbol_kind = meta.get("symbol_kind").and_then(|v| v.as_str());
 
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO kb_chunks (id, doc_id, kb_id, chunk_index, content, token_count, embedding, embedding_dim, metadata, symbol_name, symbol_kind, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+             FROM kb_documents
+             WHERE id = ? AND kb_id = ?"
         )
         .bind(&chunk.id)
         .bind(&chunk.doc_id)
@@ -282,8 +317,13 @@ impl KbRepository {
         .bind(symbol_name)
         .bind(symbol_kind)
         .bind(&chunk.created_at)
+        .bind(&chunk.doc_id)
+        .bind(&chunk.kb_id)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
         Ok(())
     }
 
@@ -468,11 +508,54 @@ impl KbRepository {
     }
 
     pub async fn delete_source(&self, id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM kb_sources WHERE id = ?")
+        let (kb_id,): (String,) = sqlx::query_as("SELECT kb_id FROM kb_sources WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await?;
-        Ok(())
+        self.delete_source_with_documents(&kb_id, id).await.map(|_| ())
+    }
+
+    /// Delete an import source and all documents created by that source in a
+    /// single database transaction. Existing documents without source_id are
+    /// intentionally left untouched because they cannot be mapped reliably.
+    pub async fn delete_source_with_documents(
+        &self,
+        kb_id: &str,
+        source_id: &str,
+    ) -> Result<Vec<KbDocument>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let documents = sqlx::query_as::<_, KbDocument>(
+            "SELECT * FROM kb_documents WHERE kb_id = ? AND source_id = ?"
+        )
+        .bind(kb_id)
+        .bind(source_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM kb_chunks WHERE doc_id IN (
+                SELECT id FROM kb_documents WHERE kb_id = ? AND source_id = ?
+            )"
+        )
+        .bind(kb_id)
+        .bind(source_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM kb_documents WHERE kb_id = ? AND source_id = ?")
+            .bind(kb_id)
+            .bind(source_id)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM kb_sources WHERE id = ? AND kb_id = ?")
+            .bind(source_id)
+            .bind(kb_id)
+            .execute(&mut *tx)
+            .await?;
+        if deleted.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        tx.commit().await?;
+        Ok(documents)
     }
 
     // ==================== Index Meta ====================

@@ -1,12 +1,13 @@
 pub mod knowledge;
 pub mod mcp;
+pub mod wiki;
 
+use crate::server::router::SharedState;
+use crate::AppState;
 use async_trait::async_trait;
 use axum::Router;
 use serde::Serialize;
 use std::sync::Arc;
-use crate::AppState;
-use crate::server::router::SharedState;
 
 /// Service trait — all services implement this interface
 #[async_trait]
@@ -47,6 +48,7 @@ impl ServiceRegistry {
         let mut registry = Self { services: vec![] };
         registry.register(Box::new(knowledge::KnowledgeService));
         registry.register(Box::new(mcp::McpService));
+        registry.register(Box::new(wiki::WikiService));
         registry
     }
 

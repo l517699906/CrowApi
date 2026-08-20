@@ -1,22 +1,23 @@
+use crate::db::repository::Repository;
+use crate::server::router::SharedState;
+use crate::services::knowledge::{embedder, rag, repository::KbRepository, retriever};
+use crate::services::wiki::{handlers as wiki_handlers, project as wiki_project, repository::WikiRepository, ingest as wiki_ingest};
 use axum::{
-    extract::{State, Query},
-    http::{StatusCode, header},
-    response::{Json, IntoResponse, Response},
     body::Body,
+    extract::{Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::{Emitter, Manager};
 use tokio::sync::{mpsc, RwLock};
-use crate::server::router::SharedState;
-use crate::db::repository::Repository;
-use crate::services::knowledge::{repository::KbRepository, embedder, retriever, rag};
-use tauri::{Manager, Emitter};
 
 /// MCP server instructions — agent 首次连接时注入 system prompt
-const MCP_INSTRUCTIONS: &str = r#"# CrowAPI 知识库 — 本地 RAG + 向量检索
+const MCP_INSTRUCTIONS: &str = r#"# CrowAPI RAG — 本地向量检索
 
-知识库已预建索引：文档已解析、分块、向量化并存入本地 SQLite + HNSW 索引。
+RAG 已预建索引：文档已解析、分块、向量化并存入本地 SQLite + HNSW 索引。
 所有检索都是本地操作，亚秒级响应。
 
 ## 工具使用优先级
@@ -27,7 +28,7 @@ const MCP_INSTRUCTIONS: &str = r#"# CrowAPI 知识库 — 本地 RAG + 向量检
 2. **search_knowledge_base** — 当需要看原始文本片段，或 ask_knowledge_base 回答不够时使用。
    返回匹配的 chunk 原文 + 相似度分数。
 
-3. **list_knowledge_bases** — 首次使用时调用一次，获取可用知识库 ID。
+3. **list_knowledge_bases** — 首次使用时调用一次，获取可用 RAG ID。
    之后无需重复调用。
 
 4. **其他工具** — 按需使用（上传文档、管理索引等）。
@@ -40,7 +41,7 @@ const MCP_INSTRUCTIONS: &str = r#"# CrowAPI 知识库 — 本地 RAG + 向量检
 
 ## 代码文件
 
-知识库中的代码文件按符号边界分块（函数/类/方法），每个 chunk 是完整符号。
+RAG 中的代码文件按符号边界分块（函数/类/方法），每个 chunk 是完整符号。
 chunk metadata 包含 symbol_name、symbol_kind、signature，可用于精确过滤。"#;
 
 // ── Session management for SSE transport ──────────────────────────
@@ -50,7 +51,8 @@ chunk metadata 包含 symbol_name、symbol_kind、signature，可用于精确过
 type SessionSender = mpsc::UnboundedSender<String>;
 
 fn sse_sessions() -> &'static Arc<RwLock<HashMap<String, SessionSender>>> {
-    static SESSIONS: std::sync::OnceLock<Arc<RwLock<HashMap<String, SessionSender>>>> = std::sync::OnceLock::new();
+    static SESSIONS: std::sync::OnceLock<Arc<RwLock<HashMap<String, SessionSender>>>> =
+        std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 
@@ -87,11 +89,21 @@ pub struct McpError {
 
 impl McpResponse {
     pub fn success(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn error(id: Option<serde_json::Value>, code: i32, message: String) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, result: None, error: Some(McpError { code, message }) }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(McpError { code, message }),
+        }
     }
 
     pub fn to_json_string(&self) -> String {
@@ -204,16 +216,15 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id"]
             }
         }),
-
         // ── Write tools: Knowledge Base lifecycle ──────────────────
         serde_json::json!({
             "name": "create_knowledge_base",
-            "description": "创建新知识库。⚠️ 使用前请先调用 list_knowledge_bases 查看已有知识库，避免重复创建。仅当用户明确要求创建新库，或现有库都不适用时才创建。创建后可通过 upload_document 或 import_source 添加内容。",
+            "description": "创建新 RAG 知识库。⚠️ 使用前请先调用 list_knowledge_bases 查看已有知识库，避免重复创建。仅当用户明确要求创建新库，或现有库都不适用时才创建。创建后可通过 upload_document 或 import_source 添加内容。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "知识库名称（1-100字符）" },
-                    "description": { "type": "string", "description": "知识库用途描述（可选）" },
+                    "name": { "type": "string", "description": "RAG 名称（1-100字符）" },
+                    "description": { "type": "string", "description": "RAG 用途描述（可选）" },
                     "embedding_model": { "type": "string", "description": "嵌入模型（默认: text-embedding-3-small）" },
                     "embedding_channel_id": { "type": "string", "description": "自定义嵌入渠道 ID（可选）" }
                 },
@@ -249,15 +260,14 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id"]
             }
         }),
-
         // ── Write tools: Document management ───────────────────────
         serde_json::json!({
             "name": "upload_document",
-            "description": "上传文档到知识库。⚠️ 如果未指定 kb_id，将返回已有知识库列表供选择——请先调用 list_knowledge_bases 让用户选择目标库，或确认创建新库。文档上传后会自动解析、分块、向量化并建立索引。支持格式: .txt .md .pdf .docx .doc .pptx .xlsx .csv .json .html .rs .py .js .ts .go .java .c .cpp .h .sh .yaml .yml .toml",
+            "description": "上传文档到 RAG。⚠️ 如果未指定 kb_id，将返回已有知识库列表供选择——请先调用 list_knowledge_bases 让用户选择目标库，或确认创建新库。文档上传后会自动解析、分块、向量化并建立索引。支持格式: .txt .md .pdf .docx .doc .pptx .xlsx .csv .json .html .rs .py .js .ts .go .java .c .cpp .h .sh .yaml .yml .toml",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kb_id": { "type": "string", "description": "目标知识库 ID。如果未提供，将返回已有知识库列表供用户选择" },
+                    "kb_id": { "type": "string", "description": "目标 RAG ID。如果未提供，将返回已有知识库列表供用户选择" },
                     "filename": { "type": "string", "description": "文档文件名（含扩展名，如 'report.pdf'）" },
                     "content": { "type": "string", "description": "Base64 编码的文件内容" }
                 },
@@ -287,7 +297,6 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id"]
             }
         }),
-
         // ── Write tools: Index management ──────────────────────────
         serde_json::json!({
             "name": "build_index",
@@ -300,7 +309,6 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id"]
             }
         }),
-
         // ── Write tools: Source import ─────────────────────────────
         serde_json::json!({
             "name": "import_source",
@@ -322,19 +330,221 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id", "source_type"]
             }
         }),
+        // ── Wiki tools: Project management ──────────────────────────
+        serde_json::json!({
+            "name": "list_wiki_projects",
+            "description": "列出所有 Wiki 项目。返回项目 ID、名称、页面数、源数、描述。Wiki 是结构化知识库，页面按 frontmatter 组织，支持标签、图谱、问答。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "get_wiki_project",
+            "description": "获取 Wiki 项目详情：统计信息、标签、页面概览。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        // ── Wiki tools: Pages ───────────────────────────────────────
+        serde_json::json!({
+            "name": "list_wiki_pages",
+            "description": "列出 Wiki 项目的所有页面，返回路径、标题、类型、标签。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "get_wiki_page",
+            "description": "读取 Wiki 页面的完整 Markdown 内容。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "path": { "type": "string", "description": "页面路径（如 'index.md' 或 'guides/setup.md'）" }
+                },
+                "required": ["project_id", "path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "save_wiki_page",
+            "description": "创建或更新 Wiki 页面。传入 Markdown 内容，自动提取 frontmatter 标签和 wikilinks。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "path": { "type": "string", "description": "页面路径（如 'guides/api.md'）" },
+                    "content": { "type": "string", "description": "页面 Markdown 内容" }
+                },
+                "required": ["project_id", "path", "content"]
+            }
+        }),
+        // ── Wiki tools: Search & Ask ───────────────────────────────
+        serde_json::json!({
+            "name": "search_wiki",
+            "description": "搜索 Wiki 页面。按标题、路径模糊匹配，并搜索页面内容。返回匹配页面的标题、路径、摘要片段。适合结构化知识检索，比 RAG chunk 更精确。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "query": { "type": "string", "description": "搜索关键词" },
+                    "top_k": { "type": "integer", "description": "最大返回结果数（默认 10）", "default": 10 }
+                },
+                "required": ["project_id", "query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "ask_wiki",
+            "description": "向 Wiki 提问，获取基于 Wiki 页面的 AI 回答。检索相关页面 → LLM 生成回答 → 返回回答 + 来源引用。与 RAG ask 类似，但基于完整 Wiki 页面而非 chunk。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "question": { "type": "string", "description": "问题" },
+                    "top_k": { "type": "integer", "description": "检索页面数（默认 5）", "default": 5 },
+                    "model": { "type": "string", "description": "LLM 模型（默认用项目配置）" }
+                },
+                "required": ["project_id", "question"]
+            }
+        }),
+        // ── Wiki tools: Tags & Graph ───────────────────────────────
+        serde_json::json!({
+            "name": "get_wiki_tags",
+            "description": "获取 Wiki 项目的标签列表（从页面 frontmatter 自动提取），按频率排序。可用于快速了解 Wiki 覆盖的主题。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "limit": { "type": "integer", "description": "返回标签数（默认 15）", "default": 15 }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "get_wiki_graph",
+            "description": "获取 Wiki 知识图谱：页面（节点）和 wikilinks（边）。用于可视化知识关联。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        // ── Wiki tools: Sources ─────────────────────────────────────
+        serde_json::json!({
+            "name": "list_wiki_sources",
+            "description": "列出 Wiki 项目的源资料及其摄入状态。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "ingest_wiki_source",
+            "description": "触发 Wiki 源资料的摄入：自动解析文档 → 生成结构化 Wiki 页面 → 提取标签和 wikilinks。异步执行，可用 list_wiki_pages 检查进度。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "source_id": { "type": "string", "description": "源资料 ID" }
+                },
+                "required": ["project_id", "source_id"]
+            }
+        }),
+        // ── Wiki tools: Project lifecycle ───────────────────────────
+        serde_json::json!({
+            "name": "create_wiki_project",
+            "description": "创建新 Wiki 项目。Wiki 是结构化知识库，页面按 frontmatter 组织，支持标签、图谱、问答。创建后可通过 save_wiki_page 添加页面或 add_wiki_source 添加源资料。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Wiki 项目名称（1-100字符）" },
+                    "description": { "type": "string", "description": "项目描述（可选）" },
+                    "ingest_model": { "type": "string", "description": "摄入模型（用于自动生成页面的 LLM，可选）" },
+                    "chat_model": { "type": "string", "description": "问答模型（用于 Wiki 问答的 LLM，可选）" },
+                    "ingest_channel_id": { "type": "string", "description": "摄入渠道 ID（可选，默认自动选择）" },
+                    "chat_channel_id": { "type": "string", "description": "问答渠道 ID（可选，默认自动选择）" },
+                    "schema_text": { "type": "string", "description": "自定义 Wiki schema（CLAUDE.md 内容，可选）。定义页面结构规范、标签约定等。" }
+                },
+                "required": ["name"]
+            }
+        }),
+        serde_json::json!({
+            "name": "delete_wiki_project",
+            "description": "永久删除 Wiki 项目及其所有页面、源资料和目录。此操作不可恢复。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        // ── Wiki tools: Page deletion ───────────────────────────────
+        serde_json::json!({
+            "name": "delete_wiki_page",
+            "description": "删除 Wiki 项目中的指定页面。同时删除数据库记录和磁盘文件。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "path": { "type": "string", "description": "页面路径（如 'guides/old-page.md'）" }
+                },
+                "required": ["project_id", "path"]
+            }
+        }),
+        // ── Wiki tools: Source management ──────────────────────────
+        serde_json::json!({
+            "name": "add_wiki_source",
+            "description": "添加源资料到 Wiki 项目。可传入文件内容，自动保存到磁盘。添加后可用 ingest_wiki_source 触发摄入，自动生成结构化 Wiki 页面。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "filename": { "type": "string", "description": "源资料文件名（如 'design.md' 或 'service.java'）" },
+                    "source_type": { "type": "string", "description": "源类型（如 'md', 'java', 'py', 'txt' 等）" },
+                    "content": { "type": "string", "description": "文件内容（纯文本，非 base64）。如果提供，会自动保存到磁盘。" },
+                    "file_path": { "type": "string", "description": "已有文件路径（可选，如果不提供 content 则用此路径）" },
+                    "source_url": { "type": "string", "description": "来源 URL（可选）" }
+                },
+                "required": ["project_id", "filename", "source_type"]
+            }
+        }),
+        serde_json::json!({
+            "name": "delete_wiki_source",
+            "description": "删除 Wiki 项目中的指定源资料。仅删除源记录，不影响已通过该源生成的 Wiki 页面。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "source_id": { "type": "string", "description": "源资料 ID" }
+                },
+                "required": ["project_id", "source_id"]
+            }
+        }),
     ]
 }
 
 // ── Core JSON-RPC dispatch ────────────────────────────────────────
 
 /// Main MCP JSON-RPC handler — async dispatch
-async fn dispatch_jsonrpc_async(
-    shared: &SharedState,
-    req: &McpRequest,
-) -> McpResponse {
+async fn dispatch_jsonrpc_async(shared: &SharedState, req: &McpRequest) -> McpResponse {
     match req.method.as_str() {
-        "initialize" => {
-            McpResponse::success(req.id.clone(), serde_json::json!({
+        "initialize" => McpResponse::success(
+            req.id.clone(),
+            serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {}
@@ -344,23 +554,24 @@ async fn dispatch_jsonrpc_async(
                     "version": "0.1.0"
                 },
                 "instructions": MCP_INSTRUCTIONS
-            }))
-        }
-        "notifications/initialized" => {
-            McpResponse::success(req.id.clone(), serde_json::json!({}))
-        }
-        "tools/list" => {
-            McpResponse::success(req.id.clone(), serde_json::json!({
+            }),
+        ),
+        "notifications/initialized" => McpResponse::success(req.id.clone(), serde_json::json!({})),
+        "tools/list" => McpResponse::success(
+            req.id.clone(),
+            serde_json::json!({
                 "tools": get_tools()
-            }))
-        }
+            }),
+        ),
         "tools/call" => {
-            let tool_name = req.params
+            let tool_name = req
+                .params
                 .get("name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
 
-            let args = req.params
+            let args = req
+                .params
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(Default::default()));
@@ -370,12 +581,12 @@ async fn dispatch_jsonrpc_async(
                 Err(e) => McpResponse::error(req.id.clone(), -32603, e),
             }
         }
-        "ping" => {
-            McpResponse::success(req.id.clone(), serde_json::json!({}))
-        }
-        _ => {
-            McpResponse::error(req.id.clone(), -32601, format!("Unknown method: {}", req.method))
-        }
+        "ping" => McpResponse::success(req.id.clone(), serde_json::json!({})),
+        _ => McpResponse::error(
+            req.id.clone(),
+            -32601,
+            format!("Unknown method: {}", req.method),
+        ),
     }
 }
 
@@ -386,9 +597,7 @@ async fn dispatch_jsonrpc_async(
 // 3. Client POSTs JSON-RPC requests to that URL
 // 4. Server pushes responses back through the SSE stream
 
-pub async fn handle_mcp_sse(
-    State(_shared): State<SharedState>,
-) -> Response {
+pub async fn handle_mcp_sse(State(_shared): State<SharedState>) -> Response {
     // Generate unique session ID
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -514,22 +723,69 @@ async fn handle_tool_call(
 ) -> Result<serde_json::Value, String> {
     let pool = &shared.state.db.pool;
 
+    const PROJECT_SCOPED_WIKI_TOOLS: &[&str] = &[
+        "get_wiki_project",
+        "list_wiki_pages",
+        "get_wiki_page",
+        "save_wiki_page",
+        "search_wiki",
+        "ask_wiki",
+        "get_wiki_tags",
+        "get_wiki_graph",
+        "list_wiki_sources",
+        "ingest_wiki_source",
+        "delete_wiki_project",
+        "delete_wiki_page",
+        "add_wiki_source",
+        "delete_wiki_source",
+    ];
+    if PROJECT_SCOPED_WIKI_TOOLS.contains(&tool_name) {
+        let project_id = args
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .ok_or("Missing project_id")?;
+        let project = WikiRepository::new(pool.clone())
+            .get_project(project_id)
+            .await?;
+        if project.mcp_enabled != 1 {
+            return Err("Wiki project is not exposed through MCP".to_string());
+        }
+    }
+
     match tool_name {
         "search_knowledge_base" => {
-            let query = args.get("query").and_then(|q| q.as_str()).ok_or("Missing query")?;
+            let query = args
+                .get("query")
+                .and_then(|q| q.as_str())
+                .ok_or("Missing query")?;
             let kb_id = args.get("kb_id").and_then(|k| k.as_str()).unwrap_or("");
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
-            let search_mode = args.get("search_mode").and_then(|s| s.as_str()).unwrap_or("hybrid");
-            let vector_weight = args.get("vector_weight").and_then(|w| w.as_f64()).unwrap_or(0.7) as f32;
-            let keyword_weight = args.get("keyword_weight").and_then(|w| w.as_f64()).unwrap_or(0.3) as f32;
+            let search_mode = args
+                .get("search_mode")
+                .and_then(|s| s.as_str())
+                .unwrap_or("hybrid");
+            let vector_weight = args
+                .get("vector_weight")
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.7) as f32;
+            let keyword_weight = args
+                .get("keyword_weight")
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.3) as f32;
 
-            let emb_model = if !kb_id.is_empty() {
+            let (emb_model, embedding_channel_id) = if !kb_id.is_empty() {
                 let kb_repo = KbRepository::new(pool.clone());
-                kb_repo.get_kb(kb_id).await.ok()
-                    .and_then(|kb| kb.embedding_model)
-                    .unwrap_or_else(|| "text-embedding-3-small".to_string())
+                let kb = kb_repo
+                    .get_kb(kb_id)
+                    .await
+                    .map_err(|error| format!("Failed to load knowledge base: {}", error))?;
+                (
+                    kb.embedding_model
+                        .unwrap_or_else(|| "text-embedding-3-small".to_string()),
+                    kb.embedding_channel_id,
+                )
             } else {
-                "text-embedding-3-small".to_string()
+                ("text-embedding-3-small".to_string(), None)
             };
 
             let repo = Repository::new(pool.clone());
@@ -546,7 +802,12 @@ async fn handle_tool_call(
                 return Ok(serde_json::json!({ "content": content, "isError": false }));
             }
 
-            let embeddings = embedder::embed(&[query.to_string()], &emb_model, &repo).await?;
+            let embeddings = embedder::embed_with_channel(
+                &[query.to_string()],
+                &emb_model,
+                &repo,
+                embedding_channel_id.as_deref(),
+            ).await?;
             if embeddings.is_empty() {
                 return Err("Failed to embed query".to_string());
             }
@@ -564,18 +825,32 @@ async fn handle_tool_call(
             } else {
                 // Single-KB search with details
                 let scored = retriever::hybrid_search_with_details(
-                    pool, kb_id, query, &embeddings[0], top_k, vector_weight, keyword_weight,
-                ).await?;
+                    pool,
+                    kb_id,
+                    query,
+                    &embeddings[0],
+                    top_k,
+                    vector_weight,
+                    keyword_weight,
+                )
+                .await?;
 
-                let content: Vec<serde_json::Value> = scored.iter().map(|s| {
-                    let r = &s.result;
-                    let mut line = format!("[{}] (score: {:.2}", r.filename, r.score);
-                    if let Some(vs) = s.vector_score { line.push_str(&format!(", vec: {:.2}", vs)); }
-                    if let Some(ks) = s.keyword_score { line.push_str(&format!(", kw: {:.2}", ks)); }
-                    line.push_str(")\n");
-                    line.push_str(&r.content);
-                    serde_json::json!({ "type": "text", "text": line })
-                }).collect();
+                let content: Vec<serde_json::Value> = scored
+                    .iter()
+                    .map(|s| {
+                        let r = &s.result;
+                        let mut line = format!("[{}] (score: {:.2}", r.filename, r.score);
+                        if let Some(vs) = s.vector_score {
+                            line.push_str(&format!(", vec: {:.2}", vs));
+                        }
+                        if let Some(ks) = s.keyword_score {
+                            line.push_str(&format!(", kw: {:.2}", ks));
+                        }
+                        line.push_str(")\n");
+                        line.push_str(&r.content);
+                        serde_json::json!({ "type": "text", "text": line })
+                    })
+                    .collect();
 
                 Ok(serde_json::json!({ "content": content, "isError": false }))
             }
@@ -604,11 +879,20 @@ async fn handle_tool_call(
         }
 
         "read_document" => {
-            let _kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
-            let doc_id = args.get("doc_id").and_then(|d| d.as_str()).ok_or("Missing doc_id")?;
+            let _kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
+            let doc_id = args
+                .get("doc_id")
+                .and_then(|d| d.as_str())
+                .ok_or("Missing doc_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
-            let doc = kb_repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
+            let doc = kb_repo
+                .get_document(doc_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             let content = if let Some(path) = &doc.file_path {
                 std::fs::read_to_string(path).unwrap_or_else(|_| "Failed to read file".to_string())
@@ -626,16 +910,31 @@ async fn handle_tool_call(
         }
 
         "ask_knowledge_base" => {
-            let question = args.get("question").and_then(|q| q.as_str()).ok_or("Missing question")?;
+            let question = args
+                .get("question")
+                .and_then(|q| q.as_str())
+                .ok_or("Missing question")?;
             let kb_id = args.get("kb_id").and_then(|k| k.as_str()).unwrap_or("");
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
-            let search_mode = args.get("search_mode").and_then(|s| s.as_str()).unwrap_or("hybrid");
-            let vector_weight = args.get("vector_weight").and_then(|w| w.as_f64()).unwrap_or(0.7) as f32;
-            let keyword_weight = args.get("keyword_weight").and_then(|w| w.as_f64()).unwrap_or(0.3) as f32;
+            let search_mode = args
+                .get("search_mode")
+                .and_then(|s| s.as_str())
+                .unwrap_or("hybrid");
+            let vector_weight = args
+                .get("vector_weight")
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.7) as f32;
+            let keyword_weight = args
+                .get("keyword_weight")
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.3) as f32;
 
             let emb_model = if !kb_id.is_empty() {
                 let kb_repo = KbRepository::new(pool.clone());
-                kb_repo.get_kb(kb_id).await.ok()
+                kb_repo
+                    .get_kb(kb_id)
+                    .await
+                    .ok()
                     .and_then(|kb| kb.embedding_model)
                     .unwrap_or_else(|| "text-embedding-3-small".to_string())
             } else {
@@ -648,11 +947,20 @@ async fn handle_tool_call(
             } else {
                 let main_repo = Repository::new(pool.clone());
                 let channels = main_repo.get_enabled_channels().await.unwrap_or_default();
-                let embedding_models = ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002", "bge-large-zh", "bge-small-zh"];
+                let embedding_models = [
+                    "text-embedding-3-small",
+                    "text-embedding-3-large",
+                    "text-embedding-ada-002",
+                    "bge-large-zh",
+                    "bge-small-zh",
+                ];
                 let mut picked: Option<String> = None;
                 for ch in &channels {
                     let models: Vec<String> = serde_json::from_str(&ch.models).unwrap_or_default();
-                    if let Some(m) = models.iter().find(|m| !embedding_models.contains(&m.as_str())) {
+                    if let Some(m) = models
+                        .iter()
+                        .find(|m| !embedding_models.contains(&m.as_str()))
+                    {
                         picked = Some(m.clone());
                         break;
                     }
@@ -661,9 +969,20 @@ async fn handle_tool_call(
             };
 
             let answer = rag::ask_with_config(
-                pool, kb_id, question, &emb_model, &chat_model, top_k, true, &[], &shared.app,
-                vector_weight, keyword_weight, search_mode,
-            ).await?;
+                pool,
+                kb_id,
+                question,
+                &emb_model,
+                &chat_model,
+                top_k,
+                true,
+                &[],
+                &shared.app,
+                vector_weight,
+                keyword_weight,
+                search_mode,
+            )
+            .await?;
 
             let mut content = vec![serde_json::json!({
                 "type": "text",
@@ -683,8 +1002,12 @@ async fn handle_tool_call(
                 let mut detail_lines = String::from("\n--- Retrieval Details ---\n");
                 for d in details {
                     let mut line = format!("• {} (score: {:.2}", d.filename, d.score);
-                    if let Some(vs) = d.vector_score { line.push_str(&format!(", vec: {:.2}", vs)); }
-                    if let Some(ks) = d.keyword_score { line.push_str(&format!(", kw: {:.2}", ks)); }
+                    if let Some(vs) = d.vector_score {
+                        line.push_str(&format!(", vec: {:.2}", vs));
+                    }
+                    if let Some(ks) = d.keyword_score {
+                        line.push_str(&format!(", kw: {:.2}", ks));
+                    }
                     if let Some(sym) = &d.symbol_name {
                         line.push_str(&format!(", symbol: {}", sym));
                         if let Some(kind) = &d.symbol_kind {
@@ -708,11 +1031,17 @@ async fn handle_tool_call(
         }
 
         "get_knowledge_base_stats" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
             let kb = kb_repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
-            let docs = kb_repo.get_documents(kb_id).await.map_err(|e| e.to_string())?;
+            let docs = kb_repo
+                .get_documents(kb_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "content": [{
@@ -731,9 +1060,11 @@ async fn handle_tool_call(
         }
 
         // ── Write tools: Knowledge Base lifecycle ──────────────────
-
         "create_knowledge_base" => {
-            let name = args.get("name").and_then(|n| n.as_str()).ok_or("Missing name")?;
+            let name = args
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or("Missing name")?;
             let description = args.get("description").and_then(|d| d.as_str());
             let embedding_model = args.get("embedding_model").and_then(|m| m.as_str());
             let embedding_channel_id = args.get("embedding_channel_id").and_then(|c| c.as_str());
@@ -764,24 +1095,52 @@ async fn handle_tool_call(
         }
 
         "update_knowledge_base" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let input = crate::services::knowledge::models::UpdateKbInput {
-                name: args.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
-                description: args.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                embedding_model: args.get("embedding_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
-                embedding_channel_id: args.get("embedding_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                name: args
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string()),
+                description: args
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string()),
+                embedding_model: args
+                    .get("embedding_model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string()),
+                embedding_channel_id: args
+                    .get("embedding_channel_id")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string()),
                 status: args.get("status").and_then(|s| s.as_i64()),
                 mcp_enabled: args.get("mcp_enabled").and_then(|m| m.as_i64()),
                 chunk_size: args.get("chunk_size").and_then(|c| c.as_i64()),
                 chunk_overlap: args.get("chunk_overlap").and_then(|c| c.as_i64()),
-                excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_str()).map(|s| s.to_string()),
-                excluded_files: args.get("excluded_files").and_then(|e| e.as_str()).map(|s| s.to_string()),
-                included_files: args.get("included_files").and_then(|i| i.as_str()).map(|s| s.to_string()),
+                excluded_dirs: args
+                    .get("excluded_dirs")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string()),
+                excluded_files: args
+                    .get("excluded_files")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string()),
+                included_files: args
+                    .get("included_files")
+                    .and_then(|i| i.as_str())
+                    .map(|s| s.to_string()),
+                embedding_batch_size: args.get("embedding_batch_size").and_then(|b| b.as_i64()),
             };
 
             let kb_repo = KbRepository::new(pool.clone());
-            let kb = kb_repo.update_kb(kb_id, &input).await.map_err(|e| e.to_string())?;
+            let kb = kb_repo
+                .update_kb(kb_id, &input)
+                .await
+                .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "content": [{
@@ -796,7 +1155,10 @@ async fn handle_tool_call(
         }
 
         "delete_knowledge_base" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
             let kb = kb_repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
@@ -812,10 +1174,15 @@ async fn handle_tool_call(
         }
 
         // ── Write tools: Document management ───────────────────────
-
         "upload_document" => {
-            let filename = args.get("filename").and_then(|f| f.as_str()).ok_or("Missing filename")?;
-            let content_b64 = args.get("content").and_then(|c| c.as_str()).ok_or("Missing content")?;
+            let filename = args
+                .get("filename")
+                .and_then(|f| f.as_str())
+                .ok_or("Missing filename")?;
+            let content_b64 = args
+                .get("content")
+                .and_then(|c| c.as_str())
+                .ok_or("Missing content")?;
 
             let kb_repo = KbRepository::new(pool.clone());
 
@@ -830,13 +1197,13 @@ async fn handle_tool_call(
                         return Ok(serde_json::json!({
                             "content": [{
                                 "type": "text",
-                                "text": "⚠️ 未指定知识库，且当前没有任何可用的知识库。\n\n请先调用 create_knowledge_base 创建一个知识库，然后再上传文档。"
+                                "text": "⚠️ 未指定 RAG，且当前没有任何可用的知识库。\n\n请先调用 create_knowledge_base 创建一个 RAG，然后再上传文档。"
                             }],
                             "isError": false
                         }));
                     }
 
-                    let mut lines = vec!["⚠️ 未指定目标知识库。请选择一个已有知识库，或确认创建新库。\n\n已有知识库列表:".to_string()];
+                    let mut lines = vec!["⚠️ 未指定目标 RAG。请选择一个已有知识库，或确认创建新库。\n\n已有知识库列表:".to_string()];
                     for (i, kb) in exposed.iter().enumerate() {
                         lines.push(format!(
                             "\n[{}] ID: {}\n    名称: {}\n    文档数: {} | 切片数: {} | Tokens: {}\n    描述: {}",
@@ -849,7 +1216,7 @@ async fn handle_tool_call(
                             kb.description.as_deref().unwrap_or("无")
                         ));
                     }
-                    lines.push("\n\n请告诉 AI 你要上传到哪个知识库（提供 ID 或名称），或者要求创建新知识库。".to_string());
+                    lines.push("\n\n请告诉 AI 你要上传到哪个 RAG（提供 ID 或名称），或者要求创建新 RAG。".to_string());
 
                     return Ok(serde_json::json!({
                         "content": [{
@@ -865,7 +1232,8 @@ async fn handle_tool_call(
 
             let content = {
                 use base64::Engine;
-                base64::engine::general_purpose::STANDARD.decode(content_b64)
+                base64::engine::general_purpose::STANDARD
+                    .decode(content_b64)
                     .map_err(|e| format!("Invalid base64: {}", e))?
             };
 
@@ -890,7 +1258,10 @@ async fn handle_tool_call(
             let file_size = content.len() as i64;
 
             // Save file to disk
-            let app_data_dir = shared.app.path().app_data_dir()
+            let app_data_dir = shared
+                .app
+                .path()
+                .app_data_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
             let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
             std::fs::create_dir_all(&kb_dir).ok();
@@ -899,10 +1270,17 @@ async fn handle_tool_call(
             std::fs::write(&file_path, &content).ok();
             let file_path_str = file_path.to_string_lossy().to_string();
 
-            let doc = kb_repo.create_document(
-                &kb_id, &filename, Some(&file_path_str),
-                &file_type, file_size, &hash_hex
-            ).await.map_err(|e| e.to_string())?;
+            let doc = kb_repo
+                .create_document(
+                    &kb_id,
+                    &filename,
+                    Some(&file_path_str),
+                    &file_type,
+                    file_size,
+                    &hash_hex,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
 
             let kb = kb_repo.get_kb(&kb_id).await.map_err(|e| e.to_string())?;
             let emb_model = kb.embedding_model.clone();
@@ -916,9 +1294,16 @@ async fn handle_tool_call(
 
             tokio::spawn(async move {
                 if let Err(e) = crate::services::knowledge::processor::process_document(
-                    &pool_clone, &app_clone, &kb_id_clone, &doc_id_clone,
-                    &filename_clone, &content, emb_model.as_deref()
-                ).await {
+                    &pool_clone,
+                    &app_clone,
+                    &kb_id_clone,
+                    &doc_id_clone,
+                    &filename_clone,
+                    &content,
+                    emb_model.as_deref(),
+                )
+                .await
+                {
                     tracing::error!("Document processing failed: {}", e);
                 }
             });
@@ -936,11 +1321,20 @@ async fn handle_tool_call(
         }
 
         "delete_document" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
-            let doc_id = args.get("doc_id").and_then(|d| d.as_str()).ok_or("Missing doc_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
+            let doc_id = args
+                .get("doc_id")
+                .and_then(|d| d.as_str())
+                .ok_or("Missing doc_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
-            let doc = kb_repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
+            let doc = kb_repo
+                .get_document(doc_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             // Delete file from disk
             if let Some(path) = &doc.file_path {
@@ -949,8 +1343,14 @@ async fn handle_tool_call(
 
             // Delete chunks and document record
             kb_repo.delete_chunks_by_doc(doc_id).await.ok();
-            kb_repo.delete_document(doc_id).await.map_err(|e| e.to_string())?;
-            kb_repo.update_kb_counts(kb_id).await.map_err(|e| e.to_string())?;
+            kb_repo
+                .delete_document(doc_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            kb_repo
+                .update_kb_counts(kb_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "content": [{
@@ -962,10 +1362,16 @@ async fn handle_tool_call(
         }
 
         "list_documents" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
-            let docs = kb_repo.get_documents(kb_id).await.map_err(|e| e.to_string())?;
+            let docs = kb_repo
+                .get_documents(kb_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             if docs.is_empty() {
                 return Ok(serde_json::json!({
@@ -977,10 +1383,15 @@ async fn handle_tool_call(
                 }));
             }
 
-            let lines: Vec<String> = docs.iter().map(|d| {
-                format!("- {} | ID: {} | Status: {} | Chunks: {} | Tokens: {} | Size: {} bytes",
-                    d.filename, d.id, d.status, d.chunk_count, d.token_count, d.file_size)
-            }).collect();
+            let lines: Vec<String> = docs
+                .iter()
+                .map(|d| {
+                    format!(
+                        "- {} | ID: {} | Status: {} | Chunks: {} | Tokens: {} | Size: {} bytes",
+                        d.filename, d.id, d.status, d.chunk_count, d.token_count, d.file_size
+                    )
+                })
+                .collect();
 
             Ok(serde_json::json!({
                 "content": [{
@@ -992,9 +1403,11 @@ async fn handle_tool_call(
         }
 
         // ── Write tools: Index management ──────────────────────────
-
         "build_index" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
             kb_repo.update_kb_index_status(kb_id, "building").await.ok();
@@ -1006,32 +1419,47 @@ async fn handle_tool_call(
             tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
                 rt.block_on(async {
-                    let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                        "kb_id": &kb_id_clone,
-                        "status": "building",
-                        "message": "Building HNSW index…"
-                    }));
+                    let _ = app_clone.emit(
+                        "kb-index-progress",
+                        serde_json::json!({
+                            "kb_id": &kb_id_clone,
+                            "status": "building",
+                            "message": "Building HNSW index…"
+                        }),
+                    );
 
                     match crate::services::knowledge::retriever::build_index(
-                        &pool_clone, &kb_id_clone, &app_clone
-                    ).await {
+                        &pool_clone,
+                        &kb_id_clone,
+                        &app_clone,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             tracing::info!("HNSW index built for KB {}", kb_id_clone);
-                            let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                                "kb_id": &kb_id_clone,
-                                "status": "ready",
-                                "message": "Index build complete"
-                            }));
+                            let _ = app_clone.emit(
+                                "kb-index-progress",
+                                serde_json::json!({
+                                    "kb_id": &kb_id_clone,
+                                    "status": "ready",
+                                    "message": "Index build complete"
+                                }),
+                            );
                         }
                         Err(e) => {
                             tracing::error!("Index build failed for KB {}: {}", kb_id_clone, e);
                             let repo = KbRepository::new(pool_clone.clone());
-                            repo.update_kb_index_status(&kb_id_clone, "error").await.ok();
-                            let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                                "kb_id": &kb_id_clone,
-                                "status": "error",
-                                "message": format!("Index build failed: {}", e)
-                            }));
+                            repo.update_kb_index_status(&kb_id_clone, "error")
+                                .await
+                                .ok();
+                            let _ = app_clone.emit(
+                                "kb-index-progress",
+                                serde_json::json!({
+                                    "kb_id": &kb_id_clone,
+                                    "status": "error",
+                                    "message": format!("Index build failed: {}", e)
+                                }),
+                            );
                         }
                     }
                 });
@@ -1047,34 +1475,71 @@ async fn handle_tool_call(
         }
 
         // ── Write tools: Source import ─────────────────────────────
-
         "import_source" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
-            let source_type = args.get("source_type").and_then(|s| s.as_str()).ok_or("Missing source_type")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
+            let source_type = args
+                .get("source_type")
+                .and_then(|s| s.as_str())
+                .ok_or("Missing source_type")?;
             let kb_id = kb_id.to_string();
 
-            let input = crate::services::knowledge::models::ImportSourceInput {
-                source_type: source_type.to_string(),
-                repo_url: args.get("repo_url").and_then(|r| r.as_str()).map(|s| s.to_string()),
-                branch: args.get("branch").and_then(|b| b.as_str()).map(|s| s.to_string()),
-                token: args.get("token").and_then(|t| t.as_str()).map(|s| s.to_string()),
-                url: args.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()),
-                dir_path: args.get("dir_path").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
-                included_files: args.get("included_files").and_then(|i| i.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
-                max_file_size: args.get("max_file_size").and_then(|m| m.as_u64()).map(|v| v as usize),
-            };
+            let input =
+                crate::services::knowledge::models::ImportSourceInput {
+                    source_type: source_type.to_string(),
+                    repo_url: args
+                        .get("repo_url")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string()),
+                    branch: args
+                        .get("branch")
+                        .and_then(|b| b.as_str())
+                        .map(|s| s.to_string()),
+                    token: args
+                        .get("token")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string()),
+                    url: args
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string()),
+                    dir_path: args
+                        .get("dir_path")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string()),
+                    excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_array()).map(
+                        |arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        },
+                    ),
+                    included_files: args.get("included_files").and_then(|i| i.as_array()).map(
+                        |arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        },
+                    ),
+                    max_file_size: args
+                        .get("max_file_size")
+                        .and_then(|m| m.as_u64())
+                        .map(|v| v as usize),
+                };
 
             let kb_repo = KbRepository::new(pool.clone());
-            let source = kb_repo.create_source(
-                &kb_id,
-                &input.source_type,
-                input.repo_url.as_deref().or(input.url.as_deref()),
-                input.dir_path.as_deref(),
-                input.branch.as_deref(),
-            ).await.map_err(|e| e.to_string())?;
+            let source = kb_repo
+                .create_source(
+                    &kb_id,
+                    &input.source_type,
+                    input.repo_url.as_deref().or(input.url.as_deref()),
+                    input.dir_path.as_deref(),
+                    input.branch.as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
 
             let source_id = source.id.clone();
             let source_type_clone = input.source_type.clone();
@@ -1085,16 +1550,31 @@ async fn handle_tool_call(
             tokio::spawn(async move {
                 let result = if source_type_clone == "git" {
                     crate::services::knowledge::importer::import_git_repo(
-                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
-                    ).await
+                        &pool_clone,
+                        &app_clone,
+                        &kb_id_clone,
+                        &source_id,
+                        &input,
+                    )
+                    .await
                 } else if source_type_clone == "url" {
                     crate::services::knowledge::importer::import_url(
-                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
-                    ).await
+                        &pool_clone,
+                        &app_clone,
+                        &kb_id_clone,
+                        &source_id,
+                        &input,
+                    )
+                    .await
                 } else if source_type_clone == "local_dir" {
                     crate::services::knowledge::importer::import_local_dir(
-                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
-                    ).await
+                        &pool_clone,
+                        &app_clone,
+                        &kb_id_clone,
+                        &source_id,
+                        &input,
+                    )
+                    .await
                 } else {
                     Err(format!("Unknown source type: {}", source_type_clone))
                 };
@@ -1102,10 +1582,14 @@ async fn handle_tool_call(
                 let repo = KbRepository::new(pool_clone.clone());
                 match result {
                     Ok(count) => {
-                        repo.update_source_status(&source_id, "done", count as i64, None).await.ok();
+                        repo.update_source_status(&source_id, "done", count as i64, None)
+                            .await
+                            .ok();
                     }
                     Err(e) => {
-                        repo.update_source_status(&source_id, "error", 0, Some(&e)).await.ok();
+                        repo.update_source_status(&source_id, "error", 0, Some(&e))
+                            .await
+                            .ok();
                         tracing::error!("Import failed: {}", e);
                     }
                 }
@@ -1118,6 +1602,499 @@ async fn handle_tool_call(
                         "Import started.\nSource ID: {}\nType: {}\nKnowledge base: {}\nThe import runs asynchronously. Use list_documents or get_knowledge_base_stats to check progress.",
                         source.id, source_type, kb_id
                     )
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Wiki tools ─────────────────────────────────────────────
+        "list_wiki_projects" => {
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let projects = wiki_repo.list_projects().await.map_err(|e| e.to_string())?;
+
+            let content: Vec<serde_json::Value> = projects.iter().filter(|p| p.mcp_enabled == 1).map(|p| {
+                serde_json::json!({
+                    "type": "text",
+                    "text": format!("ID: {}\nName: {}\nPages: {} | Sources: {}\nDescription: {}",
+                        p.id, p.name, p.page_count, p.source_count, p.description.as_deref().unwrap_or("N/A"))
+                })
+            }).collect();
+
+            Ok(serde_json::json!({ "content": content, "isError": false }))
+        }
+
+        "get_wiki_project" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let proj = wiki_repo.get_project(project_id).await.map_err(|e| e.to_string())?;
+            let stats = wiki_repo.get_stats(project_id).await.unwrap_or(serde_json::json!({}));
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "ID: {}\nName: {}\nPages: {} | Sources: {}\nDescription: {}\nStats: {}",
+                        proj.id, proj.name, proj.page_count, proj.source_count,
+                        proj.description.as_deref().unwrap_or("N/A"),
+                        serde_json::to_string_pretty(&stats).unwrap_or_default()
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "list_wiki_pages" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let pages = wiki_repo.list_pages(project_id).await.map_err(|e| e.to_string())?;
+
+            if pages.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": "No wiki pages yet." }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = pages.iter().map(|p| {
+                format!("- {} ({}) | {}", p.title, p.path, p.page_type)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki pages ({} total):\n{}", pages.len(), lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "get_wiki_page" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let path = args.get("path").and_then(|s| s.as_str())
+                .ok_or("Missing path")?;
+
+            let content = wiki_project::read_page(project_id, path)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": content
+                }],
+                "isError": false
+            }))
+        }
+
+        "save_wiki_page" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let path = args.get("path").and_then(|s| s.as_str())
+                .ok_or("Missing path")?;
+            let content = args.get("content").and_then(|s| s.as_str())
+                .ok_or("Missing content")?;
+
+            // Call the wiki update_page handler logic
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let result = wiki_handlers::update_page_inner(
+                pool, &wiki_repo, project_id, path, content,
+            ).await;
+
+            match result {
+                Ok(()) => Ok(serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Wiki page '{}' saved successfully.", path)
+                    }],
+                    "isError": false
+                })),
+                Err(e) => Err(e),
+            }
+        }
+
+        "search_wiki" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let query = args.get("query").and_then(|s| s.as_str())
+                .ok_or("Missing query")?;
+            let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(10) as usize;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let results = wiki_repo.search_pages(project_id, query, top_k)
+                .await.map_err(|e| e.to_string())?;
+
+            if results.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": "No matching wiki pages found." }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = results.iter().map(|r| {
+                let mut line = format!("- {} ({})", r.title, r.path);
+                if !r.snippet.is_empty() {
+                    line.push_str(&format!("\n  {}", r.snippet));
+                }
+                line
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki search results ({} found):\n{}", results.len(), lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "ask_wiki" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let question = args.get("question").and_then(|s| s.as_str())
+                .ok_or("Missing question")?;
+            let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
+            let model = args.get("model").and_then(|m| m.as_str());
+
+            let result = wiki_handlers::ask_inner(
+                shared, project_id, question, top_k, model,
+            ).await;
+
+            match result {
+                Ok(json) => Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json).unwrap_or_default() }],
+                    "isError": false
+                })),
+                Err(e) => Err(e),
+            }
+        }
+
+        "get_wiki_tags" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(15) as usize;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let tags = wiki_repo.get_tags(project_id, limit).await.map_err(|e| e.to_string())?;
+
+            if tags.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": "No tags found. Tags are auto-extracted from page frontmatter." }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = tags.iter().map(|t| {
+                format!("- {} ({})", t.word, t.count)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki tags:\n{}", lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "get_wiki_graph" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let graph = wiki_repo.get_graph(project_id).await.map_err(|e| e.to_string())?;
+
+            let lines: Vec<String> = graph.nodes.iter().map(|n| {
+                format!("- {} ({}){}", n.label, n.node_type,
+                    n.path.as_deref().map(|p| format!(" [{}]", p)).unwrap_or_default())
+            }).collect();
+
+            let edge_lines: Vec<String> = graph.edges.iter().map(|e| {
+                format!("  {} --{}--> {}", e.source, e.edge_type, e.target)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Graph: {} nodes, {} edges\n\nNodes:\n{}\n\nEdges:\n{}",
+                        graph.nodes.len(), graph.edges.len(),
+                        lines.join("\n"), edge_lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "list_wiki_sources" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let sources = wiki_repo.list_sources(project_id).await.map_err(|e| e.to_string())?;
+
+            if sources.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": "No wiki sources yet." }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = sources.iter().map(|s| {
+                format!("- {} | ID: {} | Type: {} | Status: {} | Pages: {}",
+                    s.filename, s.id, s.source_type, s.status, s.page_count)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki sources ({} total):\n{}", sources.len(), lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "ingest_wiki_source" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let source_id = args.get("source_id").and_then(|s| s.as_str())
+                .ok_or("Missing source_id")?;
+
+            let result = wiki_ingest::ingest_source(
+                &shared.app, pool, project_id, source_id,
+            ).await.map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Ingest complete. Pages created: {}",
+                        result.pages_created)
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Wiki tools: Project lifecycle ───────────────────────────
+        "create_wiki_project" => {
+            let name = args.get("name").and_then(|s| s.as_str())
+                .ok_or("Missing name")?;
+
+            let input = crate::services::wiki::models::CreateProjectInput {
+                name: name.to_string(),
+                description: args.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()),
+                ingest_model: args.get("ingest_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
+                chat_model: args.get("chat_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
+                ingest_channel_id: args.get("ingest_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                chat_channel_id: args.get("chat_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                schema_text: args.get("schema_text").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            };
+
+            let project_id = wiki_project::new_uuid();
+            let schema = input.schema_text.clone().unwrap_or_else(|| {
+                crate::services::wiki::repository::DEFAULT_SCHEMA.to_string()
+            });
+
+            // Create directory structure
+            let dir = wiki_project::init_project_dir(&project_id, &schema).await
+                .map_err(|e| e.to_string())?;
+            let wiki_dir = dir.to_string_lossy().to_string();
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let project = match wiki_repo.create_project_with_id(&project_id, &input, &wiki_dir).await {
+                Ok(project) => project,
+                Err(error) => {
+                    if let Err(cleanup_error) = wiki_project::remove_project_dir(&project_id).await {
+                        return Err(format!("{}; failed to clean up project directory: {}", error, cleanup_error));
+                    }
+                    return Err(error);
+                }
+            };
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Wiki project created successfully.\nID: {}\nName: {}\nDescription: {}\nIngest model: {}\nChat model: {}",
+                        project.id,
+                        project.name,
+                        project.description.as_deref().unwrap_or("N/A"),
+                        project.ingest_model.as_deref().unwrap_or("default"),
+                        project.chat_model.as_deref().unwrap_or("default")
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "delete_wiki_project" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let project = wiki_repo.get_project(project_id).await
+                .map_err(|e| e.to_string())?;
+
+            let staged = wiki_project::stage_project_dir_removal(project_id).await
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = wiki_repo.delete_project(project_id).await {
+                if let Some(ref removal) = staged {
+                    wiki_project::restore_staged_removal(removal).await
+                        .map_err(|restore_error| format!("{}; failed to restore project directory: {}", error, restore_error))?;
+                }
+                return Err(error);
+            }
+            if let Some(removal) = staged {
+                wiki_project::finalize_staged_removal(removal).await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki project '{}' ({}) has been permanently deleted.", project.name, project_id)
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Wiki tools: Page deletion ───────────────────────────────
+        "delete_wiki_page" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let path = args.get("path").and_then(|s| s.as_str())
+                .ok_or("Missing path")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let staged = wiki_project::stage_page_file_removal(project_id, path).await
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = wiki_repo.delete_page(project_id, path).await {
+                if let Some(ref removal) = staged {
+                    wiki_project::restore_staged_removal(removal).await
+                        .map_err(|restore_error| format!("{}; failed to restore page file: {}", error, restore_error))?;
+                }
+                return Err(error);
+            }
+            if let Some(removal) = staged {
+                wiki_project::finalize_staged_removal(removal).await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            // Rebuild graph edges after page deletion
+            let _ = crate::services::wiki::ingest::rebuild_graph_edges(&pool, project_id).await;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki page '{}' has been deleted.", path)
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Wiki tools: Source management ──────────────────────────
+        "add_wiki_source" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let filename = args.get("filename").and_then(|s| s.as_str())
+                .ok_or("Missing filename")?;
+            let source_type = args.get("source_type").and_then(|s| s.as_str())
+                .ok_or("Missing source_type")?;
+
+            let content = args.get("content").and_then(|c| c.as_str());
+            let file_path = args.get("file_path").and_then(|f| f.as_str()).map(|s| s.to_string());
+            let source_url = args.get("source_url").and_then(|u| u.as_str()).map(|s| s.to_string());
+
+            // Compute hash and size if content provided
+            let (content_hash, file_size) = if let Some(ref content) = content {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(content.as_bytes());
+                let hash = format!("{:x}", hasher.finalize());
+                (Some(hash), content.len() as i64)
+            } else {
+                (None, 0i64)
+            };
+
+            // Write content to disk if provided and persist the managed path.
+            let written_path = if let Some(ref content) = content {
+                Some(wiki_project::write_source_file(project_id, filename, content.as_bytes()).await
+                    .map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+
+            let mut input = crate::services::wiki::models::AddSourceInput {
+                source_type: source_type.to_string(),
+                filename: filename.to_string(),
+                file_path,
+                source_url,
+                content: content.map(|s| s.to_string()),
+            };
+            if let Some(path) = &written_path {
+                input.file_path = Some(path.to_string_lossy().to_string());
+            }
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let source = match wiki_repo.add_source(project_id, &input, content_hash.as_deref(), file_size).await {
+                Ok(source) => source,
+                Err(error) => {
+                    if let Some(path) = written_path {
+                        if let Err(cleanup_error) = tokio::fs::remove_file(&path).await {
+                            return Err(format!("{}; failed to clean up source file: {}", error, cleanup_error));
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Wiki source added successfully.\nID: {}\nFilename: {}\nType: {}\nStatus: pending\n\nUse ingest_wiki_source to generate structured pages from this source.",
+                        source.id, source.filename, source.source_type
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "delete_wiki_source" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let source_id = args.get("source_id").and_then(|s| s.as_str())
+                .ok_or("Missing source_id")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+
+            // Get source info before deletion for the response message
+            let sources = wiki_repo.list_sources(project_id).await
+                .map_err(|e| e.to_string())?;
+            let source = sources.iter().find(|s| s.id == source_id)
+                .ok_or_else(|| format!("Source {} not found in project {}", source_id, project_id))?;
+
+            let filename = source.filename.clone();
+            let staged = wiki_project::stage_source_file_removal(
+                project_id,
+                &source.filename,
+                source.file_path.as_deref(),
+            ).await.map_err(|e| e.to_string())?;
+            if let Err(error) = wiki_repo.delete_source(source_id).await {
+                if let Some(ref removal) = staged {
+                    wiki_project::restore_staged_removal(removal).await
+                        .map_err(|restore_error| format!("{}; failed to restore source file: {}", error, restore_error))?;
+                }
+                return Err(error);
+            }
+            if let Some(removal) = staged {
+                wiki_project::finalize_staged_removal(removal).await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki source '{}' ({}) has been deleted.", filename, source_id)
                 }],
                 "isError": false
             }))

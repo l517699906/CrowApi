@@ -2,23 +2,26 @@ import { type FormEvent, useDeferredValue, useMemo, useState } from "react";
 import {
     CheckCircle2,
     Clock3,
+    Download,
     FlaskConical,
     GripVertical,
     Layers3,
     Pencil,
     Plus,
     Radio,
+    ScanSearch,
     Search,
     Trash2,
+    Upload,
     XCircle,
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PROVIDERS, PROVIDER_DEFAULTS, providerLabel } from "../config/providers";
 import { formatDateTime, formatDuration } from "../lib/format";
-import { channelApi, statsApi } from "../lib/api";
+import { channelApi, fileApi, importExportApi, statsApi } from "../lib/api";
 import { errorMessage, queryKeys } from "../lib/query";
 import { localDayStatsInput } from "../lib/statistics";
-import type { Channel, ChannelType, CreateChannelInput, UpdateChannelInput } from "../types";
+import type { Channel, ChannelType, CreateChannelInput, ScannedSource, UpdateChannelInput } from "../types";
 import {
     IconButton,
     Modal,
@@ -257,6 +260,12 @@ export function ChannelsPage() {
     const [draggedId, setDraggedId] = useState<string | null>(null);
     const [dragOverId, setDragOverId] = useState<string | null>(null);
     const [toast, setToast] = useState("");
+    const [transferOpen, setTransferOpen] = useState(false);
+    const [transferBusy, setTransferBusy] = useState<"import" | "export" | "scan" | "scan-import" | null>(null);
+    const [transferMessage, setTransferMessage] = useState("");
+    const [transferError, setTransferError] = useState("");
+    const [scannedSources, setScannedSources] = useState<ScannedSource[]>([]);
+    const [selectedScannedSources, setSelectedScannedSources] = useState<Set<number>>(() => new Set());
     const deferredQuery = useDeferredValue(query.trim().toLowerCase());
 
     const filteredChannels = useMemo(() => channels.filter((channel) => {
@@ -273,6 +282,110 @@ export function ChannelsPage() {
     };
 
     const refreshChannels = () => queryClient.invalidateQueries({ queryKey: queryKeys.channels });
+
+    const exportChannels = async () => {
+        setTransferBusy("export");
+        setTransferError("");
+        try {
+            const content = await importExportApi.exportChannels();
+            const saved = await fileApi.saveExport(
+                content,
+                `crowapi-channels-${new Date().toISOString().slice(0, 10)}.json`,
+            );
+            setTransferMessage(saved ? "渠道配置已导出，请妥善保管文件中的 API Key。" : "已取消导出");
+        } catch (error) {
+            setTransferError(errorMessage(error));
+        } finally {
+            setTransferBusy(null);
+        }
+    };
+
+    const importChannels = async () => {
+        setTransferBusy("import");
+        setTransferError("");
+        setTransferMessage("");
+        try {
+            const content = await importExportApi.pickImportFile();
+            if (!content) {
+                setTransferMessage("已取消导入");
+                return;
+            }
+
+            let parsed: { type?: string };
+            try {
+                parsed = JSON.parse(content) as { type?: string };
+            } catch {
+                throw new Error("无法解析 JSON 文件");
+            }
+
+            const result = parsed.type === "crowapi-export"
+                ? await importExportApi.importCrowapiExport(content)
+                : await importExportApi.importCrowcodeBackup(content);
+            await refreshChannels();
+            const suffix = result.errors.length > 0 ? `，${result.errors.length} 项失败` : "";
+            setTransferMessage(`已导入 ${result.imported} 个渠道，跳过 ${result.skipped} 个${suffix}`);
+        } catch (error) {
+            setTransferError(errorMessage(error));
+        } finally {
+            setTransferBusy(null);
+        }
+    };
+
+    const scanLocalConfigs = async () => {
+        setTransferBusy("scan");
+        setTransferError("");
+        setTransferMessage("");
+        try {
+            const result = await importExportApi.scanLocalAiConfigs();
+            setScannedSources(result.sources);
+            setSelectedScannedSources(new Set(result.sources.map((_, index) => index)));
+            setTransferMessage(result.sources.length > 0
+                ? `发现 ${result.sources.length} 个可导入配置`
+                : "未发现可导入的本地 AI 配置");
+        } catch (error) {
+            setTransferError(errorMessage(error));
+        } finally {
+            setTransferBusy(null);
+        }
+    };
+
+    const toggleScannedSource = (index: number) => {
+        setSelectedScannedSources((current) => {
+            const next = new Set(current);
+            if (next.has(index)) {
+                next.delete(index);
+            } else {
+                next.add(index);
+            }
+            return next;
+        });
+    };
+
+    const importScannedConfigs = async () => {
+        const selected = scannedSources.filter((_, index) => selectedScannedSources.has(index));
+        if (selected.length === 0) {
+            setTransferError("请至少选择一个要导入的配置");
+            return;
+        }
+
+        setTransferBusy("scan-import");
+        setTransferError("");
+        setTransferMessage("");
+        try {
+            const result = await importExportApi.importScannedSources(selected);
+            await refreshChannels();
+            const suffix = result.errors.length > 0 ? `，${result.errors.length} 项失败` : "";
+            setTransferMessage(`已导入 ${result.imported} 个渠道，跳过 ${result.skipped} 个${suffix}`);
+            if (result.imported > 0) {
+                setScannedSources([]);
+                setSelectedScannedSources(new Set());
+            }
+        } catch (error) {
+            setTransferError(errorMessage(error));
+        } finally {
+            setTransferBusy(null);
+        }
+    };
     const toggleMutation = useMutation({
         mutationFn: (channel: Channel) => channelApi.toggle(channel.id, channel.status === 1 ? 0 : 1),
         onSuccess: refreshChannels,
@@ -386,9 +499,14 @@ export function ChannelsPage() {
                 title="渠道"
                 meta={`${activeCount} 条启用 · ${channels.length} 条已配置`}
                 action={(
-                    <button type="button" className="button-primary" onClick={() => setEditingChannel(null)}>
-                        <Plus size={16} />添加渠道
-                    </button>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                        <button type="button" className="button-secondary" onClick={() => { setTransferOpen(true); setTransferError(""); setTransferMessage(""); }}>
+                            <Upload size={15} />导入/导出
+                        </button>
+                        <button type="button" className="button-primary" onClick={() => setEditingChannel(null)}>
+                            <Plus size={16} />添加渠道
+                        </button>
+                    </div>
                 )}
             />
 
@@ -551,6 +669,75 @@ export function ChannelsPage() {
                     )}
                 >
                     <p className="text-sm leading-6 text-muted">删除后该渠道将立即退出路由，已有请求日志不会被删除。</p>
+                </Modal>
+            ) : null}
+
+            {transferOpen ? (
+                <Modal
+                    title="渠道导入与导出"
+                    description="在 CrowAPI 与其他本地安装之间迁移渠道配置"
+                    size="md"
+                    onClose={() => { if (!transferBusy) setTransferOpen(false); }}
+                    footer={<button type="button" className="button-secondary" disabled={transferBusy !== null} onClick={() => setTransferOpen(false)}>关闭</button>}
+                >
+                    <div className="space-y-4">
+                        <p className="text-sm leading-6 text-muted">
+                            导出文件包含渠道 API Key。请只在可信设备之间传输，并在完成迁移后妥善删除临时文件。
+                        </p>
+                        <div className="grid gap-2">
+                            <button type="button" className="button-secondary justify-center" disabled={transferBusy !== null} onClick={() => void importChannels()}>
+                                {transferBusy === "import" ? <span className="button-spinner" /> : <Upload size={15} />}选择 JSON 并导入
+                            </button>
+                            <button type="button" className="button-secondary justify-center" disabled={transferBusy !== null} onClick={() => void scanLocalConfigs()}>
+                                {transferBusy === "scan" ? <span className="button-spinner" /> : <ScanSearch size={15} />}扫描本地 AI 配置
+                            </button>
+                            <button type="button" className="button-secondary justify-center" disabled={transferBusy !== null} onClick={() => void exportChannels()}>
+                                {transferBusy === "export" ? <span className="button-spinner" /> : <Download size={15} />}导出当前渠道
+                            </button>
+                        </div>
+                        {scannedSources.length > 0 ? (
+                            <div className="scan-source-panel">
+                                <div className="scan-source-toolbar">
+                                    <div>
+                                        <strong>本地配置</strong>
+                                        <span>{selectedScannedSources.size}/{scannedSources.length} 已选择</span>
+                                    </div>
+                                    <div>
+                                        <button type="button" disabled={transferBusy !== null} onClick={() => setSelectedScannedSources(new Set(scannedSources.map((_, index) => index)))}>全选</button>
+                                        <button type="button" disabled={transferBusy !== null} onClick={() => setSelectedScannedSources(new Set())}>清空</button>
+                                    </div>
+                                </div>
+                                <div className="scan-source-list">
+                                    {scannedSources.map((source, index) => (
+                                        <label className="scan-source-row" key={`${source.source}-${source.name}-${index}`}>
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedScannedSources.has(index)}
+                                                disabled={transferBusy !== null}
+                                                onChange={() => toggleScannedSource(index)}
+                                            />
+                                            <span>
+                                                <strong>{source.name}</strong>
+                                                <small>{source.source} · {source.models.length} 个模型</small>
+                                                <code>{source.base_url || "使用默认 API 地址"}</code>
+                                            </span>
+                                        </label>
+                                    ))}
+                                </div>
+                                <button
+                                    type="button"
+                                    className="button-primary justify-center"
+                                    disabled={transferBusy !== null || selectedScannedSources.size === 0}
+                                    onClick={() => void importScannedConfigs()}
+                                >
+                                    {transferBusy === "scan-import" ? <span className="button-spinner is-inverse" /> : <Upload size={15} />}
+                                    导入所选配置
+                                </button>
+                            </div>
+                        ) : null}
+                        {transferMessage ? <p className="text-sm text-accent" role="status">{transferMessage}</p> : null}
+                        {transferError ? <p className="form-error" role="alert">{transferError}</p> : null}
+                    </div>
                 </Modal>
             ) : null}
 

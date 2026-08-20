@@ -20,7 +20,7 @@ export function PageTitle({ title, meta, action }: PageTitleProps) {
                 <h1 className="font-display text-[24px] font-semibold leading-8 text-ink">{title}</h1>
                 {meta ? <p className="mt-1 text-sm text-muted">{meta}</p> : null}
             </div>
-            {action ? <div className="flex items-center gap-2">{action}</div> : null}
+            {action ? <div className="page-title-action flex items-center gap-2">{action}</div> : null}
         </div>
     );
 }
@@ -56,6 +56,7 @@ interface ModalProps {
 
 export function Modal({ title, description, children, onClose, footer, size = "md" }: ModalProps) {
     const titleId = useId();
+    const descriptionId = useId();
     const panelRef = useRef<HTMLElement>(null);
     const onCloseRef = useRef(onClose);
 
@@ -121,12 +122,13 @@ export function Modal({ title, description, children, onClose, footer, size = "m
                 role="dialog"
                 aria-modal="true"
                 aria-labelledby={titleId}
+                aria-describedby={description ? descriptionId : undefined}
                 tabIndex={-1}
             >
                 <header className="flex items-start justify-between gap-5 border-b border-line px-6 py-5">
                     <div>
                         <h2 id={titleId} className="font-display text-lg font-semibold text-ink">{title}</h2>
-                        {description ? <p className="mt-1 text-sm text-muted">{description}</p> : null}
+                        {description ? <p id={descriptionId} className="mt-1 text-sm text-muted">{description}</p> : null}
                     </div>
                     <IconButton label="关闭" onClick={onClose} className="-mr-1 -mt-1">
                         <X size={18} />

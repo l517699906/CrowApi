@@ -73,7 +73,10 @@ impl Adaptor for ClaudeAdaptor {
             claude_body["temperature"] = temp;
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client.post(&url)
             .header("x-api-key", &config.api_key)           // Claude 特有的认证头
             .header("anthropic-version", "2023-06-01")       // 必填的版本头
@@ -113,7 +116,10 @@ impl Adaptor for ClaudeAdaptor {
             claude_body["system"] = serde_json::Value::String(sys);
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client.post(&url)
             .header("x-api-key", &config.api_key)
             .header("anthropic-version", "2023-06-01")

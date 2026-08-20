@@ -49,7 +49,10 @@ impl Adaptor for OpenAIAdaptor {
         // 应用模型映射：用户请求的模型名 → 上游真实模型名
         let body = apply_model_mapping(&request.body, &config.model_mapping);
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
@@ -81,7 +84,10 @@ impl Adaptor for OpenAIAdaptor {
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let body = apply_model_mapping(&request.body, &config.model_mapping);
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
@@ -100,9 +106,7 @@ pub fn apply_model_mapping(body: &serde_json::Value, mapping: &serde_json::Value
     }
     let mut body = body.clone();
     if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
-        if let Some(mapped) = mapping.get(model).and_then(|m| m.as_str()) {
-            body["model"] = serde_json::Value::String(mapped.to_string());
-        }
+        body["model"] = serde_json::Value::String(super::resolve_model_mapping(model, mapping));
     }
     sanitize_messages(body)
 }

@@ -15,6 +15,7 @@ pub struct ChannelConfig {
     pub models: Vec<String>,
     pub model_mapping: serde_json::Value,
     pub extra: serde_json::Value,
+    pub timeout_secs: u64,
 }
 
 // 代理请求——统一的上游请求抽象
@@ -79,6 +80,74 @@ pub fn get_adaptor(channel_type: &str) -> Box<dyn Adaptor> {
         "gemini" => Box::new(gemini::GeminiAdaptor),
         "custom" => Box::new(custom::CustomAdaptor),
         _ => Box::new(custom::CustomAdaptor),      // 未知类型兜底走自定义
+    }
+}
+
+pub fn resolve_model_mapping(requested_model: &str, mapping: &serde_json::Value) -> String {
+    let Some(mapped) = mapping.get(requested_model) else {
+        return requested_model.to_string();
+    };
+    if let Some(model) = mapped.as_str() {
+        return model.to_string();
+    }
+    let Some(models) = mapped.as_array() else {
+        return requested_model.to_string();
+    };
+    let candidates = models.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return requested_model.to_string();
+    }
+    let index = rand::Rng::random_range(&mut rand::rng(), 0..candidates.len());
+    candidates[index].to_string()
+}
+
+/// Resolve a channel's model mapping exactly once and disable re-mapping inside
+/// protocol adaptors, keeping the forwarded model and request log consistent.
+pub fn prepare_channel_request(
+    request: &ProxyRequest,
+    config: &ChannelConfig,
+) -> (ProxyRequest, ChannelConfig, String) {
+    let requested_model = request
+        .body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&request.model);
+    let upstream_model = resolve_model_mapping(requested_model, &config.model_mapping);
+    let mut channel_request = request.clone();
+    channel_request.model = upstream_model.clone();
+    if channel_request.body.is_object() {
+        channel_request.body["model"] = serde_json::Value::String(upstream_model.clone());
+    }
+    let mut channel_config = config.clone();
+    channel_config.model_mapping = serde_json::Value::Object(Default::default());
+    (channel_request, channel_config, upstream_model)
+}
+
+#[cfg(test)]
+mod model_mapping_tests {
+    use super::{prepare_channel_request, ChannelConfig, ProxyRequest};
+
+    #[test]
+    fn array_mapping_updates_body_and_log_model_together() {
+        let request = ProxyRequest {
+            model: "public-model".to_string(),
+            body: serde_json::json!({"model": "public-model", "messages": []}),
+            stream: true,
+        };
+        let config = ChannelConfig {
+            base_url: "http://localhost".to_string(),
+            api_key: "test".to_string(),
+            models: vec![],
+            model_mapping: serde_json::json!({"public-model": ["upstream-model"]}),
+            extra: serde_json::json!({}),
+            timeout_secs: 1,
+        };
+
+        let (mapped, mapped_config, upstream_model) = prepare_channel_request(&request, &config);
+        assert_eq!(upstream_model, "upstream-model");
+        assert_eq!(mapped.model, "upstream-model");
+        assert_eq!(mapped.body["model"], "upstream-model");
+        assert_eq!(mapped_config.model_mapping, serde_json::json!({}));
     }
 }
 

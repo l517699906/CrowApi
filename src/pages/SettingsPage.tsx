@@ -11,6 +11,7 @@ import {
     Save,
     Server,
     Settings2,
+    ShieldAlert,
     ShieldCheck,
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -24,13 +25,15 @@ import { errorMessage, queryKeys } from "../lib/query";
 import { applyUiTheme } from "../lib/theme";
 import type { Settings, UiTheme } from "../types";
 import { PageTitle, Toast, Toggle } from "../components/ui";
+import { SecurityRulesPanel } from "../components/SecurityRulesPanel";
 
-type SettingsTab = "service" | "quota" | "general" | "interface" | "retry" | "update";
+type SettingsTab = "service" | "quota" | "general" | "security" | "interface" | "retry" | "update";
 
 const tabs: Array<{ id: SettingsTab; label: string; icon: typeof Server }> = [
     { id: "service", label: "服务配置", icon: Server },
     { id: "quota", label: "配额管理", icon: Gauge },
     { id: "general", label: "通用设置", icon: Settings2 },
+    { id: "security", label: "安全规则", icon: ShieldAlert },
     { id: "interface", label: "界面设置", icon: Palette },
     { id: "retry", label: "重试策略", icon: RefreshCcw },
     { id: "update", label: "软件更新", icon: DownloadCloud },
@@ -301,17 +304,49 @@ export function SettingsPage() {
                                     <Toggle checked={draft.close_to_tray} label="关闭到托盘" onChange={(value) => updateSetting("close_to_tray", value)} />
                                 </div>
                             </div>
-                            <div className="settings-heading mt-8">
+                        </div>
+                    ) : null}
+
+                    {activeTab === "security" ? (
+                        <div className="settings-section page-enter" key="security">
+                            <div className="settings-heading">
                                 <span className="settings-heading-icon settings-heading-amber"><ShieldCheck size={19} /></span>
-                                <div><h2>请求安全</h2><p>敏感内容扫描与脱敏</p></div>
+                                <div><h2>请求安全</h2><p>敏感内容扫描、处理方式与本地规则</p></div>
+                            </div>
+                            <div className="settings-form-block">
+                                <label className="field-label max-w-sm">
+                                    <span>处理模式</span>
+                                    <select className="field-input" value={draft.security_mode} onChange={(event) => updateSetting("security_mode", event.target.value)}>
+                                        <option value="audit">仅审计</option>
+                                        <option value="redact">审计并脱敏</option>
+                                        <option value="block">审计并拦截</option>
+                                    </select>
+                                    <small>决定发现风险后仅记录、清理敏感内容，或直接阻止请求</small>
+                                </label>
                             </div>
                             <div className="setting-rows">
                                 <div className="setting-row">
-                                    <div><strong>启用安全扫描</strong><span>检查请求中的工具、网络和 Unicode 风险</span></div>
+                                    <div><strong>启用安全扫描</strong><span>对请求和响应执行本地风险检查</span></div>
                                     <Toggle checked={draft.security_enabled} label="启用安全扫描" onChange={(value) => updateSetting("security_enabled", value)} />
                                 </div>
                                 <div className="setting-row">
-                                    <div><strong>自动脱敏密钥</strong><span>日志中隐藏检测到的凭据</span></div>
+                                    <div><strong>扫描 Unicode 风险</strong><span>检测零宽字符、双向控制符和同形字符</span></div>
+                                    <Toggle checked={draft.security_scan_unicode} label="扫描 Unicode 风险" onChange={(value) => updateSetting("security_scan_unicode", value)} />
+                                </div>
+                                <div className="setting-row">
+                                    <div><strong>扫描工具调用</strong><span>检测命令执行、外传与远程脚本风险</span></div>
+                                    <Toggle checked={draft.security_scan_tools} label="扫描工具调用" onChange={(value) => updateSetting("security_scan_tools", value)} />
+                                </div>
+                                <div className="setting-row">
+                                    <div><strong>扫描网络内容</strong><span>检测外部链接、探测服务和可疑接收地址</span></div>
+                                    <Toggle checked={draft.security_scan_network} label="扫描网络内容" onChange={(value) => updateSetting("security_scan_network", value)} />
+                                </div>
+                                <div className="setting-row">
+                                    <div><strong>扫描上游响应</strong><span>返回客户端前继续检查模型输出</span></div>
+                                    <Toggle checked={draft.security_scan_response} label="扫描上游响应" onChange={(value) => updateSetting("security_scan_response", value)} />
+                                </div>
+                                <div className="setting-row">
+                                    <div><strong>转发前脱敏密钥</strong><span>向上游发送前隐藏检测到的凭据；本地日志始终脱敏</span></div>
                                     <Toggle checked={draft.security_redact_secrets} label="自动脱敏密钥" onChange={(value) => updateSetting("security_redact_secrets", value)} />
                                 </div>
                                 <div className="setting-row">
@@ -319,6 +354,11 @@ export function SettingsPage() {
                                     <Toggle checked={draft.security_block_on_critical} label="拦截严重风险" onChange={(value) => updateSetting("security_block_on_critical", value)} />
                                 </div>
                             </div>
+                            <SecurityRulesPanel onNotice={(message) => {
+                                setToast(message);
+                                window.setTimeout(() => setToast(""), 1800);
+                            }} />
+                            <div className="settings-note"><CircleHelp size={17} /><span>开关与处理模式需保存后生效；规则操作会立即写入本地数据库。</span></div>
                         </div>
                     ) : null}
 

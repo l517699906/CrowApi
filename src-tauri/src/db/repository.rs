@@ -43,8 +43,8 @@ impl Repository {
             .unwrap_or_else(|| "{}".to_string());
 
         sqlx::query(
-            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, weight, config, model_mapping, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, weight, config, model_mapping, timeout_secs, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
@@ -103,6 +103,9 @@ impl Repository {
         if let Some(mapping) = &input.model_mapping {
             let m = serde_json::to_string(mapping).unwrap_or_else(|_| "{}".to_string());
             q.push(", model_mapping = ").push_bind(m);
+        }
+        if let Some(timeout_secs) = input.timeout_secs {
+            q.push(", timeout_secs = ").push_bind(timeout_secs);
         }
 
         q.push(" WHERE id = ").push_bind(&input.id);
@@ -447,7 +450,7 @@ impl Repository {
     ) -> Result<DashboardStats, sqlx::Error> {
         let mut today_query = QueryBuilder::new(
             "SELECT COUNT(*) AS request_count, COALESCE(SUM(total_tokens), 0) AS total_tokens, \
-             COALESCE(AVG(duration_ms), 0) AS avg_latency FROM request_logs WHERE 1=1",
+             COALESCE(AVG(duration_ms), CAST(0 AS REAL)) AS avg_latency FROM request_logs WHERE 1=1",
         );
         push_stats_date_range(&mut today_query, date_from, date_to);
         let (today_requests, today_total_tokens, avg_latency) = today_query
@@ -753,4 +756,59 @@ fn push_log_filters(
         query.push(" AND trace_id LIKE ").push_bind(format!("%{}%", trace_id));
     }
     push_date_range(query, date_from, date_to);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Repository;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn dashboard_stats_return_real_zero_for_an_empty_date_range() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create in-memory SQLite pool");
+
+        for statement in [
+            "CREATE TABLE request_logs (mode TEXT NOT NULL, total_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)",
+            "CREATE TABLE channels (status INTEGER NOT NULL)",
+            "CREATE TABLE api_keys (id TEXT)",
+            "CREATE TABLE kb_knowledge_bases (id TEXT)",
+            "CREATE TABLE kb_documents (id TEXT)",
+            "CREATE TABLE kb_chunks (id TEXT)",
+        ] {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("create dashboard statistics table");
+        }
+
+        sqlx::query(
+            "INSERT INTO request_logs (mode, total_tokens, duration_ms, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind("chat")
+        .bind(42_i64)
+        .bind(250_i64)
+        .bind("2026-08-19T12:00:00.000Z")
+        .execute(&pool)
+        .await
+        .expect("insert historical request log");
+
+        let repository = Repository::new(pool);
+        let stats = repository
+            .get_dashboard_stats(
+                Some("2026-08-20T00:00:00.000Z"),
+                Some("2026-08-21T00:00:00.000Z"),
+            )
+            .await
+            .expect("load dashboard statistics for an empty date range");
+
+        assert_eq!(stats.today_requests, 0);
+        assert_eq!(stats.today_total_tokens, 0);
+        assert_eq!(stats.avg_latency_ms, 0.0);
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.total_tokens, 42);
+    }
 }

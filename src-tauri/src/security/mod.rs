@@ -223,3 +223,30 @@ pub fn redact_request_body(body: &serde_json::Value, settings: &SecuritySettings
     let was_redacted = redacted != *body;
     (redacted, was_redacted)
 }
+
+/// Request logs never persist detected credentials in clear text, regardless of
+/// whether forwarding-time redaction is enabled for the upstream request.
+pub fn redact_request_body_for_log(body: &serde_json::Value) -> String {
+    let settings = SecuritySettings {
+        enabled: true,
+        redact_secrets: true,
+        ..SecuritySettings::default()
+    };
+    serde_json::to_string(&redact::redact_json(body, &settings)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod log_redaction_tests {
+    use super::redact_request_body_for_log;
+
+    #[test]
+    fn request_logs_mask_credentials_by_default() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "Bearer sk-abcdefghijklmnopqrstuvwxyz123456"}],
+            "api_key": "sk-abcdefghijklmnopqrstuvwxyz123456"
+        });
+        let logged = redact_request_body_for_log(&body);
+        assert!(!logged.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(logged.contains("****"));
+    }
+}

@@ -114,15 +114,18 @@ pub fn load_settings(app: &AppHandle) -> AppSettings {
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or(defaults.ui_language),
         minimize_to_tray: store
-            .get("app.minimize_to_tray")
+            .get("general.minimize_to_tray")
+            .or_else(|| store.get("app.minimize_to_tray"))
             .and_then(|value| value.as_bool())
             .unwrap_or(defaults.minimize_to_tray),
         close_to_tray: store
-            .get("app.close_to_tray")
+            .get("general.close_to_tray")
+            .or_else(|| store.get("app.close_to_tray"))
             .and_then(|value| value.as_bool())
             .unwrap_or(defaults.close_to_tray),
         auto_start: store
-            .get("app.auto_start")
+            .get("general.auto_start")
+            .or_else(|| store.get("app.auto_start"))
             .and_then(|value| value.as_bool())
             .unwrap_or(defaults.auto_start),
         retry_enabled: store
@@ -177,48 +180,4 @@ pub fn load_settings(app: &AppHandle) -> AppSettings {
             .and_then(|value| value.as_bool())
             .unwrap_or(defaults.security_block_on_critical),
     }
-}
-
-pub fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
-    let host = settings.server_host.trim();
-    if host.is_empty() {
-        return Err("监听地址不能为空".to_string());
-    }
-    if settings.server_port < 1024 {
-        return Err("服务端口必须在 1024 到 65535 之间".to_string());
-    }
-    if !(0..=5).contains(&settings.retry_times) {
-        return Err("最大重试次数必须在 0 到 5 之间".to_string());
-    }
-    if settings.default_key_quota < 0 || settings.total_quota < 0 {
-        return Err("配额不能小于 0".to_string());
-    }
-    if !is_supported_ui_theme(&settings.ui_theme) {
-        return Err("不支持的界面主题".to_string());
-    }
-    if !matches!(settings.security_mode.as_str(), "audit" | "redact" | "block") {
-        return Err("安全模式必须是 audit、redact 或 block".to_string());
-    }
-
-    let store = app.store("settings.json").map_err(|error| error.to_string())?;
-    store.set("server.port", serde_json::json!(settings.server_port));
-    store.set("server.host", serde_json::json!(host));
-    store.set("ui.theme", serde_json::json!(settings.ui_theme));
-    store.set("ui.language", serde_json::json!(settings.ui_language));
-    store.set("app.minimize_to_tray", serde_json::json!(settings.minimize_to_tray));
-    store.set("app.close_to_tray", serde_json::json!(settings.close_to_tray));
-    store.set("app.auto_start", serde_json::json!(settings.auto_start));
-    store.set("retry.enabled", serde_json::json!(settings.retry_enabled));
-    store.set("retry.times", serde_json::json!(settings.retry_times));
-    store.set("quota.default_key_limit", serde_json::json!(settings.default_key_quota));
-    store.set("quota.total_limit", serde_json::json!(settings.total_quota));
-    store.set("security.enabled", serde_json::json!(settings.security_enabled));
-    store.set("security.mode", serde_json::json!(settings.security_mode));
-    store.set("security.scan_unicode", serde_json::json!(settings.security_scan_unicode));
-    store.set("security.scan_tools", serde_json::json!(settings.security_scan_tools));
-    store.set("security.scan_network", serde_json::json!(settings.security_scan_network));
-    store.set("security.scan_response", serde_json::json!(settings.security_scan_response));
-    store.set("security.redact_secrets", serde_json::json!(settings.security_redact_secrets));
-    store.set("security.block_on_critical", serde_json::json!(settings.security_block_on_critical));
-    store.save().map_err(|error| error.to_string())
 }

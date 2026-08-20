@@ -57,9 +57,19 @@ pub async fn delete_kb_document(
     kb_id: String,
 ) -> Result<(), String> {
     let repo = KbRepository::new(state.db.pool.clone());
-    if let Ok(doc) = repo.get_document(&doc_id).await {
+    let doc = match repo.get_document(&doc_id).await {
+        Ok(doc) if doc.kb_id == kb_id => doc,
+        Ok(_) => return Err("文档不属于该知识库".to_string()),
+        Err(sqlx::Error::RowNotFound) => return Err("文档不存在".to_string()),
+        Err(error) => return Err(format!("读取文档失败: {}", error)),
+    };
+    if doc.source_type == "upload" {
         if let Some(path) = &doc.file_path {
-            std::fs::remove_file(path).ok();
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("删除文档文件失败: {}", error)),
+            }
         }
     }
     repo.delete_document(&doc_id).await.map_err(|e| e.to_string())?;
@@ -224,18 +234,57 @@ pub async fn search_knowledge_base(
 ) -> Result<Vec<SearchResult>, String> {
     let pool = &state.db.pool;
     let repo = Repository::new(pool.clone());
+    let search_mode = input
+        .search_mode
+        .as_deref()
+        .unwrap_or(if input.kb_id.is_some() { "hybrid" } else { "vector" });
+    if !matches!(search_mode, "hybrid" | "vector" | "keyword") {
+        return Err(format!("Unsupported search_mode: {}", search_mode));
+    }
 
-    let emb_model = if let Some(kb_id) = &input.kb_id {
+    if input.kb_id.is_none() && search_mode != "vector" {
+        return Err("Cross-knowledge-base search currently supports vector mode only".to_string());
+    }
+
+    let vector_weight = input.vector_weight.unwrap_or(0.7);
+    let keyword_weight = input.keyword_weight.unwrap_or(0.3);
+    if search_mode == "hybrid"
+        && (!vector_weight.is_finite()
+            || !keyword_weight.is_finite()
+            || vector_weight < 0.0
+            || keyword_weight < 0.0
+            || vector_weight + keyword_weight <= 0.0)
+    {
+        return Err("Hybrid search weights must be finite, non-negative, and have a positive sum".to_string());
+    }
+
+    if search_mode == "keyword" {
+        let kb_id = input.kb_id.as_deref().expect("keyword mode requires kb_id");
+        return crate::services::knowledge::retriever::keyword_only_search(
+            pool,
+            kb_id,
+            &input.query,
+            input.top_k,
+        )
+        .await;
+    }
+
+    let (emb_model, embedding_channel_id) = if let Some(kb_id) = &input.kb_id {
         let kb_repo = KbRepository::new(pool.clone());
-        kb_repo.get_kb(kb_id).await.ok()
-            .and_then(|kb| kb.embedding_model)
-            .unwrap_or_else(|| "text-embedding-3-small".to_string())
+        let kb = kb_repo
+            .get_kb(kb_id)
+            .await
+            .map_err(|e| format!("Failed to load knowledge base: {}", e))?;
+        (
+            kb.embedding_model.unwrap_or_else(|| "text-embedding-3-small".to_string()),
+            kb.embedding_channel_id,
+        )
     } else {
-        "text-embedding-3-small".to_string()
+        ("text-embedding-3-small".to_string(), None)
     };
 
-    let embeddings = crate::services::knowledge::embedder::embed(
-        &[input.query.clone()], &emb_model, &repo
+    let embeddings = crate::services::knowledge::embedder::embed_with_channel(
+        &[input.query.clone()], &emb_model, &repo, embedding_channel_id.as_deref()
     ).await.map_err(|e| e)?;
 
     if embeddings.is_empty() {
@@ -243,7 +292,26 @@ pub async fn search_knowledge_base(
     }
 
     let results = if let Some(kb_id) = &input.kb_id {
-        crate::services::knowledge::retriever::search(pool, kb_id, &embeddings[0], input.top_k).await
+        if search_mode == "hybrid" {
+            crate::services::knowledge::retriever::hybrid_search(
+                pool,
+                kb_id,
+                &input.query,
+                &embeddings[0],
+                input.top_k,
+                vector_weight,
+                keyword_weight,
+            )
+            .await
+        } else {
+            crate::services::knowledge::retriever::search(
+                pool,
+                kb_id,
+                &embeddings[0],
+                input.top_k,
+            )
+            .await
+        }
     } else {
         crate::services::knowledge::retriever::search_all(pool, &embeddings[0], input.top_k, false).await
     };
@@ -287,8 +355,11 @@ pub async fn ask_knowledge_base(
 
     let emb_model = if !kb_id.is_empty() {
         let kb_repo = KbRepository::new(pool.clone());
-        kb_repo.get_kb(&kb_id).await.ok()
-            .and_then(|kb| kb.embedding_model)
+        let kb = kb_repo
+            .get_kb(&kb_id)
+            .await
+            .map_err(|error| format!("Failed to load knowledge base: {}", error))?;
+        kb.embedding_model
             .unwrap_or_else(|| "text-embedding-3-small".to_string())
     } else {
         "text-embedding-3-small".to_string()
@@ -319,12 +390,12 @@ pub async fn get_kb_stats(
 ) -> Result<serde_json::Value, String> {
     let repo = KbRepository::new(state.db.pool.clone());
     let kb = repo.get_kb(&kb_id).await.map_err(|e| e.to_string())?;
-    let docs = repo.get_documents(&kb_id).await.unwrap_or_default();
+    let docs = repo.get_documents(&kb_id).await.map_err(|e| e.to_string())?;
     let ready = docs.iter().filter(|d| d.status == "ready").count();
     let processing = docs.iter().filter(|d| d.status == "processing").count();
     let failed = docs.iter().filter(|d| d.status == "failed").count();
 
-    let index_meta = repo.get_index_meta(&kb_id).await.ok().flatten();
+    let index_meta = repo.get_index_meta(&kb_id).await.map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
         "kb": kb,
@@ -364,9 +435,13 @@ pub async fn upload_kb_document(
     let hash = sha2::Sha256::digest(&content);
     let hash_hex = hex::encode(hash);
 
-    if let Ok(Some(_)) = repo.find_document_by_hash(&input.kb_id, &hash_hex).await {
-        return Err("Document with same content already exists".to_string());
+    match repo.find_document_by_hash(&input.kb_id, &hash_hex).await {
+        Ok(Some(_)) => return Err("Document with same content already exists".to_string()),
+        Ok(None) => {}
+        Err(error) => return Err(error.to_string()),
     }
+
+    crate::services::knowledge::safe_path_component(&input.filename, "filename")?;
 
     let file_type = crate::services::knowledge::parser::get_file_type(&input.filename);
     let file_size = content.len() as i64;
@@ -374,16 +449,26 @@ pub async fn upload_kb_document(
     let app_data_dir = app.path().app_data_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let kb_dir = app_data_dir.join("kb_files").join(&input.kb_id);
-    std::fs::create_dir_all(&kb_dir).ok();
+    std::fs::create_dir_all(&kb_dir)
+        .map_err(|error| format!("创建知识库文件目录失败: {}", error))?;
     let doc_id = uuid::Uuid::new_v4().to_string();
     let file_path = kb_dir.join(format!("{}_{}", &doc_id, &input.filename));
-    std::fs::write(&file_path, &content).ok();
+    std::fs::write(&file_path, &content)
+        .map_err(|error| format!("保存文档文件失败: {}", error))?;
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let doc = repo.create_document(
+    let doc = match repo.create_document(
         &input.kb_id, &input.filename, Some(&file_path_str),
         &file_type, file_size, &hash_hex
-    ).await.map_err(|e| e.to_string())?;
+    ).await {
+        Ok(doc) => doc,
+        Err(error) => {
+            if let Err(remove_error) = std::fs::remove_file(&file_path) {
+                tracing::warn!(%remove_error, path = %file_path.display(), "failed to remove document after DB insert error");
+            }
+            return Err(error.to_string());
+        }
+    };
 
     let kb = repo.get_kb(&input.kb_id).await.map_err(|e| e.to_string())?;
     let emb_model = kb.embedding_model.clone();
@@ -443,7 +528,12 @@ pub async fn delete_kb_source(
     kb_id: String,
 ) -> Result<(), String> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.delete_source(&source_id).await.map_err(|e| e.to_string())?;
+    repo.delete_source_with_documents(&kb_id, &source_id)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => "来源不存在或不属于该知识库".to_string(),
+            error => error.to_string(),
+        })?;
     repo.update_kb_counts(&kb_id).await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -489,10 +579,14 @@ pub async fn import_kb_source(
         let repo = KbRepository::new(pool.clone());
         match result {
             Ok(count) => {
-                repo.update_source_status(&source_id, "done", count as i64, None).await.ok();
+                if let Err(error) = repo.update_source_status(&source_id, "done", count as i64, None).await {
+                    tracing::warn!(%error, source_id = %source_id, "failed to persist knowledge source completion");
+                }
             }
             Err(e) => {
-                repo.update_source_status(&source_id, "error", 0, Some(&e)).await.ok();
+                if let Err(error) = repo.update_source_status(&source_id, "error", 0, Some(&e)).await {
+                    tracing::warn!(%error, source_id = %source_id, "failed to persist knowledge source failure");
+                }
                 tracing::error!("Import failed: {}", e);
             }
         }
@@ -520,7 +614,9 @@ pub async fn build_kb_index(
 
     // Update status to building immediately
     let repo = KbRepository::new(pool.clone());
-    repo.update_kb_index_status(&kb_id, "building").await.ok();
+    repo.update_kb_index_status(&kb_id, "building")
+        .await
+        .map_err(|error| format!("Failed to update index status: {}", error))?;
 
     // Spawn the actual HNSW index build
     tokio::spawn(async move {
@@ -550,7 +646,9 @@ pub async fn build_kb_index(
             Err(e) => {
                 tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id_clone, e);
                 let repo = KbRepository::new(pool.clone());
-                repo.update_kb_index_status(&kb_id_clone, "error").await.ok();
+                if let Err(error) = repo.update_kb_index_status(&kb_id_clone, "error").await {
+                    tracing::warn!(%error, knowledge_base_id = %kb_id_clone, "failed to persist index failure status");
+                }
                 let _ = app.emit("kb-index-progress", serde_json::json!({
                     "kb_id": &kb_id_clone,
                     "status": "error",
