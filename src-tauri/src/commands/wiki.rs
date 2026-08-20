@@ -1,9 +1,10 @@
 #![allow(non_snake_case)] // Tauri argument names are part of the frontend command contract.
 
 use crate::AppState;
+use crate::core::error::{CommandError, CommandResult, CommandResultExt};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::State;
 
 // Re-export models for convenience
 pub use crate::services::wiki::models::*;
@@ -13,14 +14,14 @@ pub use crate::services::wiki::models::*;
 #[tauri::command]
 pub async fn get_wiki_projects(
     state: State<'_, Arc<AppState>>,
-) -> Result<Vec<WikiProject>, String> {
+) -> CommandResult<Vec<WikiProject>> {
     let pool = state.db.pool.clone();
     let rows = sqlx::query_as::<_, WikiProject>(
         "SELECT * FROM wiki_projects ORDER BY created_at DESC"
     )
     .fetch_all(&pool)
     .await
-    .map_err(|e| format!("DB error: {}", e))?;
+    .command_error("WIKI_PROJECT_LIST_FAILED", "读取 Wiki 项目失败", true)?;
     Ok(rows)
 }
 
@@ -28,7 +29,7 @@ pub async fn get_wiki_projects(
 pub async fn create_wiki_project(
     state: State<'_, Arc<AppState>>,
     input: CreateProjectInput,
-) -> Result<WikiProject, String> {
+) -> CommandResult<WikiProject> {
     let pool = state.db.pool.clone();
     let project_id = crate::services::wiki::project::new_uuid();
     let schema = input.schema_text.clone().unwrap_or_else(|| {
@@ -36,7 +37,9 @@ pub async fn create_wiki_project(
     });
 
     // Create directory structure
-    let dir = crate::services::wiki::project::init_project_dir(&project_id, &schema).await?;
+    let dir = crate::services::wiki::project::init_project_dir(&project_id, &schema)
+        .await
+        .command_error("WIKI_PROJECT_STORAGE_CREATE_FAILED", "创建 Wiki 项目目录失败", false)?;
     let wiki_dir = dir.to_string_lossy().to_string();
 
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
@@ -44,9 +47,19 @@ pub async fn create_wiki_project(
         Ok(project) => Ok(project),
         Err(error) => {
             if let Err(cleanup_error) = crate::services::wiki::project::remove_project_dir(&project_id).await {
-                return Err(format!("{}; failed to clean up project directory: {}", error, cleanup_error));
+                return Err(CommandError::reported(
+                    "WIKI_PROJECT_CREATE_ROLLBACK_FAILED",
+                    "创建 Wiki 项目失败，且无法清理项目目录",
+                    false,
+                    format!("{}; cleanup: {}", error, cleanup_error),
+                ));
             }
-            Err(error)
+            Err(CommandError::reported(
+                "WIKI_PROJECT_CREATE_FAILED",
+                "创建 Wiki 项目失败",
+                false,
+                error,
+            ))
         }
     }
 }
@@ -55,10 +68,12 @@ pub async fn create_wiki_project(
 pub async fn get_wiki_project(
     state: State<'_, Arc<AppState>>,
     id: String,
-) -> Result<WikiProject, String> {
+) -> CommandResult<WikiProject> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.get_project(&id).await
+    repo.get_project(&id)
+        .await
+        .command_error("WIKI_PROJECT_READ_FAILED", "读取 Wiki 项目失败", true)
 }
 
 #[tauri::command]
@@ -66,36 +81,51 @@ pub async fn update_wiki_project(
     state: State<'_, Arc<AppState>>,
     id: String,
     input: UpdateProjectInput,
-) -> Result<WikiProject, String> {
+) -> CommandResult<WikiProject> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
 
     if let Some(ref schema) = input.schema_text {
-        let dir = crate::services::wiki::project::project_wiki_dir(&id)?;
+        let dir = crate::services::wiki::project::project_wiki_dir(&id)
+            .command_error("WIKI_PROJECT_PATH_INVALID", "Wiki 项目路径无效", false)?;
         let schema_path = dir.join("schema").join("CLAUDE.md");
         tokio::fs::write(&schema_path, schema)
             .await
-            .map_err(|e| format!("Failed to write Wiki schema {}: {}", schema_path.display(), e))?;
+            .command_error("WIKI_SCHEMA_WRITE_FAILED", "保存 Wiki Schema 失败", false)?;
     }
 
-    repo.update_project(&id, &input).await
+    repo.update_project(&id, &input)
+        .await
+        .command_error("WIKI_PROJECT_UPDATE_FAILED", "更新 Wiki 项目失败", false)
 }
 
 #[tauri::command]
 pub async fn delete_wiki_project(
     state: State<'_, Arc<AppState>>,
     id: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    let staged = crate::services::wiki::project::stage_project_dir_removal(&id).await?;
+    let staged = crate::services::wiki::project::stage_project_dir_removal(&id)
+        .await
+        .command_error("WIKI_PROJECT_DELETE_STAGE_FAILED", "准备删除 Wiki 项目失败", false)?;
     if let Err(error) = repo.delete_project(&id).await {
         if let Some(ref removal) = staged {
             if let Err(restore_error) = crate::services::wiki::project::restore_staged_removal(removal).await {
-                return Err(format!("{}; failed to restore project directory: {}", error, restore_error));
+                return Err(CommandError::reported(
+                    "WIKI_PROJECT_DELETE_ROLLBACK_FAILED",
+                    "删除 Wiki 项目失败，且无法恢复项目目录",
+                    false,
+                    format!("{}; restore: {}", error, restore_error),
+                ));
             }
         }
-        return Err(error);
+        return Err(CommandError::reported(
+            "WIKI_PROJECT_DELETE_FAILED",
+            "删除 Wiki 项目失败",
+            false,
+            error,
+        ));
     }
     if let Some(removal) = staged {
         if let Err(error) = crate::services::wiki::project::finalize_staged_removal(removal).await {
@@ -111,10 +141,12 @@ pub async fn delete_wiki_project(
 pub async fn get_wiki_pages(
     state: State<'_, Arc<AppState>>,
     projectId: String,
-) -> Result<Vec<WikiPage>, String> {
+) -> CommandResult<Vec<WikiPage>> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.list_pages(&projectId).await
+    repo.list_pages(&projectId)
+        .await
+        .command_error("WIKI_PAGE_LIST_FAILED", "读取 Wiki 页面失败", true)
 }
 
 #[tauri::command]
@@ -122,13 +154,19 @@ pub async fn get_wiki_page(
     state: State<'_, Arc<AppState>>,
     projectId: String,
     path: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
 
-    match repo.get_page(&projectId, &path).await? {
+    match repo
+        .get_page(&projectId, &path)
+        .await
+        .command_error("WIKI_PAGE_READ_FAILED", "读取 Wiki 页面失败", true)?
+    {
         Some(page) => {
-            let content = crate::services::wiki::project::read_page(&projectId, &path).await?;
+            let content = crate::services::wiki::project::read_page(&projectId, &path)
+                .await
+                .command_error("WIKI_PAGE_FILE_READ_FAILED", "读取 Wiki 页面文件失败", true)?;
             return Ok(serde_json::json!({
                 "id": page.id,
                 "project_id": page.project_id,
@@ -158,7 +196,12 @@ pub async fn get_wiki_page(
                 "page_type": "unknown",
             }))
         }
-        Err(e) => Err(e),
+        Err(error) => Err(CommandError::reported(
+            "WIKI_PAGE_NOT_FOUND",
+            "Wiki 页面不存在或无法读取",
+            false,
+            error,
+        )),
     }
 }
 
@@ -168,7 +211,7 @@ pub async fn save_wiki_page(
     projectId: String,
     path: String,
     content: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
     crate::services::wiki::handlers::update_page_inner(
@@ -177,7 +220,7 @@ pub async fn save_wiki_page(
         &projectId,
         &path,
         &content,
-    ).await
+    ).await.command_error("WIKI_PAGE_SAVE_FAILED", "保存 Wiki 页面失败", false)
 }
 
 // ── Wiki Sources ──
@@ -186,10 +229,12 @@ pub async fn save_wiki_page(
 pub async fn get_wiki_sources(
     state: State<'_, Arc<AppState>>,
     projectId: String,
-) -> Result<Vec<WikiSource>, String> {
+) -> CommandResult<Vec<WikiSource>> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.list_sources(&projectId).await
+    repo.list_sources(&projectId)
+        .await
+        .command_error("WIKI_SOURCE_LIST_FAILED", "读取 Wiki 来源失败", true)
 }
 
 #[tauri::command]
@@ -197,7 +242,7 @@ pub async fn add_wiki_source(
     state: State<'_, Arc<AppState>>,
     projectId: String,
     input: AddSourceInput,
-) -> Result<WikiSource, String> {
+) -> CommandResult<WikiSource> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
 
@@ -213,7 +258,7 @@ pub async fn add_wiki_source(
             &projectId,
             &input.filename,
             content.as_bytes(),
-        ).await?)
+        ).await.command_error("WIKI_SOURCE_FILE_WRITE_FAILED", "保存 Wiki 来源文件失败", false)?)
     } else {
         None
     };
@@ -228,10 +273,20 @@ pub async fn add_wiki_source(
         Err(error) => {
             if let Some(path) = written_path {
                 if let Err(cleanup_error) = tokio::fs::remove_file(&path).await {
-                    return Err(format!("{}; failed to clean up source file: {}", error, cleanup_error));
+                    return Err(CommandError::reported(
+                        "WIKI_SOURCE_CREATE_ROLLBACK_FAILED",
+                        "创建 Wiki 来源失败，且无法清理来源文件",
+                        false,
+                        format!("{}; cleanup: {}", error, cleanup_error),
+                    ));
                 }
             }
-            Err(error)
+            Err(CommandError::reported(
+                "WIKI_SOURCE_CREATE_FAILED",
+                "创建 Wiki 来源失败",
+                false,
+                error,
+            ))
         }
     }
 }
@@ -240,26 +295,41 @@ pub async fn add_wiki_source(
 pub async fn delete_wiki_source(
     state: State<'_, Arc<AppState>>,
     sourceId: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    let source = repo.get_source(&sourceId).await?;
+    let source = repo
+        .get_source(&sourceId)
+        .await
+        .command_error("WIKI_SOURCE_READ_FAILED", "读取 Wiki 来源失败", true)?;
     let project_id = source.project_id.clone();
     let staged = crate::services::wiki::project::stage_source_file_removal(
         &project_id,
         &source.filename,
         source.file_path.as_deref(),
-    ).await?;
+    ).await.command_error("WIKI_SOURCE_DELETE_STAGE_FAILED", "准备删除 Wiki 来源失败", false)?;
     if let Err(error) = repo.delete_source(&sourceId).await {
         if let Some(ref removal) = staged {
             if let Err(restore_error) = crate::services::wiki::project::restore_staged_removal(removal).await {
-                return Err(format!("{}; failed to restore source file: {}", error, restore_error));
+                return Err(CommandError::reported(
+                    "WIKI_SOURCE_DELETE_ROLLBACK_FAILED",
+                    "删除 Wiki 来源失败，且无法恢复来源文件",
+                    false,
+                    format!("{}; restore: {}", error, restore_error),
+                ));
             }
         }
-        return Err(error);
+        return Err(CommandError::reported(
+            "WIKI_SOURCE_DELETE_FAILED",
+            "删除 Wiki 来源失败",
+            false,
+            error,
+        ));
     }
     if let Some(removal) = staged {
-        crate::services::wiki::project::finalize_staged_removal(removal).await?;
+        crate::services::wiki::project::finalize_staged_removal(removal)
+            .await
+            .command_error("WIKI_SOURCE_DELETE_FINALIZE_FAILED", "清理 Wiki 来源文件失败", false)?;
     }
     Ok(())
 }
@@ -272,10 +342,12 @@ pub async fn search_wiki(
     projectId: String,
     query: String,
     topK: Option<usize>,
-) -> Result<Vec<WikiSearchResult>, String> {
+) -> CommandResult<Vec<WikiSearchResult>> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.search_pages(&projectId, &query, topK.unwrap_or(10)).await
+    repo.search_pages(&projectId, &query, topK.unwrap_or(10))
+        .await
+        .command_error("WIKI_SEARCH_FAILED", "搜索 Wiki 页面失败", true)
 }
 
 // ── Wiki Graph ──
@@ -284,10 +356,12 @@ pub async fn search_wiki(
 pub async fn get_wiki_graph(
     state: State<'_, Arc<AppState>>,
     projectId: String,
-) -> Result<GraphData, String> {
+) -> CommandResult<GraphData> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.get_graph(&projectId).await
+    repo.get_graph(&projectId)
+        .await
+        .command_error("WIKI_GRAPH_FAILED", "读取 Wiki 关系图失败", true)
 }
 
 // ── Wiki Tags ──
@@ -297,10 +371,12 @@ pub async fn get_wiki_tags(
     state: State<'_, Arc<AppState>>,
     projectId: String,
     limit: Option<usize>,
-) -> Result<Vec<WikiTag>, String> {
+) -> CommandResult<Vec<WikiTag>> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.get_tags(&projectId, limit.unwrap_or(15)).await
+    repo.get_tags(&projectId, limit.unwrap_or(15))
+        .await
+        .command_error("WIKI_TAGS_FAILED", "读取 Wiki 标签失败", true)
 }
 
 // ── Wiki Stats ──
@@ -309,10 +385,12 @@ pub async fn get_wiki_tags(
 pub async fn get_wiki_stats(
     state: State<'_, Arc<AppState>>,
     projectId: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.get_stats(&projectId).await
+    repo.get_stats(&projectId)
+        .await
+        .command_error("WIKI_STATS_FAILED", "读取 Wiki 统计失败", true)
 }
 
 // ── Wiki Ingest ──
@@ -323,40 +401,30 @@ pub async fn ingest_wiki_source(
     state: State<'_, Arc<AppState>>,
     projectId: String,
     sourceId: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let pool = state.db.pool.clone();
     crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &sourceId).await
         .map(|r| serde_json::json!({
             "status": "done",
+            "task_id": r.task_id,
             "pages_created": r.pages_created,
             "page_paths": r.page_paths,
         }))
-        .map_err(|e| {
-            let pool_clone = pool.clone();
-            let sid = sourceId.clone();
-            let pid = projectId.clone();
-            let err = e.clone();
-            let app_clone = app.clone();
-            tokio::spawn(async move {
-                let repo = crate::services::wiki::repository::WikiRepository::new(pool_clone);
-                if let Err(error) = repo.update_source_status(&sid, "failed", 0, Some(&err)).await {
-                    tracing::warn!(%error, source_id = %sid, "failed to persist Wiki source failure status");
-                }
-                if let Err(error) = app_clone.emit(
-                    "wiki-source-progress",
-                    serde_json::json!({
-                        "source_id": sid,
-                        "project_id": pid,
-                        "filename": "",
-                        "stage": "error",
-                        "progress": 0,
-                        "detail": &err,
-                    }),
-                ) {
-                    tracing::warn!(%error, source_id = %sid, "failed to emit Wiki source failure event");
-                }
-            });
-            e
+        .map_err(|error| {
+            if error == crate::services::wiki::ingest::INGEST_ALREADY_RUNNING {
+                CommandError::new(
+                    "WIKI_INGEST_ALREADY_RUNNING",
+                    "该 Wiki 来源正在摄入",
+                    true,
+                )
+            } else {
+                CommandError::reported(
+                    "WIKI_INGEST_FAILED",
+                    "Wiki 来源摄入失败",
+                    true,
+                    error,
+                )
+            }
         })
 }
 
@@ -365,12 +433,18 @@ pub async fn rescan_wiki_sources(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     projectId: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool.clone());
 
-    let sources = repo.list_sources(&projectId).await?;
-    let pending: Vec<_> = sources.iter().filter(|s| s.status == "pending").collect();
+    let sources = repo
+        .list_sources(&projectId)
+        .await
+        .command_error("WIKI_SOURCE_LIST_FAILED", "读取 Wiki 来源失败", true)?;
+    let pending: Vec<_> = sources
+        .iter()
+        .filter(|source| matches!(source.status.as_str(), "pending" | "failed"))
+        .collect();
     let mut results = Vec::new();
 
     for source in &pending {
@@ -381,12 +455,26 @@ pub async fn rescan_wiki_sources(
                 "status": "done",
                 "pages": r.pages_created,
             })),
-            Err(e) => results.push(serde_json::json!({
-                "source_id": source.id,
-                "filename": source.filename,
-                "status": "failed",
-                "error": e,
-            })),
+            Err(error) => {
+                tracing::error!(%error, source_id = %source.id, "Wiki source rescan failed");
+                results.push(serde_json::json!({
+                    "source_id": source.id,
+                    "filename": source.filename,
+                    "status": "failed",
+                    "error": {
+                        "code": if error == crate::services::wiki::ingest::INGEST_ALREADY_RUNNING {
+                            "WIKI_INGEST_ALREADY_RUNNING"
+                        } else {
+                            "WIKI_INGEST_FAILED"
+                        },
+                        "message": if error == crate::services::wiki::ingest::INGEST_ALREADY_RUNNING {
+                            "该 Wiki 来源正在摄入"
+                        } else {
+                            "Wiki 来源摄入失败"
+                        }
+                    }
+                }));
+            }
         }
     }
 

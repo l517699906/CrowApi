@@ -1,5 +1,6 @@
 use crate::db::models::{RequestLog, RequestSecurityFinding};
 use crate::db::repository::Repository;
+use crate::core::error::{CommandResult, CommandResultExt};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 
@@ -117,7 +118,7 @@ pub struct GetLogsInput {
 pub async fn get_logs(
     input: GetLogsInput,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<Vec<LogDto>, String> {
+) -> CommandResult<Vec<LogDto>> {
     let repo = Repository::new(state.db.pool.clone());
     let limit = input.limit.unwrap_or(50);
     let offset = input.offset.unwrap_or(0);
@@ -162,34 +163,45 @@ pub async fn get_logs(
         repo.get_logs(limit, offset).await
     };
 
-    logs.map_err(|e| e.to_string()).map(|ls| ls.into_iter().map(Into::into).collect())
+    let logs = logs.command_error("LOG_LIST_FAILED", "读取请求日志失败", true)?;
+    Ok(logs.into_iter().map(Into::into).collect())
 }
 
 #[tauri::command]
 pub async fn get_log(
     id: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<LogDto, String> {
+) -> CommandResult<LogDto> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.get_log(&id).await.map_err(|e| e.to_string()).map(Into::into)
+    let log = repo
+        .get_log(&id)
+        .await
+        .command_error("LOG_READ_FAILED", "读取请求日志详情失败", true)?;
+    Ok(log.into())
 }
 
 #[tauri::command]
 pub async fn get_log_security_findings(
     log_id: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<Vec<SecurityFindingDto>, String> {
+) -> CommandResult<Vec<SecurityFindingDto>> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.get_security_findings(&log_id).await.map_err(|e| e.to_string()).map(|fs| fs.into_iter().map(Into::into).collect())
+    let findings = repo
+        .get_security_findings(&log_id)
+        .await
+        .command_error("LOG_SECURITY_FINDINGS_FAILED", "读取安全检查结果失败", true)?;
+    Ok(findings.into_iter().map(Into::into).collect())
 }
 
 #[tauri::command]
 pub async fn delete_log(
     id: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.delete_log(&id).await.map_err(|e| e.to_string())?;
+    repo.delete_log(&id)
+        .await
+        .command_error("LOG_DELETE_FAILED", "删除请求日志失败", false)?;
     state.log_events.mark_reset();
     Ok(())
 }
@@ -198,9 +210,12 @@ pub async fn delete_log(
 pub async fn delete_logs_before(
     before_date: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<u64, String> {
+) -> CommandResult<u64> {
     let repo = Repository::new(state.db.pool.clone());
-    let deleted = repo.delete_logs_before(&before_date).await.map_err(|e| e.to_string())?;
+    let deleted = repo
+        .delete_logs_before(&before_date)
+        .await
+        .command_error("LOG_DELETE_FAILED", "清理历史请求日志失败", false)?;
     state.log_events.mark_reset();
     Ok(deleted)
 }
@@ -208,9 +223,12 @@ pub async fn delete_logs_before(
 #[tauri::command]
 pub async fn delete_all_logs(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<u64, String> {
+) -> CommandResult<u64> {
     let repo = Repository::new(state.db.pool.clone());
-    let deleted = repo.delete_all_logs().await.map_err(|e| e.to_string())?;
+    let deleted = repo
+        .delete_all_logs()
+        .await
+        .command_error("LOG_DELETE_FAILED", "清空请求日志失败", false)?;
     state.log_events.mark_reset();
     Ok(deleted)
 }
@@ -223,8 +241,19 @@ pub struct LogStatsDto {
 }
 
 #[tauri::command]
-pub async fn get_log_stats(days: Option<i64>, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<Vec<LogStatsDto>, String> {
+pub async fn get_log_stats(days: Option<i64>, state: tauri::State<'_, std::sync::Arc<AppState>>) -> CommandResult<Vec<LogStatsDto>> {
     let repo = Repository::new(state.db.pool.clone());
     let days = days.unwrap_or(7);
-    repo.get_log_stats(days).await.map_err(|e| e.to_string()).map(|ss| ss.into_iter().map(|s| LogStatsDto { date: s.date, count: s.count, total_tokens: s.total_tokens }).collect())
+    let stats = repo
+        .get_log_stats(days)
+        .await
+        .command_error("LOG_STATS_FAILED", "读取日志统计失败", true)?;
+    Ok(stats
+        .into_iter()
+        .map(|stat| LogStatsDto {
+            date: stat.date,
+            count: stat.count,
+            total_tokens: stat.total_tokens,
+        })
+        .collect())
 }

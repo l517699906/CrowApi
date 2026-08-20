@@ -9,3 +9,4 @@ pub mod import_export;
 pub mod knowledge_base;
 pub mod services;
 pub mod wiki;
+pub mod backup;

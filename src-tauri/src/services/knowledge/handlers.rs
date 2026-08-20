@@ -4,9 +4,10 @@ use axum::{
     response::{Json, IntoResponse, Response},
 };
 use serde::Deserialize;
+use crate::server::error::HttpError;
 use crate::server::router::SharedState;
 use crate::db::repository::Repository;
-use tauri::{Manager, Emitter};
+use tauri::Manager;
 use sha2::Digest;
 use super::models::*;
 use super::repository::KbRepository;
@@ -31,7 +32,11 @@ pub async fn list_knowledge_bases(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_all_kbs().await {
         Ok(kbs) => Json(serde_json::json!({ "data": kbs })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_BASE_LIST_FAILED",
+            "读取知识库失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -42,7 +47,11 @@ pub async fn create_knowledge_base(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.create_kb(&input).await {
         Ok(kb) => (StatusCode::CREATED, Json(kb)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_BASE_CREATE_FAILED",
+            "创建知识库失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -53,7 +62,15 @@ pub async fn get_knowledge_base(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_kb(&id).await {
         Ok(kb) => Json(kb).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "Knowledge base not found").into_response(),
+        Err(sqlx::Error::RowNotFound) => HttpError::not_found(
+            "KNOWLEDGE_BASE_NOT_FOUND",
+            "知识库不存在",
+        ).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_BASE_READ_FAILED",
+            "读取知识库失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -65,7 +82,15 @@ pub async fn update_knowledge_base(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.update_kb(&id, &input).await {
         Ok(kb) => Json(kb).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(sqlx::Error::RowNotFound) => HttpError::not_found(
+            "KNOWLEDGE_BASE_NOT_FOUND",
+            "知识库不存在",
+        ).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_BASE_UPDATE_FAILED",
+            "更新知识库失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -76,7 +101,11 @@ pub async fn delete_knowledge_base(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.delete_kb(&id).await {
         Ok(_) => (StatusCode::NO_CONTENT, "").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_BASE_DELETE_FAILED",
+            "删除知识库失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -89,7 +118,11 @@ pub async fn list_documents(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_documents(&kb_id).await {
         Ok(docs) => Json(serde_json::json!({ "data": docs })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "DOCUMENT_LIST_FAILED",
+            "读取文档列表失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -102,20 +135,30 @@ pub async fn upload_document(
 
     let content = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &input.content) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid base64: {}", e)).into_response(),
+        Err(_) => return HttpError::bad_request(
+            "DOCUMENT_CONTENT_INVALID",
+            "文档内容不是有效的 Base64 数据",
+        ).into_response(),
     };
 
     let hash = sha2::Sha256::digest(&content);
     let hash_hex = hex::encode(hash);
 
     match repo.find_document_by_hash(&kb_id, &hash_hex).await {
-        Ok(Some(_)) => return (StatusCode::CONFLICT, "Document with same content already exists").into_response(),
+        Ok(Some(_)) => return HttpError::conflict(
+            "DOCUMENT_DUPLICATE",
+            "相同内容的文档已存在",
+        ).into_response(),
         Ok(None) => {}
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+        Err(error) => return HttpError::internal(
+            "DOCUMENT_DUPLICATE_CHECK_FAILED",
+            "检查重复文档失败",
+            error,
+        ).into_response(),
     }
 
     if let Err(error) = super::safe_path_component(&input.filename, "filename") {
-        return (StatusCode::BAD_REQUEST, error).into_response();
+        return HttpError::bad_request("DOCUMENT_FILENAME_INVALID", error).into_response();
     }
 
     let file_type = super::parser::get_file_type(&input.filename);
@@ -124,12 +167,20 @@ pub async fn upload_document(
     let app_data_dir = shared.app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
     if let Err(error) = std::fs::create_dir_all(&kb_dir) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create document directory: {}", error)).into_response();
+        return HttpError::internal(
+            "DOCUMENT_DIRECTORY_CREATE_FAILED",
+            "创建文档目录失败",
+            error,
+        ).into_response();
     }
     let doc_id = uuid::Uuid::new_v4().to_string();
     let file_path = kb_dir.join(format!("{}_{}", &doc_id, &input.filename));
     if let Err(error) = std::fs::write(&file_path, &content) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save document: {}", error)).into_response();
+        return HttpError::internal(
+            "DOCUMENT_FILE_SAVE_FAILED",
+            "保存文档失败",
+            error,
+        ).into_response();
     }
     let file_path_str = file_path.to_string_lossy().to_string();
 
@@ -146,13 +197,25 @@ pub async fn upload_document(
             if let Err(remove_error) = std::fs::remove_file(&file_path) {
                 tracing::warn!(%remove_error, path = %file_path.display(), "failed to remove document after DB insert error");
             }
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response();
+            return HttpError::internal(
+                "DOCUMENT_CREATE_FAILED",
+                "创建文档记录失败",
+                e,
+            ).into_response();
         }
     };
 
     let kb = match repo.get_kb(&kb_id).await {
         Ok(k) => k,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("KB not found: {}", e)).into_response(),
+        Err(sqlx::Error::RowNotFound) => return HttpError::not_found(
+            "KNOWLEDGE_BASE_NOT_FOUND",
+            "知识库不存在",
+        ).into_response(),
+        Err(error) => return HttpError::internal(
+            "KNOWLEDGE_BASE_READ_FAILED",
+            "读取知识库失败",
+            error,
+        ).into_response(),
     };
 
     let pool = shared.state.db.pool.clone();
@@ -180,12 +243,20 @@ pub async fn upload_document(
 
 pub async fn get_document(
     State(shared): State<SharedState>,
-    Path((_kb_id, doc_id)): Path<(String, String)>,
+    Path((kb_id, doc_id)): Path<(String, String)>,
 ) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_document(&doc_id).await {
-        Ok(doc) => Json(doc).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "Document not found").into_response(),
+        Ok(doc) if doc.kb_id == kb_id => Json(doc).into_response(),
+        Ok(_) | Err(sqlx::Error::RowNotFound) => HttpError::not_found(
+            "DOCUMENT_NOT_FOUND",
+            "文档不存在",
+        ).into_response(),
+        Err(error) => HttpError::internal(
+            "DOCUMENT_READ_FAILED",
+            "读取文档失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -197,9 +268,15 @@ pub async fn delete_document(
 
     let doc = match repo.get_document(&doc_id).await {
         Ok(doc) if doc.kb_id == kb_id => doc,
-        Ok(_) => return (StatusCode::NOT_FOUND, "Document not found").into_response(),
-        Err(sqlx::Error::RowNotFound) => return (StatusCode::NOT_FOUND, "Document not found").into_response(),
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+        Ok(_) | Err(sqlx::Error::RowNotFound) => return HttpError::not_found(
+            "DOCUMENT_NOT_FOUND",
+            "文档不存在",
+        ).into_response(),
+        Err(error) => return HttpError::internal(
+            "DOCUMENT_READ_FAILED",
+            "读取文档失败",
+            error,
+        ).into_response(),
     };
 
     if doc.source_type == "upload" {
@@ -207,9 +284,10 @@ pub async fn delete_document(
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to delete document file: {}", error),
+                Err(error) => return HttpError::internal(
+                    "DOCUMENT_FILE_DELETE_FAILED",
+                    "删除文档文件失败",
+                    error,
                 ).into_response(),
             }
         }
@@ -218,31 +296,62 @@ pub async fn delete_document(
     match repo.delete_document(&doc_id).await {
         Ok(_) => {
             if let Err(error) = repo.update_kb_counts(&kb_id).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Document deleted but failed to update knowledge base counts: {}", error),
+                return HttpError::internal(
+                    "KNOWLEDGE_BASE_COUNT_UPDATE_FAILED",
+                    "文档已删除，但更新知识库统计失败",
+                    error,
                 ).into_response();
             }
             (StatusCode::NO_CONTENT, "").into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "DOCUMENT_DELETE_FAILED",
+            "删除文档失败",
+            error,
+        ).into_response(),
     }
 }
 
 pub async fn reindex_document(
     State(shared): State<SharedState>,
-    Path((_kb_id, doc_id)): Path<(String, String)>,
+    Path((kb_id, doc_id)): Path<(String, String)>,
 ) -> Response {
-    let pool = shared.state.db.pool.clone();
-    let app = shared.app.clone();
+    let repo = KbRepository::new(shared.state.db.pool.clone());
+    match repo.get_document(&doc_id).await {
+        Ok(document) if document.kb_id == kb_id => {}
+        Ok(_) | Err(sqlx::Error::RowNotFound) => return HttpError::not_found(
+            "DOCUMENT_NOT_FOUND",
+            "文档不存在",
+        ).into_response(),
+        Err(error) => return HttpError::internal(
+            "DOCUMENT_READ_FAILED",
+            "读取文档失败",
+            error,
+        ).into_response(),
+    }
 
-    tokio::spawn(async move {
-        if let Err(e) = processor::reindex_document(&pool, &app, &doc_id).await {
-            tracing::error!("Reindex failed: {}", e);
-        }
-    });
-
-    Json(serde_json::json!({ "message": "Reindex started" })).into_response()
+    match processor::start_reindex_document(
+        &shared.state.db.pool,
+        &shared.app,
+        &kb_id,
+        &doc_id,
+    )
+    .await
+    {
+        Ok(task_id) => Json(serde_json::json!({
+            "message": "Reindex started",
+            "task_id": task_id,
+        })).into_response(),
+        Err(error) if error == processor::DOCUMENT_TASK_ALREADY_RUNNING => HttpError::conflict(
+            "DOCUMENT_REINDEX_ALREADY_RUNNING",
+            "该文档正在重新处理",
+        ).into_response(),
+        Err(error) => HttpError::internal(
+            "DOCUMENT_REINDEX_START_FAILED",
+            "启动文档重新处理失败",
+            error,
+        ).into_response(),
+    }
 }
 
 // ─── Search ───────────────────────────────────────────────────────
@@ -267,7 +376,15 @@ pub async fn search(
         let kb_repo = KbRepository::new(shared.state.db.pool.clone());
         let kb = match kb_repo.get_kb(kb_id).await {
             Ok(kb) => kb,
-            Err(error) => return (StatusCode::NOT_FOUND, format!("KB not found: {}", error)).into_response(),
+            Err(sqlx::Error::RowNotFound) => return HttpError::not_found(
+                "KNOWLEDGE_BASE_NOT_FOUND",
+                "知识库不存在",
+            ).into_response(),
+            Err(error) => return HttpError::internal(
+                "KNOWLEDGE_BASE_READ_FAILED",
+                "读取知识库失败",
+                error,
+            ).into_response(),
         };
         (
             kb.embedding_model.unwrap_or_else(|| "text-embedding-3-small".to_string()),
@@ -284,11 +401,22 @@ pub async fn search(
         embedding_channel_id.as_deref(),
     ).await {
         Ok(e) => e,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding failed: {}", e)).into_response(),
+        Err(error) => return HttpError::reported(
+            StatusCode::BAD_GATEWAY,
+            "EMBEDDING_REQUEST_FAILED",
+            "生成查询向量失败",
+            true,
+            error,
+        ).into_response(),
     };
 
     if embeddings.is_empty() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to embed query").into_response();
+        return HttpError::new(
+            StatusCode::BAD_GATEWAY,
+            "EMBEDDING_RESPONSE_INVALID",
+            "向量服务未返回有效结果",
+            true,
+        ).into_response();
     }
 
     let query_emb = &embeddings[0];
@@ -301,7 +429,11 @@ pub async fn search(
 
     match results {
         Ok(results) => Json(serde_json::json!({ "data": results })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Search failed: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_SEARCH_FAILED",
+            "搜索知识库失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -317,7 +449,15 @@ pub async fn ask(
         let kb_repo = KbRepository::new(shared.state.db.pool.clone());
         let kb = match kb_repo.get_kb(&kb_id).await {
             Ok(kb) => kb,
-            Err(error) => return (StatusCode::NOT_FOUND, format!("KB not found: {}", error)).into_response(),
+            Err(sqlx::Error::RowNotFound) => return HttpError::not_found(
+                "KNOWLEDGE_BASE_NOT_FOUND",
+                "知识库不存在",
+            ).into_response(),
+            Err(error) => return HttpError::internal(
+                "KNOWLEDGE_BASE_READ_FAILED",
+                "读取知识库失败",
+                error,
+            ).into_response(),
         };
         kb.embedding_model
             .unwrap_or_else(|| "text-embedding-3-small".to_string())
@@ -338,7 +478,11 @@ pub async fn ask(
             &shared.app,
         ).await {
             Ok(answer) => Json(answer).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Deep research failed: {}", e)).into_response(),
+            Err(error) => HttpError::internal(
+                "DEEP_RESEARCH_FAILED",
+                "深度研究失败",
+                error,
+            ).into_response(),
         }
     } else {
         // Normal RAG with history and configurable search
@@ -362,7 +506,11 @@ pub async fn ask(
             search_mode,
         ).await {
             Ok(answer) => Json(answer).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {}", e)).into_response(),
+            Err(error) => HttpError::internal(
+                "KNOWLEDGE_ASK_FAILED",
+                "知识库问答失败",
+                error,
+            ).into_response(),
         }
     }
 }
@@ -377,12 +525,24 @@ pub async fn kb_stats(
 
     let kb = match repo.get_kb(&kb_id).await {
         Ok(k) => k,
-        Err(_) => return (StatusCode::NOT_FOUND, "KB not found").into_response(),
+        Err(sqlx::Error::RowNotFound) => return HttpError::not_found(
+            "KNOWLEDGE_BASE_NOT_FOUND",
+            "知识库不存在",
+        ).into_response(),
+        Err(error) => return HttpError::internal(
+            "KNOWLEDGE_BASE_READ_FAILED",
+            "读取知识库失败",
+            error,
+        ).into_response(),
     };
 
     let docs = match repo.get_documents(&kb_id).await {
         Ok(docs) => docs,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+        Err(error) => return HttpError::internal(
+            "DOCUMENT_LIST_FAILED",
+            "读取文档统计失败",
+            error,
+        ).into_response(),
     };
     let ready_count = docs.iter().filter(|d| d.status == "ready").count();
     let processing_count = docs.iter().filter(|d| d.status == "processing").count();
@@ -391,7 +551,11 @@ pub async fn kb_stats(
 
     let index_meta = match repo.get_index_meta(&kb_id).await {
         Ok(index_meta) => index_meta,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+        Err(error) => return HttpError::internal(
+            "INDEX_STATUS_READ_FAILED",
+            "读取索引状态失败",
+            error,
+        ).into_response(),
     };
 
     Json(serde_json::json!({
@@ -420,7 +584,11 @@ pub async fn list_conversations(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_conversations(&kb_id).await {
         Ok(convs) => Json(serde_json::json!({ "data": convs })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "CONVERSATION_LIST_FAILED",
+            "读取会话记录失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -431,7 +599,11 @@ pub async fn clear_conversations(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.clear_conversations(&kb_id).await {
         Ok(_) => (StatusCode::NO_CONTENT, "").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "CONVERSATION_CLEAR_FAILED",
+            "清空会话记录失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -444,7 +616,11 @@ pub async fn list_sources(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_sources(&kb_id).await {
         Ok(sources) => Json(serde_json::json!({ "data": sources })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_SOURCE_LIST_FAILED",
+            "读取知识来源失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -456,15 +632,23 @@ pub async fn delete_source(
     match repo.delete_source_with_documents(&kb_id, &source_id).await {
         Ok(_) => {
             if let Err(error) = repo.update_kb_counts(&kb_id).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Source deleted but failed to update knowledge base counts: {}", error),
+                return HttpError::internal(
+                    "KNOWLEDGE_BASE_COUNT_UPDATE_FAILED",
+                    "来源已删除，但更新知识库统计失败",
+                    error,
                 ).into_response();
             }
             (StatusCode::NO_CONTENT, "").into_response()
         }
-        Err(sqlx::Error::RowNotFound) => (StatusCode::NOT_FOUND, "Source not found").into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", error)).into_response(),
+        Err(sqlx::Error::RowNotFound) => HttpError::not_found(
+            "KNOWLEDGE_SOURCE_NOT_FOUND",
+            "知识来源不存在",
+        ).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_SOURCE_DELETE_FAILED",
+            "删除知识来源失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -487,7 +671,11 @@ pub async fn import_source(
         input.branch.as_deref(),
     ).await {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => return HttpError::internal(
+            "KNOWLEDGE_SOURCE_CREATE_FAILED",
+            "创建知识来源失败",
+            error,
+        ).into_response(),
     };
 
     let source_id = source.id.clone();
@@ -538,7 +726,11 @@ pub async fn get_index_status(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_index_meta(&kb_id).await {
         Ok(meta) => Json(serde_json::json!({ "data": meta })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "INDEX_STATUS_READ_FAILED",
+            "读取索引状态失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -546,56 +738,21 @@ pub async fn build_index(
     State(shared): State<SharedState>,
     Path(kb_id): Path<String>,
 ) -> Response {
-    let pool = shared.state.db.pool.clone();
-    let kb_id_clone = kb_id.clone();
-    let app = shared.app.clone();
-
-    // Update index status to building immediately
-    let repo = KbRepository::new(pool.clone());
-    if let Err(error) = repo.update_kb_index_status(&kb_id_clone, "building").await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update index status: {}", error)).into_response();
+    match retriever::start_index_build(&shared.state.db.pool, &kb_id, &shared.app).await {
+        Ok(task_id) => Json(serde_json::json!({
+            "message": "Index build started",
+            "task_id": task_id,
+        })).into_response(),
+        Err(error) if error == retriever::INDEX_BUILD_ALREADY_RUNNING => HttpError::conflict(
+            "INDEX_BUILD_ALREADY_RUNNING",
+            "该知识库的索引正在构建",
+        ).into_response(),
+        Err(error) => HttpError::internal(
+            "INDEX_BUILD_START_FAILED",
+            "启动索引构建失败",
+            error,
+        ).into_response(),
     }
-
-    // Spawn on blocking thread pool — HNSW build is CPU-intensive
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        let pool = pool;
-        let kb_id = kb_id_clone;
-
-        rt.block_on(async {
-            // Emit progress: starting
-            let _ = app.emit("kb-index-progress", serde_json::json!({
-                "kb_id": &kb_id,
-                "status": "building",
-                "message": "正在构建 HNSW 向量索引…"
-            }));
-
-            match retriever::build_index(&pool, &kb_id, &app).await {
-                Ok(()) => {
-                    tracing::info!("HNSW index built successfully for KB {}", kb_id);
-                    let _ = app.emit("kb-index-progress", serde_json::json!({
-                        "kb_id": &kb_id,
-                        "status": "ready",
-                        "message": "索引构建完成"
-                    }));
-                }
-                Err(e) => {
-                    tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id, e);
-                    let repo = KbRepository::new(pool.clone());
-                    if let Err(error) = repo.update_kb_index_status(&kb_id, "error").await {
-                        tracing::warn!(%error, knowledge_base_id = %kb_id, "failed to persist index failure status");
-                    }
-                    let _ = app.emit("kb-index-progress", serde_json::json!({
-                        "kb_id": &kb_id,
-                        "status": "error",
-                        "message": format!("索引构建失败: {}", e)
-                    }));
-                }
-            }
-        });
-    });
-
-    Json(serde_json::json!({ "message": "Index build started" })).into_response()
 }
 
 pub async fn drop_index(
@@ -608,7 +765,11 @@ pub async fn drop_index(
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => {
             tracing::error!("Failed to drop index for KB {}: {}", kb_id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to drop index: {}", e)).into_response()
+            HttpError::internal(
+                "INDEX_DROP_FAILED",
+                "删除向量索引失败",
+                e,
+            ).into_response()
         }
     }
 }

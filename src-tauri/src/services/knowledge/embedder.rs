@@ -185,6 +185,8 @@ mod tests {
             channel_type: channel_type.to_string(),
             base_url: "https://example.test/v1".to_string(),
             api_key: "secret".to_string(),
+            secret_ref: None,
+            api_key_last4: "cret".to_string(),
             models: "[]".to_string(),
             status: 1,
             priority: 0,

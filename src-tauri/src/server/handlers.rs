@@ -7,6 +7,7 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use super::router::SharedState;
+use super::error::HttpError;
 use crate::core::access::{api_key_is_expired, parse_scope, scope_allows};
 use crate::core::proxy;
 use crate::db::models::{ApiKey, Channel};
@@ -39,23 +40,32 @@ fn quota_limit_reached(limit: i64, used: i64) -> bool {
 
 fn validate_api_key_scopes(
     key: &ApiKey,
-) -> Result<(Vec<String>, Vec<String>), (StatusCode, String)> {
+) -> Result<(Vec<String>, Vec<String>), HttpError> {
     match api_key_is_expired(key.expires_at.as_deref()) {
-        Ok(true) => return Err((StatusCode::UNAUTHORIZED, "API key has expired".to_string())),
+        Ok(true) => return Err(HttpError::unauthorized("API_KEY_EXPIRED", "API key has expired")),
         Ok(false) => {}
         Err(error) => {
-            tracing::error!(key_id = %key.id, %error, "invalid API key expiration value");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Invalid API key configuration".to_string()));
+            return Err(HttpError::internal(
+                "API_KEY_CONFIGURATION_INVALID",
+                "Invalid API key configuration",
+                error,
+            ));
         }
     }
 
     let allowed_models = parse_scope(&key.allowed_models).map_err(|error| {
-        tracing::error!(key_id = %key.id, %error, "invalid API key model scope");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Invalid API key configuration".to_string())
+        HttpError::internal(
+            "API_KEY_CONFIGURATION_INVALID",
+            "Invalid API key configuration",
+            error,
+        )
     })?;
     let allowed_channels = parse_scope(&key.allowed_channels).map_err(|error| {
-        tracing::error!(key_id = %key.id, %error, "invalid API key channel scope");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Invalid API key configuration".to_string())
+        HttpError::internal(
+            "API_KEY_CONFIGURATION_INVALID",
+            "Invalid API key configuration",
+            error,
+        )
     })?;
     Ok((allowed_models, allowed_channels))
 }
@@ -63,17 +73,18 @@ fn validate_api_key_scopes(
 fn validate_api_key_access(
     key: &ApiKey,
     model: &str,
-) -> Result<Vec<String>, (StatusCode, String)> {
+) -> Result<Vec<String>, HttpError> {
     if model.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "model is required".to_string()));
+        return Err(HttpError::bad_request("MODEL_REQUIRED", "model is required"));
     }
 
     let (allowed_models, allowed_channels) = validate_api_key_scopes(key)?;
     if !scope_allows(&allowed_models, model, "全部模型") {
-        return Err((
-            StatusCode::FORBIDDEN,
+        return Err(HttpError::forbidden(
+            "MODEL_NOT_ALLOWED",
             format!("API key is not allowed to use model: {}", model),
-        ));
+        )
+        .with_details(serde_json::json!({ "model": model })));
     }
 
     Ok(allowed_channels)
@@ -110,6 +121,37 @@ fn anthropic_error_response(
         })),
     )
         .into_response()
+}
+
+fn anthropic_http_error_response(error: HttpError) -> Response {
+    let error_type = error.anthropic_type();
+    let trace_id = error.error.trace_id.clone();
+    let mut response = anthropic_error_response(error.status, error_type, error.error.message);
+    if let Some(trace_id) = trace_id {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&trace_id) {
+            response.headers_mut().insert("x-crowapi-trace-id", value);
+        }
+    }
+    response
+}
+
+fn upstream_error_response(code: u16, source: impl std::fmt::Display) -> Response {
+    let status = StatusCode::from_u16(code)
+        .ok()
+        .filter(|status| status.is_client_error() || status.is_server_error())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let retryable = status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error();
+    HttpError::reported(
+        status,
+        "UPSTREAM_REQUEST_FAILED",
+        "上游请求失败",
+        retryable,
+        source,
+    )
+    .with_details(serde_json::json!({ "upstream_status": code }))
+    .into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,7 +219,10 @@ async fn handle_chat_completions_for_mode(
     let body_str = String::from_utf8_lossy(&body);
     let json: serde_json::Value = match serde_json::from_str(&body_str) {
         Ok(j) => j,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
+        Err(error) => {
+            return HttpError::bad_request("INVALID_JSON", format!("Invalid JSON: {}", error))
+                .into_response();
+        }
     };
 
     let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -187,28 +232,32 @@ async fn handle_chat_completions_for_mode(
     let api_key = auth_header.strip_prefix("Bearer ").unwrap_or("").trim();
 
     if api_key.is_empty() {
-        return (StatusCode::UNAUTHORIZED, "Missing API key").into_response();
+        return HttpError::unauthorized("MISSING_API_KEY", "Missing API key").into_response();
     }
 
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
     let key_record = match repo.get_api_key_by_key(api_key).await {
         Ok(k) => k,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
+        Err(_) => return HttpError::unauthorized("INVALID_API_KEY", "Invalid API key").into_response(),
     };
     let allowed_channels = match validate_api_key_access(&key_record, model) {
         Ok(scope) => scope,
-        Err((status, message)) => return (status, message).into_response(),
+        Err(error) => return error.into_response(),
     };
 
     let is_quota_exceeded = match quota_exceeded(&repo, &shared.app, &key_record).await {
         Ok(exceeded) => exceeded,
         Err(error) => {
-            tracing::error!("quota check failed: {}", error);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to check quota").into_response();
+            return HttpError::internal(
+                "QUOTA_CHECK_FAILED",
+                "Failed to check quota",
+                error,
+            )
+            .into_response();
         }
     };
     if is_quota_exceeded {
-        return (StatusCode::TOO_MANY_REQUESTS, "Quota exceeded").into_response();
+        return HttpError::too_many_requests("QUOTA_EXCEEDED", "Quota exceeded").into_response();
     }
 
     // Extract Crow-Trace-Id from request headers
@@ -231,12 +280,7 @@ async fn handle_chat_completions_for_mode(
     } else {
         match proxy::handle_request(&repo, &shared.app, &key_record.id, &key_record.name, json, false, request_mode, Some(request_body_str), trace_id, Some(&allowed_channels)).await {
             Ok(result) => (StatusCode::OK, Json(result.body)).into_response(),
-            Err((code, msg)) => {
-                let err_body = serde_json::json!({
-                    "error": { "message": msg, "type": "upstream_error", "code": code }
-                });
-                (StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY), Json(err_body)).into_response()
-            }
+            Err((code, message)) => upstream_error_response(code, message),
         }
     }
 }
@@ -325,24 +369,40 @@ async fn handle_stream(
             trace_id: trace_id.clone(),
         };
         persist_request_log(&repo, &shared.app, &log, &security_result).await;
-        let err_body = serde_json::json!({"error": {"message": security_result.summary, "type": "security_blocked", "code": "security.blocked"}});
-        return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
+        return HttpError::new(
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "SECURITY_BLOCKED",
+            security_result.summary,
+            false,
+        ).into_response();
     }
     let channels = match repo.get_enabled_channels().await {
         Ok(c) => c,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "No channels available").into_response(),
+        Err(error) => return HttpError::reported(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CHANNEL_LIST_FAILED",
+            "读取可用渠道失败",
+            true,
+            error,
+        ).into_response(),
     };
 
     let model_channels = Dispatcher::select_channels(&channels, &model);
     if model_channels.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
+        return HttpError::service_unavailable(
+            "CHANNEL_UNAVAILABLE",
+            "当前模型没有可用渠道",
+        ).into_response();
     }
     let selected_channels: Vec<_> = model_channels
         .into_iter()
         .filter(|channel| scope_allows(&allowed_channels, &channel.id, "全部渠道"))
         .collect();
     if selected_channels.is_empty() {
-        return (StatusCode::FORBIDDEN, "API key is not allowed to use a channel for this model").into_response();
+        return HttpError::forbidden(
+            "CHANNEL_NOT_ALLOWED",
+            "API Key 无权使用当前模型对应的渠道",
+        ).into_response();
     }
 
     let request = ProxyRequest {
@@ -625,18 +685,16 @@ async fn handle_stream(
         }
     }
 
-    let err_body = serde_json::json!({
-        "error": {
-            "message": format!(
-                "All stream channels failed for model {} after {} attempt(s): {}",
-                model,
-                max_attempts,
-                last_error.unwrap_or_else(|| "unknown upstream error".to_string())
-            ),
-            "type": "upstream_error"
-        }
-    });
-    (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
+    HttpError::bad_gateway(
+        "UPSTREAM_STREAM_FAILED",
+        "所有流式渠道请求均失败",
+        last_error.unwrap_or_else(|| "unknown upstream error".to_string()),
+    )
+    .with_details(serde_json::json!({
+        "model": model,
+        "attempts": max_attempts,
+    }))
+    .into_response()
 }
 
 // ─── Anthropic Messages API: POST /v1/messages ─────────────────────────────
@@ -652,7 +710,11 @@ pub async fn handle_messages(
     let body_str = String::from_utf8_lossy(&body);
     let json: serde_json::Value = match serde_json::from_str(&body_str) {
         Ok(j) => j,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
+        Err(_) => return anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "请求体不是有效的 JSON",
+        ),
     };
 
     let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -661,58 +723,44 @@ pub async fn handle_messages(
     // Extract API key from x-api-key header or Authorization Bearer
     let api_key = match protocol::extract_api_key(&headers) {
         Some(k) => k,
-        None => {
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-                "type": "error",
-                "error": {"type": "authentication_error", "message": "Missing API key"}
-            }))).into_response();
-        }
+        None => return anthropic_error_response(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "缺少 API Key",
+        ),
     };
 
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
     let key_record = match repo.get_api_key_by_key(&api_key).await {
         Ok(k) => k,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "type": "error",
-            "error": {"type": "authentication_error", "message": "Invalid API key"}
-        }))).into_response(),
+        Err(_) => return anthropic_error_response(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "API Key 无效",
+        ),
     };
     let allowed_channels = match validate_api_key_access(&key_record, &model) {
         Ok(scope) => scope,
-        Err((status, message)) => {
-            let error_type = if status == StatusCode::UNAUTHORIZED {
-                "authentication_error"
-            } else if status == StatusCode::FORBIDDEN {
-                "permission_error"
-            } else {
-                "api_error"
-            };
-            return (
-                status,
-                Json(serde_json::json!({
-                    "type": "error",
-                    "error": {"type": error_type, "message": message}
-                })),
-            )
-                .into_response();
+        Err(error) => {
+            return anthropic_http_error_response(error);
         }
     };
 
     let is_quota_exceeded = match quota_exceeded(&repo, &shared.app, &key_record).await {
         Ok(exceeded) => exceeded,
         Err(error) => {
-            tracing::error!("quota check failed: {}", error);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "type": "error",
-                "error": {"type": "api_error", "message": "Failed to check quota"}
-            }))).into_response();
+            return anthropic_http_error_response(HttpError::internal(
+                "QUOTA_CHECK_FAILED",
+                "检查配额失败",
+                error,
+            ));
         }
     };
     if is_quota_exceeded {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
-            "type": "error",
-            "error": {"type": "rate_limit_error", "message": "Quota exceeded"}
-        }))).into_response();
+        return anthropic_http_error_response(HttpError::too_many_requests(
+            "QUOTA_EXCEEDED",
+            "配额已用尽",
+        ));
     }
 
     let trace_id = headers.get("Crow-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
@@ -730,12 +778,20 @@ pub async fn handle_messages(
                 let anthropic_resp = protocol::openai_to_anthropic(&result.body, &result.channel.channel_type);
                 (StatusCode::OK, Json(anthropic_resp)).into_response()
             }
-            Err((code, msg)) => {
-                let err_body = serde_json::json!({
-                    "type": "error",
-                    "error": {"type": "api_error", "message": msg}
-                });
-                (StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY), Json(err_body)).into_response()
+            Err((code, message)) => {
+                let status = StatusCode::from_u16(code)
+                    .ok()
+                    .filter(|status| status.is_client_error() || status.is_server_error())
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                anthropic_http_error_response(HttpError::reported(
+                    status,
+                    "UPSTREAM_REQUEST_FAILED",
+                    "上游请求失败",
+                    status == StatusCode::REQUEST_TIMEOUT
+                        || status == StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error(),
+                    message,
+                ))
             }
         }
     }
@@ -791,15 +847,12 @@ pub async fn handle_messages_count_tokens(
     };
     let allowed_channels = match validate_api_key_access(&key_record, &model) {
         Ok(value) => value,
-        Err((status, message)) => {
-            let error_type = if status == StatusCode::UNAUTHORIZED {
-                "authentication_error"
-            } else if status == StatusCode::FORBIDDEN {
-                "permission_error"
-            } else {
-                "api_error"
-            };
-            return anthropic_error_response(status, error_type, message);
+        Err(error) => {
+            return anthropic_error_response(
+                error.status,
+                error.anthropic_type(),
+                error.error.message,
+            );
         }
     };
     match quota_exceeded(&repo, &shared.app, &key_record).await {
@@ -1096,25 +1149,31 @@ async fn handle_messages_stream(
 
     let channels = match repo.get_enabled_channels().await {
         Ok(c) => c,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "type": "error", "error": {"type": "api_error", "message": "No channels available"}
-        }))).into_response(),
+        Err(error) => return anthropic_http_error_response(HttpError::reported(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CHANNEL_LIST_FAILED",
+            "读取可用渠道失败",
+            true,
+            error,
+        )),
     };
 
     let model_channels = Dispatcher::select_channels(&channels, &model);
     if model_channels.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "type": "error", "error": {"type": "api_error", "message": format!("No channel for model: {}", model)}
-        }))).into_response();
+        return anthropic_http_error_response(HttpError::service_unavailable(
+            "CHANNEL_UNAVAILABLE",
+            "当前模型没有可用渠道",
+        ));
     }
     let selected_channels: Vec<_> = model_channels
         .into_iter()
         .filter(|channel| scope_allows(&allowed_channels, &channel.id, "全部渠道"))
         .collect();
     if selected_channels.is_empty() {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
-            "type": "error", "error": {"type": "permission_error", "message": "API key is not allowed to use a channel for this model"}
-        }))).into_response();
+        return anthropic_http_error_response(HttpError::forbidden(
+            "CHANNEL_NOT_ALLOWED",
+            "API Key 无权使用当前模型对应的渠道",
+        ));
     }
 
     let request = ProxyRequest { model: model.clone(), body: forward_json.clone(), stream: true };
@@ -1305,11 +1364,17 @@ async fn handle_messages_stream(
         }
     }
 
-    let err_body = serde_json::json!({
-        "type": "error",
-        "error": {"type": "api_error", "message": format!("All channels failed for model {} after {} attempt(s): {}", model, max_attempts, last_error.unwrap_or_else(|| "unknown".to_string()))}
-    });
-    (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
+    anthropic_http_error_response(
+        HttpError::bad_gateway(
+            "UPSTREAM_STREAM_FAILED",
+            "所有流式渠道请求均失败",
+            last_error.unwrap_or_else(|| "unknown upstream error".to_string()),
+        )
+        .with_details(serde_json::json!({
+            "model": model,
+            "attempts": max_attempts,
+        })),
+    )
 }
 
 // ─── OpenAI Responses API: POST /v1/responses ────────────────────────────────
@@ -1324,7 +1389,10 @@ pub async fn handle_responses(
     let body_str = String::from_utf8_lossy(&body);
     let json: serde_json::Value = match serde_json::from_str(&body_str) {
         Ok(j) => j,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
+        Err(_) => return HttpError::bad_request(
+            "INVALID_JSON",
+            "请求体不是有效的 JSON",
+        ).into_response(),
     };
 
     let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -1332,47 +1400,40 @@ pub async fn handle_responses(
 
     let api_key = match protocol::extract_api_key(&headers) {
         Some(k) => k,
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": {"message": "Missing API key", "type": "authentication_error"}
-        }))).into_response(),
+        None => return HttpError::unauthorized(
+            "MISSING_API_KEY",
+            "缺少 API Key",
+        ).into_response(),
     };
 
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
     let key_record = match repo.get_api_key_by_key(&api_key).await {
         Ok(k) => k,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": {"message": "Invalid API key", "type": "authentication_error"}
-        }))).into_response(),
+        Err(_) => return HttpError::unauthorized(
+            "INVALID_API_KEY",
+            "API Key 无效",
+        ).into_response(),
     };
     let allowed_channels = match validate_api_key_access(&key_record, &model) {
         Ok(scope) => scope,
-        Err((status, message)) => {
-            let error_type = if status == StatusCode::UNAUTHORIZED {
-                "authentication_error"
-            } else if status == StatusCode::FORBIDDEN {
-                "permission_error"
-            } else {
-                "server_error"
-            };
-            return (status, Json(serde_json::json!({
-                "error": {"message": message, "type": error_type}
-            }))).into_response();
-        }
+        Err(error) => return error.into_response(),
     };
 
     let is_quota_exceeded = match quota_exceeded(&repo, &shared.app, &key_record).await {
         Ok(exceeded) => exceeded,
         Err(error) => {
-            tracing::error!("quota check failed: {}", error);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": {"message": "Failed to check quota", "type": "server_error"}
-            }))).into_response();
+            return HttpError::internal(
+                "QUOTA_CHECK_FAILED",
+                "检查配额失败",
+                error,
+            ).into_response();
         }
     };
     if is_quota_exceeded {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
-            "error": {"message": "Quota exceeded", "type": "rate_limit_error"}
-        }))).into_response();
+        return HttpError::too_many_requests(
+            "QUOTA_EXCEEDED",
+            "配额已用尽",
+        ).into_response();
     }
 
     let trace_id = headers.get("Crow-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
@@ -1390,12 +1451,7 @@ pub async fn handle_responses(
                 let responses_resp = protocol::openai_to_responses(&result.body, &model);
                 (StatusCode::OK, Json(responses_resp)).into_response()
             }
-            Err((code, msg)) => {
-                let err_body = serde_json::json!({
-                    "error": {"message": msg, "type": "upstream_error", "code": code}
-                });
-                (StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY), Json(err_body)).into_response()
-            }
+            Err((code, message)) => upstream_error_response(code, message),
         }
     }
 }
@@ -1464,19 +1520,31 @@ async fn handle_responses_stream(
 
     let channels = match repo.get_enabled_channels().await {
         Ok(c) => c,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "No channels available").into_response(),
+        Err(error) => return HttpError::reported(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CHANNEL_LIST_FAILED",
+            "读取可用渠道失败",
+            true,
+            error,
+        ).into_response(),
     };
 
     let model_channels = Dispatcher::select_channels(&channels, &model);
     if model_channels.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
+        return HttpError::service_unavailable(
+            "CHANNEL_UNAVAILABLE",
+            "当前模型没有可用渠道",
+        ).into_response();
     }
     let selected_channels: Vec<_> = model_channels
         .into_iter()
         .filter(|channel| scope_allows(&allowed_channels, &channel.id, "全部渠道"))
         .collect();
     if selected_channels.is_empty() {
-        return (StatusCode::FORBIDDEN, "API key is not allowed to use a channel for this model").into_response();
+        return HttpError::forbidden(
+            "CHANNEL_NOT_ALLOWED",
+            "API Key 无权使用当前模型对应的渠道",
+        ).into_response();
     }
 
     let request = ProxyRequest { model: model.clone(), body: forward_json.clone(), stream: true };
@@ -1670,13 +1738,16 @@ async fn handle_responses_stream(
         }
     }
 
-    let err_body = serde_json::json!({
-        "error": {
-            "message": format!("All channels failed for model {} after {} attempt(s): {}", model, max_attempts, last_error.unwrap_or_else(|| "unknown".to_string())),
-            "type": "upstream_error"
-        }
-    });
-    (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
+    HttpError::bad_gateway(
+        "UPSTREAM_STREAM_FAILED",
+        "所有流式渠道请求均失败",
+        last_error.unwrap_or_else(|| "unknown upstream error".to_string()),
+    )
+    .with_details(serde_json::json!({
+        "model": model,
+        "attempts": max_attempts,
+    }))
+    .into_response()
 }
 
 fn legacy_prompt_to_text(prompt: &serde_json::Value) -> Result<String, String> {
@@ -1805,21 +1876,30 @@ pub async fn handle_completions(
     let body_str = String::from_utf8_lossy(&body);
     let mut json: serde_json::Value = match serde_json::from_str(&body_str) {
         Ok(value) => value,
-        Err(error) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", error)).into_response(),
+        Err(_) => return HttpError::bad_request(
+            "INVALID_JSON",
+            "请求体不是有效的 JSON",
+        ).into_response(),
     };
 
     let Some(object) = json.as_object_mut() else {
-        return (StatusCode::BAD_REQUEST, "Request body must be a JSON object").into_response();
+        return HttpError::bad_request(
+            "REQUEST_OBJECT_REQUIRED",
+            "请求体必须是 JSON 对象",
+        ).into_response();
     };
     let Some(model) = object.get("model").and_then(|value| value.as_str()).map(str::to_string) else {
-        return (StatusCode::BAD_REQUEST, "model is required").into_response();
+        return HttpError::bad_request("MODEL_REQUIRED", "model 为必填项").into_response();
     };
     let Some(prompt) = object.get("prompt") else {
-        return (StatusCode::BAD_REQUEST, "prompt is required").into_response();
+        return HttpError::bad_request("PROMPT_REQUIRED", "prompt 为必填项").into_response();
     };
     let prompt_text = match legacy_prompt_to_text(prompt) {
         Ok(value) => value,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        Err(error) => return HttpError::bad_request(
+            "PROMPT_INVALID",
+            error,
+        ).into_response(),
     };
     let stream = object.get("stream").and_then(|value| value.as_bool()).unwrap_or(false);
     let echo = object.get("echo").and_then(|value| value.as_bool()).unwrap_or(false);
@@ -1832,7 +1912,11 @@ pub async fn handle_completions(
 
     let translated = match serde_json::to_vec(&json) {
         Ok(value) => Bytes::from(value),
-        Err(error) => return (StatusCode::BAD_REQUEST, format!("Invalid request: {}", error)).into_response(),
+        Err(error) => return HttpError::internal(
+            "REQUEST_TRANSLATION_FAILED",
+            "转换兼容请求失败",
+            error,
+        ).into_response(),
     };
     let chat_response = handle_chat_completions_for_mode(shared, headers, translated, "completion").await;
     if !chat_response.status().is_success() {
@@ -1842,11 +1926,19 @@ pub async fn handle_completions(
     if !stream {
         let body = match to_bytes(chat_response.into_body(), 16 * 1024 * 1024).await {
             Ok(value) => value,
-            Err(error) => return (StatusCode::BAD_GATEWAY, format!("Invalid upstream response: {}", error)).into_response(),
+            Err(error) => return HttpError::bad_gateway(
+                "UPSTREAM_RESPONSE_READ_FAILED",
+                "读取上游响应失败",
+                error,
+            ).into_response(),
         };
         let chat_json = match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(value) => value,
-            Err(error) => return (StatusCode::BAD_GATEWAY, format!("Invalid upstream response: {}", error)).into_response(),
+            Err(error) => return HttpError::bad_gateway(
+                "UPSTREAM_RESPONSE_INVALID",
+                "上游响应格式无效",
+                error,
+            ).into_response(),
         };
         return (
             StatusCode::OK,
@@ -1944,59 +2036,56 @@ pub async fn handle_embeddings(
     let body_str = String::from_utf8_lossy(&body);
     let json: serde_json::Value = match serde_json::from_str(&body_str) {
         Ok(j) => j,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response(),
+        Err(_) => return HttpError::bad_request(
+            "INVALID_JSON",
+            "请求体不是有效的 JSON",
+        ).into_response(),
     };
 
     let api_key = match protocol::extract_api_key(&headers) {
         Some(k) => k,
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": {"message": "Missing API key", "type": "authentication_error"}
-        }))).into_response(),
+        None => return HttpError::unauthorized(
+            "MISSING_API_KEY",
+            "缺少 API Key",
+        ).into_response(),
     };
 
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
     let key_record = match repo.get_api_key_by_key(&api_key).await {
         Ok(k) => k,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": {"message": "Invalid API key", "type": "authentication_error"}
-        }))).into_response(),
+        Err(_) => return HttpError::unauthorized(
+            "INVALID_API_KEY",
+            "API Key 无效",
+        ).into_response(),
     };
 
     let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     if model.is_empty() || json.get("input").is_none() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": {"message": "model and input are required", "type": "invalid_request_error"}
-        }))).into_response();
+        return HttpError::bad_request(
+            "EMBEDDING_INPUT_REQUIRED",
+            "model 和 input 为必填项",
+        ).into_response();
     }
     let allowed_channels = match validate_api_key_access(&key_record, &model) {
         Ok(scope) => scope,
-        Err((status, message)) => {
-            let error_type = if status == StatusCode::UNAUTHORIZED {
-                "authentication_error"
-            } else if status == StatusCode::FORBIDDEN {
-                "permission_error"
-            } else {
-                "server_error"
-            };
-            return (status, Json(serde_json::json!({
-                "error": {"message": message, "type": error_type}
-            }))).into_response();
-        }
+        Err(error) => return error.into_response(),
     };
 
     let is_quota_exceeded = match quota_exceeded(&repo, &shared.app, &key_record).await {
         Ok(exceeded) => exceeded,
         Err(error) => {
-            tracing::error!("quota check failed: {}", error);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": {"message": "Failed to check quota", "type": "server_error"}
-            }))).into_response();
+            return HttpError::internal(
+                "QUOTA_CHECK_FAILED",
+                "检查配额失败",
+                error,
+            ).into_response();
         }
     };
     if is_quota_exceeded {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
-            "error": {"message": "Quota exceeded", "type": "rate_limit_error"}
-        }))).into_response();
+        return HttpError::too_many_requests(
+            "QUOTA_EXCEEDED",
+            "配额已用尽",
+        ).into_response();
     }
 
     let trace_id = headers.get("Crow-Trace-Id").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
@@ -2055,7 +2144,13 @@ pub async fn handle_embeddings(
     // Select channels
     let channels = match repo.get_enabled_channels().await {
         Ok(c) => c,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "No channels available").into_response(),
+        Err(error) => return HttpError::reported(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CHANNEL_LIST_FAILED",
+            "读取可用渠道失败",
+            true,
+            error,
+        ).into_response(),
     };
 
     let model_channels: Vec<_> = Dispatcher::select_channels(&channels, &model)
@@ -2063,9 +2158,9 @@ pub async fn handle_embeddings(
         .filter(|channel| supports_openai_embeddings(&channel.channel_type))
         .collect();
     if model_channels.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No OpenAI-compatible embeddings channel for model",
+        return HttpError::service_unavailable(
+            "EMBEDDING_CHANNEL_UNAVAILABLE",
+            "当前模型没有兼容的向量渠道",
         ).into_response();
     }
     let selected_channels: Vec<_> = model_channels
@@ -2073,7 +2168,10 @@ pub async fn handle_embeddings(
         .filter(|channel| scope_allows(&allowed_channels, &channel.id, "全部渠道"))
         .collect();
     if selected_channels.is_empty() {
-        return (StatusCode::FORBIDDEN, "API key is not allowed to use a channel for this model").into_response();
+        return HttpError::forbidden(
+            "CHANNEL_NOT_ALLOWED",
+            "API Key 无权使用当前模型对应的渠道",
+        ).into_response();
     }
 
     let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
@@ -2224,13 +2322,16 @@ pub async fn handle_embeddings(
         }
     }
 
-    let err_body = serde_json::json!({
-        "error": {
-            "message": format!("All channels failed for embedding model {} after {} attempt(s): {}", model, max_attempts, last_error.unwrap_or_else(|| "unknown".to_string())),
-            "type": "upstream_error"
-        }
-    });
-    (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
+    HttpError::bad_gateway(
+        "UPSTREAM_EMBEDDING_FAILED",
+        "所有向量渠道请求均失败",
+        last_error.unwrap_or_else(|| "unknown upstream error".to_string()),
+    )
+    .with_details(serde_json::json!({
+        "model": model,
+        "attempts": max_attempts,
+    }))
+    .into_response()
 }
 
 pub async fn handle_list_models(
@@ -2240,21 +2341,21 @@ pub async fn handle_list_models(
     let repo = Repository::new(shared.state.db.pool.clone());
     let api_key = match protocol::extract_api_key(&headers) {
         Some(key) => key,
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": {"message": "Missing API key", "type": "authentication_error"}
-        }))).into_response(),
+        None => return HttpError::unauthorized(
+            "MISSING_API_KEY",
+            "缺少 API Key",
+        ).into_response(),
     };
     let key_record = match repo.get_api_key_by_key(&api_key).await {
         Ok(key) => key,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": {"message": "Invalid API key", "type": "authentication_error"}
-        }))).into_response(),
+        Err(_) => return HttpError::unauthorized(
+            "INVALID_API_KEY",
+            "API Key 无效",
+        ).into_response(),
     };
     let (allowed_models, allowed_channels) = match validate_api_key_scopes(&key_record) {
         Ok(scopes) => scopes,
-        Err((status, message)) => return (status, Json(serde_json::json!({
-            "error": {"message": message, "type": if status == StatusCode::FORBIDDEN { "permission_error" } else { "authentication_error" }}
-        }))).into_response(),
+        Err(error) => return error.into_response(),
     };
 
     match repo.get_enabled_channels().await {
@@ -2292,20 +2393,33 @@ pub async fn handle_list_models(
             }
             Json(serde_json::json!({ "object": "list", "data": models })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(error) => HttpError::internal(
+            "MODEL_LIST_FAILED",
+            "读取模型列表失败",
+            error,
+        ).into_response(),
     }
 }
 
 pub async fn handle_images(State(_shared): State<SharedState>) -> Response {
-    (StatusCode::NOT_IMPLEMENTED, "Not implemented yet").into_response()
+    HttpError::not_implemented(
+        "IMAGES_NOT_IMPLEMENTED",
+        "图像接口暂未实现",
+    ).into_response()
 }
 
 pub async fn handle_audio_transcriptions(State(_shared): State<SharedState>) -> Response {
-    (StatusCode::NOT_IMPLEMENTED, "Not implemented yet").into_response()
+    HttpError::not_implemented(
+        "AUDIO_TRANSCRIPTIONS_NOT_IMPLEMENTED",
+        "音频转写接口暂未实现",
+    ).into_response()
 }
 
 pub async fn handle_audio_speech(State(_shared): State<SharedState>) -> Response {
-    (StatusCode::NOT_IMPLEMENTED, "Not implemented yet").into_response()
+    HttpError::not_implemented(
+        "AUDIO_SPEECH_NOT_IMPLEMENTED",
+        "语音合成接口暂未实现",
+    ).into_response()
 }
 
 pub async fn handle_health(State(shared): State<SharedState>) -> Response {

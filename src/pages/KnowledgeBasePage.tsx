@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useLocation } from "react-router-dom";
 import { ServiceSwitcher } from "../components/ServiceSwitcher";
+import { useTauriEvent } from "../hooks/useTauriEvent";
 import { Modal, PageTitle } from "../components/ui";
 import {
   kbApi,
@@ -132,6 +133,11 @@ function McpSection() {
   const mcpEndpoint = `${baseUrl}/mcp`;
   const sseEndpoint = `${baseUrl}/mcp/sse`;
   const tools = (mcpService?.stats?.tools as { name: string; label: string; desc: string }[]) || [];
+  const serviceState = (service: ServiceStatus) => {
+    if (!service.running) return { className: "is-stopped", label: "已停止" };
+    if (service.health === "degraded") return { className: "is-degraded", label: "受限" };
+    return { className: "is-running", label: "运行中" };
+  };
 
   const handleCopy = async (text: string) => {
     try {
@@ -171,26 +177,32 @@ function McpSection() {
             <div className="mcp-status-item">
               <div className="mcp-status-item-header">
                 <span>知识库服务</span>
-                <span className={`mcp-runtime-state ${kbService.running ? "is-running" : "is-stopped"}`}>
-                  <Wifi size={12} />{kbService.running ? "运行中" : "已停止"}
+                <span className={`mcp-runtime-state ${serviceState(kbService).className}`}>
+                  <Wifi size={12} />{serviceState(kbService).label}
                 </span>
               </div>
               <div className="mcp-status-metrics">
                 知识库: {String(kbService.stats.knowledge_bases || 0)} · 文档: {String(kbService.stats.documents || 0)} · 切片: {String(kbService.stats.chunks || 0)}
               </div>
+              {kbService.issues[0] && (
+                <div className="mcp-status-issue">{kbService.issues[0].message}</div>
+              )}
             </div>
           )}
           {mcpService && (
             <div className="mcp-status-item">
               <div className="mcp-status-item-header">
                 <span>MCP 服务</span>
-                <span className={`mcp-runtime-state ${mcpService.running ? "is-running" : "is-stopped"}`}>
-                  <Wifi size={12} />{mcpService.running ? "运行中" : "已停止"}
+                <span className={`mcp-runtime-state ${serviceState(mcpService).className}`}>
+                  <Wifi size={12} />{serviceState(mcpService).label}
                 </span>
               </div>
               <div className="mcp-status-metrics">
                 可用知识库: {String(mcpService.stats.available_knowledge_bases || 0)} · 工具: {tools.length}
               </div>
+              {mcpService.issues[0] && (
+                <div className="mcp-status-issue">{mcpService.issues[0].message}</div>
+              )}
             </div>
           )}
           {!kbService && !mcpService && (
@@ -781,40 +793,26 @@ function SourcesTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => voi
     return () => clearInterval(interval);
   }, [fetchSources]);
 
-  // Listen for import progress
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let active = true;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ kb_id: string; source_id: string; progress: number; detail: string }>(
-        "kb-import-progress",
-        (event) => {
-          if (!active) return;
-          const p = event.payload;
-          if (p.kb_id !== kb.id) return;
-          if (p.progress >= 100) {
-            setProgressMap((prev) => {
-              const next = { ...prev };
-              delete next[p.source_id];
-              return next;
-            });
-            fetchSources();
-            onRefresh();
-          } else {
-            setProgressMap((prev) => ({
-              ...prev,
-              [p.source_id]: { progress: p.progress, detail: p.detail },
-            }));
-          }
-        }
-      );
-    })();
-    return () => {
-      active = false;
-      if (unlisten) unlisten();
-    };
-  }, [kb.id, fetchSources, onRefresh]);
+  useTauriEvent<{ kb_id: string; source_id: string; progress: number; detail: string }>(
+    "kb-import-progress",
+    (payload) => {
+      if (payload.kb_id !== kb.id) return;
+      if (payload.progress >= 100) {
+        setProgressMap((prev) => {
+          const next = { ...prev };
+          delete next[payload.source_id];
+          return next;
+        });
+        void fetchSources();
+        onRefresh();
+      } else {
+        setProgressMap((prev) => ({
+          ...prev,
+          [payload.source_id]: { progress: payload.progress, detail: payload.detail },
+        }));
+      }
+    },
+  );
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
@@ -1243,41 +1241,29 @@ function IndexTab({ kb }: { kb: KnowledgeBase }) {
   }, [kb.id]);
 
   useEffect(() => {
-    fetchIndex();
+    void fetchIndex();
+  }, [fetchIndex]);
 
-    // Listen for real-time index build progress
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ kb_id: string; status: string; message: string; progress?: number; current?: number; total?: number }>(
-        "kb-index-progress",
-        (event) => {
-          const payload = event.payload;
-          if (payload.kb_id !== kb.id) return;
+  useTauriEvent<{ kb_id: string; status: string; message: string; progress?: number; current?: number; total?: number }>(
+    "kb-index-progress",
+    (payload) => {
+      if (payload.kb_id !== kb.id) return;
 
-          setBuildMsg(payload.message);
-
-          if (payload.status === "ready") {
-            setBuilding(false);
-            setBuildProgress(100);
-            setBuildMsg("");
-            fetchIndex();
-          } else if (payload.status === "error") {
-            setBuilding(false);
-            setBuildProgress(0);
-            // Keep error message visible
-          } else if (payload.status === "building") {
-            setBuilding(true);
-            setBuildProgress(payload.progress ?? 0);
-          }
-        }
-      );
-    })();
-
-    return () => {
-      if (unlisten) unlisten();
-    };
-  }, [fetchIndex, kb.id]);
+      setBuildMsg(payload.message);
+      if (payload.status === "ready") {
+        setBuilding(false);
+        setBuildProgress(100);
+        setBuildMsg("");
+        void fetchIndex();
+      } else if (payload.status === "error") {
+        setBuilding(false);
+        setBuildProgress(0);
+      } else if (payload.status === "building") {
+        setBuilding(true);
+        setBuildProgress(payload.progress ?? 0);
+      }
+    },
+  );
 
   const handleBuild = async () => {
     setBuilding(true);
@@ -1469,72 +1455,44 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
     return () => clearInterval(interval);
   }, [fetchDocs]);
 
-  // Listen for document processing errors from backend
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let active = true;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ doc_id: string; kb_id: string; filename: string; error: string }>(
-        "kb-document-error",
-        (event) => {
-          if (!active) return;
-          const payload = event.payload;
-          if (payload.kb_id !== kb.id) return;
-          setErrorNotices((prev) => [...prev, payload]);
-          setProgressMap((prev) => {
-            const next = { ...prev };
-            delete next[payload.doc_id];
-            return next;
-          });
-          setTimeout(() => {
-            setErrorNotices((prev) => prev.filter((n) => n.doc_id !== payload.doc_id));
-          }, 8000);
-          fetchDocs();
-          onRefresh();
-        }
-      );
-    })();
-    return () => {
-      active = false;
-      if (unlisten) unlisten();
-    };
-  }, [kb.id, fetchDocs, onRefresh]);
+  useTauriEvent<{ doc_id: string; kb_id: string; filename: string; error: string }>(
+    "kb-document-error",
+    (payload) => {
+      if (payload.kb_id !== kb.id) return;
+      setErrorNotices((prev) => [...prev, payload]);
+      setProgressMap((prev) => {
+        const next = { ...prev };
+        delete next[payload.doc_id];
+        return next;
+      });
+      setTimeout(() => {
+        setErrorNotices((prev) => prev.filter((notice) => notice.doc_id !== payload.doc_id));
+      }, 8000);
+      void fetchDocs();
+      onRefresh();
+    },
+  );
 
-  // Listen for document processing progress from backend
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let active = true;
-    (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ doc_id: string; kb_id: string; filename: string; stage: string; progress: number; detail: string }>(
-        "kb-document-progress",
-        (event) => {
-          if (!active) return;
-          const p = event.payload;
-          if (p.kb_id !== kb.id) return;
-          if (p.stage === "done") {
-            setProgressMap((prev) => {
-              const next = { ...prev };
-              delete next[p.doc_id];
-              return next;
-            });
-            fetchDocs();
-            onRefresh();
-          } else {
-            setProgressMap((prev) => ({
-              ...prev,
-              [p.doc_id]: { stage: p.stage, progress: p.progress, detail: p.detail },
-            }));
-          }
-        }
-      );
-    })();
-    return () => {
-      active = false;
-      if (unlisten) unlisten();
-    };
-  }, [kb.id, fetchDocs, onRefresh]);
+  useTauriEvent<{ doc_id: string; kb_id: string; filename: string; stage: string; progress: number; detail: string }>(
+    "kb-document-progress",
+    (payload) => {
+      if (payload.kb_id !== kb.id) return;
+      if (payload.stage === "done") {
+        setProgressMap((prev) => {
+          const next = { ...prev };
+          delete next[payload.doc_id];
+          return next;
+        });
+        void fetchDocs();
+        onRefresh();
+      } else {
+        setProgressMap((prev) => ({
+          ...prev,
+          [payload.doc_id]: { stage: payload.stage, progress: payload.progress, detail: payload.detail },
+        }));
+      }
+    },
+  );
 
   const handleUploadBatch = async (files: File[]) => {
     if (files.length === 0) return;

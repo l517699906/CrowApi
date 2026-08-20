@@ -11,10 +11,12 @@ use tauri::{AppHandle, Emitter};
 
 /// Default embedding model
 const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+pub const DOCUMENT_TASK_ALREADY_RUNNING: &str = "KB_DOCUMENT_TASK_ALREADY_RUNNING";
 
 /// Emit progress event to frontend
 fn emit_progress(
     app: &AppHandle,
+    task_id: &str,
     doc_id: &str,
     kb_id: &str,
     filename: &str,
@@ -23,6 +25,7 @@ fn emit_progress(
     detail: &str,
 ) {
     let _ = app.emit("kb-document-progress", serde_json::json!({
+        "task_id": task_id,
         "doc_id": doc_id,
         "kb_id": kb_id,
         "filename": filename,
@@ -43,29 +46,66 @@ pub async fn process_document(
     embedding_model: Option<&str>,
 ) -> Result<(), String> {
     let repo = KbRepository::new(pool.clone());
-
-    // Update status to processing
-    repo.update_document_status(doc_id, "processing", None)
+    let task = repo
+        .create_task(kb_id, Some(doc_id), "process_document", 1)
         .await
         .map_err(|e| e.to_string())?;
+    run_document_task(
+        pool,
+        app,
+        kb_id,
+        doc_id,
+        filename,
+        content,
+        embedding_model,
+        &task.id,
+        "failed",
+    )
+    .await
+}
 
-    emit_progress(app, doc_id, kb_id, filename, "processing", 0, "开始处理");
+#[allow(clippy::too_many_arguments)]
+async fn run_document_task(
+    pool: &SqlitePool,
+    app: &AppHandle,
+    kb_id: &str,
+    doc_id: &str,
+    filename: &str,
+    content: &[u8],
+    embedding_model: Option<&str>,
+    task_id: &str,
+    failure_status: &str,
+) -> Result<(), String> {
+    let repo = KbRepository::new(pool.clone());
+
+    // Update status to processing
+    if let Err(error) = repo.update_document_status(doc_id, "processing", None).await {
+        let message = error.to_string();
+        let _ = repo.complete_task(task_id, Some(&message)).await;
+        return Err(message);
+    }
+
+    emit_progress(app, task_id, doc_id, kb_id, filename, "processing", 0, "开始处理");
 
     let result = process_document_inner(
-        pool, app, kb_id, doc_id, filename, content, embedding_model,
+        pool, app, kb_id, doc_id, filename, content, embedding_model, task_id,
     ).await;
 
     if let Err(ref e) = result {
         let err_msg = format!("文档「{}」处理失败: {}", filename, e);
-        let _ = repo.update_document_status(doc_id, "failed", Some(&err_msg)).await;
+        let _ = repo.update_document_status(doc_id, failure_status, Some(&err_msg)).await;
+        let _ = repo.complete_task(task_id, Some(&err_msg)).await;
         let _ = app.emit("kb-document-error", serde_json::json!({
+            "task_id": task_id,
             "doc_id": doc_id,
             "kb_id": kb_id,
             "filename": filename,
-            "error": e,
+            "error": "文档处理失败",
         }));
     } else {
-        emit_progress(app, doc_id, kb_id, filename, "done", 100, "处理完成");
+        let _ = repo.update_task_progress(task_id, 1, 100).await;
+        let _ = repo.complete_task(task_id, None).await;
+        emit_progress(app, task_id, doc_id, kb_id, filename, "done", 100, "处理完成");
     }
 
     result
@@ -79,11 +119,12 @@ async fn process_document_inner(
     filename: &str,
     content: &[u8],
     embedding_model: Option<&str>,
+    task_id: &str,
 ) -> Result<(), String> {
     let repo = KbRepository::new(pool.clone());
 
     // 1. Parse file
-    emit_progress(app, doc_id, kb_id, filename, "parsing", 5, "解析文件");
+    emit_progress(app, task_id, doc_id, kb_id, filename, "parsing", 5, "解析文件");
     let parsed = parser::parse_file(filename, content)?;
 
     let (text, file_type_label): (String, String) = match &parsed {
@@ -94,7 +135,7 @@ async fn process_document_inner(
     };
 
     // 2. Split into chunks — use KB-level config if available
-    emit_progress(app, doc_id, kb_id, filename, "splitting", 15, "文本分块");
+    emit_progress(app, task_id, doc_id, kb_id, filename, "splitting", 15, "文本分块");
     let kb = repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
     let config = splitter::SplitConfig {
         chunk_size: if kb.chunk_size > 0 { kb.chunk_size as usize } else { 512 },
@@ -111,7 +152,7 @@ async fn process_document_inner(
             if code_parser::is_supported_language(language) {
                 let symbols = code_parser::extract_symbols(filename, text);
                 emit_progress(
-                    app, doc_id, kb_id, filename, "splitting", 18,
+                    app, task_id, doc_id, kb_id, filename, "splitting", 18,
                     &format!("AST 解析：提取到 {} 个符号", symbols.len()),
                 );
                 splitter::split_code_by_symbols(text, &symbols, &config, &base_metadata)
@@ -123,16 +164,12 @@ async fn process_document_inner(
     };
 
     if chunks.is_empty() {
-        repo.update_document_status(doc_id, "ready", None)
-            .await
-            .map_err(|e| e.to_string())?;
-        repo.update_document_counts(doc_id, 0, 0)
+        repo.replace_document_chunks(kb_id, doc_id, &[], 0)
             .await
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
 
-    let total_chunks = chunks.len() as i64;
     let total_tokens: i64 = chunks.iter().map(|c| c.token_count as i64).sum();
 
     // 3. Embed chunks in batches
@@ -173,7 +210,7 @@ async fn process_document_inner(
         // Embedding progress: 20% ~ 80%
         let pct = 20 + ((batch_done as f64 / total_batches as f64) * 60.0) as u8;
         emit_progress(
-            app, doc_id, kb_id, filename, "embedding", pct,
+            app, task_id, doc_id, kb_id, filename, "embedding", pct,
             &format!("向量化 {}/{}", batch_done, total_batches),
         );
     }
@@ -187,19 +224,20 @@ async fn process_document_inner(
         }
     }
 
-    // 4. Store chunks with embeddings
+    // 4. Prepare all chunks before replacing the previous document snapshot.
     let chunks_total = chunks.len();
+    let mut inserts = Vec::with_capacity(chunks_total);
     for (i, chunk) in chunks.iter().enumerate() {
         // Storing progress: 80% ~ 95%
         if i % 10 == 0 || i == chunks_total - 1 {
             let pct = 80 + ((i as f64 + 1.0) / chunks_total as f64 * 15.0) as u8;
             emit_progress(
-                app, doc_id, kb_id, filename, "storing", pct,
+                app, task_id, doc_id, kb_id, filename, "storing", pct,
                 &format!("存储切片 {}/{}", i + 1, chunks_total),
             );
         }
         let embedding_bytes = retriever::encode_embedding(&all_embeddings[i]);
-        let chunk_insert = ChunkInsert {
+        inserts.push(ChunkInsert {
             id: uuid::Uuid::new_v4().to_string(),
             doc_id: doc_id.to_string(),
             kb_id: kb_id.to_string(),
@@ -210,26 +248,17 @@ async fn process_document_inner(
             embedding_dim: all_embeddings[i].len() as i64,
             metadata: serde_json::to_string(&chunk.metadata).unwrap_or_else(|_| "{}".to_string()),
             created_at: now_iso(),
-        };
-        repo.create_chunk(&chunk_insert)
-            .await
-            .map_err(|e| e.to_string())?;
+        });
     }
 
-    // 5. Update document and KB counts
-    emit_progress(app, doc_id, kb_id, filename, "finalizing", 98, "更新统计");
-    repo.update_document_counts(doc_id, total_chunks, total_tokens)
-        .await
-        .map_err(|e| e.to_string())?;
-    repo.update_document_status(doc_id, "ready", None)
-        .await
-        .map_err(|e| e.to_string())?;
-    repo.update_kb_counts(kb_id)
+    // 5. Atomically swap chunks, document status, counts and index freshness.
+    emit_progress(app, task_id, doc_id, kb_id, filename, "finalizing", 98, "更新统计");
+    repo.replace_document_chunks(kb_id, doc_id, &inserts, total_tokens)
         .await
         .map_err(|e| e.to_string())?;
 
     // 6. Rebuild HNSW index (best-effort, non-blocking on failure)
-    emit_progress(app, doc_id, kb_id, filename, "indexing", 99, "更新向量索引");
+    emit_progress(app, task_id, doc_id, kb_id, filename, "indexing", 99, "更新向量索引");
     let pool_clone = pool.clone();
     let kb_id_clone = kb_id.to_string();
     let app_clone = app.clone();
@@ -237,11 +266,15 @@ async fn process_document_inner(
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             if let Err(e) = retriever::build_index(&pool_clone, &kb_id_clone, &app_clone).await {
+                if e == retriever::INDEX_BUILD_ALREADY_RUNNING {
+                    tracing::debug!(knowledge_base_id = %kb_id_clone, "index build already running");
+                    return;
+                }
                 tracing::warn!("Failed to rebuild HNSW index for KB {} after doc: {}", kb_id_clone, e);
                 let _ = app_clone.emit("kb-index-progress", serde_json::json!({
                     "kb_id": &kb_id_clone,
                     "status": "error",
-                    "message": format!("索引构建失败: {}", e)
+                    "message": "索引构建失败"
                 }));
             } else {
                 let _ = app_clone.emit("kb-index-progress", serde_json::json!({
@@ -256,7 +289,7 @@ async fn process_document_inner(
     Ok(())
 }
 
-/// Reindex a document (delete old chunks, reprocess)
+/// Reindex a document while preserving the previous ready snapshot on failure.
 pub async fn reindex_document(
     pool: &SqlitePool,
     app: &AppHandle,
@@ -264,28 +297,92 @@ pub async fn reindex_document(
 ) -> Result<(), String> {
     let repo = KbRepository::new(pool.clone());
     let doc = repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
+    let task = repo
+        .create_task_if_idle(&doc.kb_id, Some(doc_id), "reindex_document", 1)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| DOCUMENT_TASK_ALREADY_RUNNING.to_string())?;
+    run_reindex_task(pool, app, doc, task.id).await
+}
 
-    // Delete existing chunks
-    repo.delete_chunks_by_doc(doc_id).await.map_err(|e| e.to_string())?;
+pub async fn start_reindex_document(
+    pool: &SqlitePool,
+    app: &AppHandle,
+    kb_id: &str,
+    doc_id: &str,
+) -> Result<String, String> {
+    let repo = KbRepository::new(pool.clone());
+    let doc = repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
+    if doc.kb_id != kb_id {
+        return Err("DOCUMENT_NOT_FOUND".to_string());
+    }
+    let task = repo
+        .create_task_if_idle(kb_id, Some(doc_id), "reindex_document", 1)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| DOCUMENT_TASK_ALREADY_RUNNING.to_string())?;
+    let task_id = task.id.clone();
+    let pool = pool.clone();
+    let app = app.clone();
+    tokio::spawn(async move {
+        if let Err(error) = run_reindex_task(&pool, &app, doc, task.id).await {
+            tracing::error!(%error, "knowledge document reindex failed");
+        }
+    });
+    Ok(task_id)
+}
 
-    // Read file content from path
+async fn run_reindex_task(
+    pool: &SqlitePool,
+    app: &AppHandle,
+    doc: super::models::KbDocument,
+    task_id: String,
+) -> Result<(), String> {
+    let repo = KbRepository::new(pool.clone());
+    let failure_status = if doc.chunk_count > 0 { "ready" } else { "failed" };
+
     let content = if let Some(path) = &doc.file_path {
-        std::fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?
+        match tokio::fs::read(path).await {
+            Ok(content) => content,
+            Err(error) => {
+                let message = format!("Failed to read file: {}", error);
+                let _ = repo.complete_task(&task_id, Some(&message)).await;
+                let _ = repo
+                    .update_document_status(&doc.id, failure_status, Some(&message))
+                    .await;
+                return Err(message);
+            }
+        }
     } else {
-        return Err("No file path to reindex".to_string());
+        let message = "No file path to reindex".to_string();
+        let _ = repo.complete_task(&task_id, Some(&message)).await;
+        let _ = repo
+            .update_document_status(&doc.id, failure_status, Some(&message))
+            .await;
+        return Err(message);
     };
 
-    // Get KB for embedding model
-    let kb = repo.get_kb(&doc.kb_id).await.map_err(|e| e.to_string())?;
-
-    process_document(
+    let kb = match repo.get_kb(&doc.kb_id).await {
+        Ok(kb) => kb,
+        Err(error) => {
+            let message = error.to_string();
+            let _ = repo.complete_task(&task_id, Some(&message)).await;
+            let _ = repo
+                .update_document_status(&doc.id, failure_status, Some(&message))
+                .await;
+            return Err(message);
+        }
+    };
+    run_document_task(
         pool,
         app,
         &doc.kb_id,
-        doc_id,
+        &doc.id,
         &doc.filename,
         &content,
         kb.embedding_model.as_deref(),
+        &task_id,
+        failure_status,
     )
     .await
 }

@@ -12,9 +12,15 @@ impl Adaptor for GeminiAdaptor {
     async fn test(&self, config: &ChannelConfig) -> Result<TestResult, anyhow::Error> {
         let start = std::time::Instant::now();
         let model = config.models.first().map(|s| s.as_str()).unwrap_or("gemini-2.0-flash");
-        let url = format!("{}/v1beta/models/{}?key={}", config.base_url.trim_end_matches('/'), model, config.api_key);
+        let url = format!("{}/v1beta/models/{}", config.base_url.trim_end_matches('/'), model);
         let client = reqwest::Client::new();
-        match client.get(&url).timeout(std::time::Duration::from_secs(10)).send().await {
+        match client
+            .get(&url)
+            .header("x-goog-api-key", &config.api_key)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
             Ok(r) => {
                 let latency = start.elapsed().as_millis() as u64;
                 if r.status().is_success() {
@@ -30,7 +36,7 @@ impl Adaptor for GeminiAdaptor {
     async fn forward(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<(u16, serde_json::Value, Option<TokenUsage>), anyhow::Error> {
         let model = request.body.get("model").and_then(|m| m.as_str()).unwrap_or("gemini-2.0-flash");
         // 非流式：:generateContent
-        let url = format!("{}/v1beta/models/{}:generateContent?key={}", config.base_url.trim_end_matches('/'), model, config.api_key);
+        let url = format!("{}/v1beta/models/{}:generateContent", config.base_url.trim_end_matches('/'), model);
 
         let openai_body = &request.body;
         let gemini_body = convert_openai_to_gemini(openai_body);
@@ -39,7 +45,13 @@ impl Adaptor for GeminiAdaptor {
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        let resp = client.post(&url).header("Content-Type", "application/json").json(&gemini_body).send().await?;
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &config.api_key)
+            .json(&gemini_body)
+            .send()
+            .await?;
         let status = resp.status().as_u16();
         let gemini_json: serde_json::Value = resp.json().await?;
 
@@ -56,7 +68,7 @@ impl Adaptor for GeminiAdaptor {
     async fn forward_stream(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<reqwest::Response, anyhow::Error> {
         let model = request.body.get("model").and_then(|m| m.as_str()).unwrap_or("gemini-2.0-flash");
         // 流式：:streamGenerateContent + alt=sse
-        let url = format!("{}/v1beta/models/{}:streamGenerateContent?key={}&alt=sse", config.base_url.trim_end_matches('/'), model, config.api_key);
+        let url = format!("{}/v1beta/models/{}:streamGenerateContent?alt=sse", config.base_url.trim_end_matches('/'), model);
 
         let openai_body = &request.body;
         let gemini_body = convert_openai_to_gemini(openai_body);
@@ -65,7 +77,13 @@ impl Adaptor for GeminiAdaptor {
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        let resp = client.post(&url).header("Content-Type", "application/json").json(&gemini_body).send().await?;
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &config.api_key)
+            .json(&gemini_body)
+            .send()
+            .await?;
         Ok(resp)
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
     BarChart3,
     Bell,
@@ -18,18 +18,20 @@ import {
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { DEFAULT_SETTINGS } from "../config/defaults";
+import { serviceViewForPath } from "../config/serviceViews";
 import { channelApi, serverApi, settingsApi } from "../lib/api";
 import { queryKeys } from "../lib/query";
 import { applyUiTheme, DARK_THEME_MEDIA_QUERY } from "../lib/theme";
-import { ApiKeysPage } from "../pages/ApiKeysPage";
-import { ChannelsPage } from "../pages/ChannelsPage";
-import { DashboardPage } from "../pages/DashboardPage";
-import { LogsPage } from "../pages/LogsPage";
-import { SettingsPage } from "../pages/SettingsPage";
-import { UsagePage } from "../pages/UsagePage";
-import { KnowledgeBasePage } from "../pages/KnowledgeBasePage";
-import { WikiPage } from "../pages/WikiPage";
 import { IconButton, Toast } from "./ui";
+
+const ApiKeysPage = lazy(() => import("../pages/ApiKeysPage").then((module) => ({ default: module.ApiKeysPage })));
+const ChannelsPage = lazy(() => import("../pages/ChannelsPage").then((module) => ({ default: module.ChannelsPage })));
+const DashboardPage = lazy(() => import("../pages/DashboardPage").then((module) => ({ default: module.DashboardPage })));
+const LogsPage = lazy(() => import("../pages/LogsPage").then((module) => ({ default: module.LogsPage })));
+const SettingsPage = lazy(() => import("../pages/SettingsPage").then((module) => ({ default: module.SettingsPage })));
+const UsagePage = lazy(() => import("../pages/UsagePage").then((module) => ({ default: module.UsagePage })));
+const KnowledgeBasePage = lazy(() => import("../pages/KnowledgeBasePage").then((module) => ({ default: module.KnowledgeBasePage })));
+const WikiPage = lazy(() => import("../pages/WikiPage").then((module) => ({ default: module.WikiPage })));
 
 const navItems = [
     { to: "/dashboard", label: "仪表盘", icon: LayoutDashboard },
@@ -44,10 +46,18 @@ const navItems = [
 const pageNames = new Map<string, string>(navItems.map((item) => [item.to, item.label]));
 
 function resolvePageName(pathname: string) {
-    if (pathname.startsWith("/services/wiki")) return "Wiki";
-    if (pathname.startsWith("/services/mcp")) return "MCP 服务";
-    if (pathname.startsWith("/services")) return "知识库";
+    const serviceView = serviceViewForPath(pathname);
+    if (serviceView) return serviceView.pageName;
     return pageNames.get(pathname) ?? "仪表盘";
+}
+
+function RouteFallback() {
+    return (
+        <div className="route-loading" role="status">
+            <span className="button-spinner" aria-hidden="true" />
+            正在加载页面
+        </div>
+    );
 }
 
 export function AppShell() {
@@ -228,17 +238,19 @@ export function AppShell() {
                 </header>
 
                 <main className="app-content">
-                    <Routes>
-                        <Route path="/dashboard" element={<DashboardPage />} />
-                        <Route path="/usage" element={<UsagePage />} />
-                        <Route path="/channels" element={<ChannelsPage />} />
-                        <Route path="/services/wiki" element={<WikiPage />} />
-                        <Route path="/services/*" element={<KnowledgeBasePage />} />
-                        <Route path="/keys" element={<ApiKeysPage />} />
-                        <Route path="/logs" element={<LogsPage />} />
-                        <Route path="/settings" element={<SettingsPage />} />
-                        <Route path="*" element={<Navigate to="/dashboard" replace />} />
-                    </Routes>
+                    <Suspense fallback={<RouteFallback />}>
+                        <Routes>
+                            <Route path="/dashboard" element={<DashboardPage />} />
+                            <Route path="/usage" element={<UsagePage />} />
+                            <Route path="/channels" element={<ChannelsPage />} />
+                            <Route path="/services/wiki" element={<WikiPage />} />
+                            <Route path="/services/*" element={<KnowledgeBasePage />} />
+                            <Route path="/keys" element={<ApiKeysPage />} />
+                            <Route path="/logs" element={<LogsPage />} />
+                            <Route path="/settings" element={<SettingsPage />} />
+                            <Route path="*" element={<Navigate to="/dashboard" replace />} />
+                        </Routes>
+                    </Suspense>
                 </main>
             </div>
             {toastMessage ? <Toast message={toastMessage} /> : null}

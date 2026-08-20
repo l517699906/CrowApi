@@ -88,17 +88,47 @@ export interface ImportResult {
 }
 
 export interface ScannedSource {
+    id: string;
     source: string;
     name: string;
     base_url: string;
-    api_key: string;
+    key_preview: string;
     models: string[];
     api_format: string;
-    raw: Record<string, unknown>;
 }
 
 export interface ScanResult {
     sources: ScannedSource[];
+}
+
+export interface BackupSummary {
+    createdAt: string;
+    appVersion: string;
+    schemaVersion: number;
+    databaseBytes: number;
+    fileCount: number;
+    fileBytes: number;
+    channelCount: number;
+    apiKeyCount: number;
+    knowledgeBaseCount: number;
+    wikiProjectCount: number;
+    includesLogs: boolean;
+}
+
+export interface BackupPreview {
+    selectionId: string;
+    summary: BackupSummary;
+    warnings: string[];
+}
+
+export interface BackupWriteResult {
+    path: string;
+    summary: BackupSummary;
+}
+
+export interface RestoreScheduleResult {
+    restartRequired: boolean;
+    rollbackDirectory: string;
 }
 
 export type SecurityRuleSeverity = "info" | "low" | "medium" | "high" | "critical";
@@ -169,6 +199,8 @@ export interface UpdateApiKeyInput {
     id: string;
     status?: number;
     quota_limit?: number;
+    expires_at?: string;
+    clear_expires_at?: boolean;
 }
 
 export type RiskLevel = "clean" | "info" | "low" | "medium" | "high" | "critical";
@@ -461,5 +493,11 @@ export interface ServiceStatus {
     description: string;
     enabled: boolean;
     running: boolean;
+    health: "healthy" | "degraded" | "unavailable";
+    issues: Array<{
+        code: string;
+        message: string;
+        retryable: boolean;
+    }>;
     stats: Record<string, unknown>;
 }

@@ -1,4 +1,5 @@
 use crate::db::repository::Repository;
+use crate::core::error::{CommandResult, CommandResultExt};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 
@@ -45,12 +46,12 @@ impl From<crate::db::models::ProtocolUsageStat> for ProtocolUsageStatDto {
 pub async fn get_dashboard_stats(
     input: DashboardStatsInput,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<DashboardStatsDto, String> {
+) -> CommandResult<DashboardStatsDto> {
     let repo = Repository::new(state.db.pool.clone());
     let s = repo
         .get_dashboard_stats(input.date_from.as_deref(), input.date_to.as_deref())
         .await
-        .map_err(|e| e.to_string())?;
+        .command_error("DASHBOARD_STATS_FAILED", "读取仪表盘统计失败", true)?;
     Ok(DashboardStatsDto {
         today_requests: s.today_requests,
         today_total_tokens: s.today_total_tokens,
@@ -111,7 +112,7 @@ pub struct UsageStatsDto {
 pub async fn get_usage_stats(
     input: UsageStatsInput,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
-) -> Result<UsageStatsDto, String> {
+) -> CommandResult<UsageStatsDto> {
     let repo = Repository::new(state.db.pool.clone());
     let bucket_seconds = input
         .bucket_seconds
@@ -126,7 +127,7 @@ pub async fn get_usage_stats(
             bucket_count,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .command_error("USAGE_STATS_FAILED", "读取用量统计失败", true)?;
 
     Ok(UsageStatsDto {
         total_requests: stats.total_requests,

@@ -16,7 +16,7 @@ import {
     TriangleAlert,
 } from "lucide-react";
 import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { listen } from "@tauri-apps/api/event";
+import { useTauriEvent } from "../hooks/useTauriEvent";
 import { formatDateTime, formatDuration, formatNumber, formatTokenCount } from "../lib/format";
 import { apiKeyApi, channelApi, fileApi, logApi } from "../lib/api";
 import { logExportName, logsToCsv, logsToJson } from "../lib/logExport";
@@ -394,55 +394,35 @@ export function LogsPage() {
         }
     }, [logs, queueLiveSync]);
 
-    useEffect(() => {
-        let disposed = false;
-        let unlisten: (() => void) | undefined;
+    useTauriEvent<LogChangedEvent>(LOG_CHANGED_EVENT, (payload) => {
+        if (payload.reset) {
+            syncedSeqRef.current = 0;
+            targetSeqRef.current = 0;
+            liveSyncAgainRef.current = false;
+            setPendingLiveLogs(0);
+            void queryClient.invalidateQueries({
+                queryKey: logsQueryKeyRef.current,
+                exact: true,
+            });
+            return;
+        }
 
-        const registerListener = async () => {
-            try {
-                const cleanup = await listen<LogChangedEvent>(LOG_CHANGED_EVENT, ({ payload }) => {
-                    if (payload.reset) {
-                        syncedSeqRef.current = 0;
-                        targetSeqRef.current = 0;
-                        liveSyncAgainRef.current = false;
-                        setPendingLiveLogs(0);
-                        void queryClient.invalidateQueries({
-                            queryKey: logsQueryKeyRef.current,
-                            exact: true,
-                        });
-                        return;
-                    }
+        const latestSeq = Number(payload.latest_seq);
+        if (!Number.isFinite(latestSeq) || latestSeq <= targetSeqRef.current) {
+            return;
+        }
 
-                    const latestSeq = Number(payload.latest_seq);
-                    if (!Number.isFinite(latestSeq) || latestSeq <= targetSeqRef.current) {
-                        return;
-                    }
+        targetSeqRef.current = latestSeq;
+        setPendingLiveLogs((current) => Math.max(current, payload.pending || 1));
+        queueLiveSyncRef.current();
+    });
 
-                    targetSeqRef.current = latestSeq;
-                    setPendingLiveLogs((current) => Math.max(current, payload.pending || 1));
-                    queueLiveSyncRef.current();
-                });
-
-                if (disposed) {
-                    cleanup();
-                } else {
-                    unlisten = cleanup;
-                }
-            } catch {
-                // Web 预览没有 Tauri 事件桥，初始查询仍然可以正常工作。
-            }
-        };
-
-        void registerListener();
-        return () => {
-            disposed = true;
-            if (liveSyncTimerRef.current !== null) {
-                clearTimeout(liveSyncTimerRef.current);
-                liveSyncTimerRef.current = null;
-            }
-            unlisten?.();
-        };
-    }, [queryClient]);
+    useEffect(() => () => {
+        if (liveSyncTimerRef.current !== null) {
+            clearTimeout(liveSyncTimerRef.current);
+            liveSyncTimerRef.current = null;
+        }
+    }, []);
 
     useEffect(() => {
         const probe = () => void probeLiveLogs();

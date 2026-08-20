@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
     Check,
     CircleHelp,
+    DatabaseBackup,
     DownloadCloud,
     Gauge,
     Globe2,
@@ -26,8 +27,9 @@ import { applyUiTheme } from "../lib/theme";
 import type { Settings, UiTheme } from "../types";
 import { PageTitle, Toast, Toggle } from "../components/ui";
 import { SecurityRulesPanel } from "../components/SecurityRulesPanel";
+import { BackupSettingsPanel } from "../components/BackupSettingsPanel";
 
-type SettingsTab = "service" | "quota" | "general" | "security" | "interface" | "retry" | "update";
+type SettingsTab = "service" | "quota" | "general" | "security" | "interface" | "retry" | "backup" | "update";
 
 const tabs: Array<{ id: SettingsTab; label: string; icon: typeof Server }> = [
     { id: "service", label: "服务配置", icon: Server },
@@ -36,6 +38,7 @@ const tabs: Array<{ id: SettingsTab; label: string; icon: typeof Server }> = [
     { id: "security", label: "安全规则", icon: ShieldAlert },
     { id: "interface", label: "界面设置", icon: Palette },
     { id: "retry", label: "重试策略", icon: RefreshCcw },
+    { id: "backup", label: "备份恢复", icon: DatabaseBackup },
     { id: "update", label: "软件更新", icon: DownloadCloud },
 ];
 
@@ -169,7 +172,7 @@ export function SettingsPage() {
             <PageTitle
                 title="设置"
                 meta="本地网关配置"
-                action={(
+                action={activeTab === "backup" ? undefined : (
                     <button type="button" className="button-primary" onClick={save} disabled={saveMutation.isPending || isPending}>
                         <Save size={16} />{saveMutation.isPending ? "保存中..." : "保存更改"}
                     </button>
@@ -471,6 +474,19 @@ export function SettingsPage() {
                                 {updatePhase === "error" ? <p className="update-message is-error"><CircleHelp size={15} />{updateError}</p> : null}
                             </div>
                             <div className="settings-note"><CircleHelp size={17} /><span>发现新版本后会直接下载并安装，完成后自动重启应用。</span></div>
+                        </div>
+                    ) : null}
+
+                    {activeTab === "backup" ? (
+                        <div className="settings-section page-enter" key="backup">
+                            <div className="settings-heading">
+                                <span className="settings-heading-icon settings-heading-amber"><DatabaseBackup size={19} /></span>
+                                <div><h2>备份与恢复</h2><p>加密保存并迁移 CrowAPI 本地数据</p></div>
+                            </div>
+                            <BackupSettingsPanel onNotice={(message) => {
+                                setToast(message);
+                                window.setTimeout(() => setToast(""), 1800);
+                            }} />
                         </div>
                     ) : null}
                 </section>

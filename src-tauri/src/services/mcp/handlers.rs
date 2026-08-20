@@ -9,9 +9,11 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use std::time::{Duration, Instant};
+use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
 
 /// MCP server instructions — agent 首次连接时注入 system prompt
@@ -50,10 +52,55 @@ chunk metadata 包含 symbol_name、symbol_kind、signature，可用于精确过
 
 type SessionSender = mpsc::UnboundedSender<String>;
 
-fn sse_sessions() -> &'static Arc<RwLock<HashMap<String, SessionSender>>> {
-    static SESSIONS: std::sync::OnceLock<Arc<RwLock<HashMap<String, SessionSender>>>> =
+const MAX_SSE_SESSIONS: usize = 256;
+const SSE_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone)]
+struct SessionEntry {
+    sender: SessionSender,
+    created_at: Instant,
+}
+
+fn sse_sessions() -> &'static Arc<RwLock<HashMap<String, SessionEntry>>> {
+    static SESSIONS: std::sync::OnceLock<Arc<RwLock<HashMap<String, SessionEntry>>>> =
         std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+async fn register_sse_session(session_id: String, sender: SessionSender) -> Result<(), ()> {
+    let mut sessions = sse_sessions().write().await;
+    let now = Instant::now();
+    sessions.retain(|_, entry| {
+        !entry.sender.is_closed() && now.duration_since(entry.created_at) < SSE_SESSION_TTL
+    });
+    if sessions.len() >= MAX_SSE_SESSIONS {
+        return Err(());
+    }
+    sessions.insert(
+        session_id,
+        SessionEntry {
+            sender,
+            created_at: now,
+        },
+    );
+    Ok(())
+}
+
+async fn remove_sse_session(session_id: &str) {
+    sse_sessions().write().await.remove(session_id);
+}
+
+struct SessionGuard(String);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let session_id = self.0.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                remove_sse_session(&session_id).await;
+            });
+        }
+    }
 }
 
 // ── MCP JSON-RPC types ────────────────────────────────────────────
@@ -109,6 +156,17 @@ impl McpResponse {
     pub fn to_json_string(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
+}
+
+fn validate_jsonrpc_request(req: &McpRequest) -> Result<(), McpResponse> {
+    if req.jsonrpc != "2.0" || req.method.trim().is_empty() {
+        return Err(McpResponse::error(
+            req.id.clone(),
+            -32600,
+            "Invalid Request".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ── MCP tool definitions ──────────────────────────────────────────
@@ -564,17 +622,31 @@ async fn dispatch_jsonrpc_async(shared: &SharedState, req: &McpRequest) -> McpRe
             }),
         ),
         "tools/call" => {
-            let tool_name = req
+            let Some(tool_name) = req
                 .params
                 .get("name")
                 .and_then(|n| n.as_str())
-                .unwrap_or("");
+                .filter(|name| !name.is_empty())
+            else {
+                return McpResponse::error(
+                    req.id.clone(),
+                    -32602,
+                    "Missing tool name".to_string(),
+                );
+            };
 
             let args = req
                 .params
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(Default::default()));
+            if !args.is_object() {
+                return McpResponse::error(
+                    req.id.clone(),
+                    -32602,
+                    "Tool arguments must be an object".to_string(),
+                );
+            }
 
             match handle_tool_call(shared, tool_name, &args).await {
                 Ok(result) => McpResponse::success(req.id.clone(), result),
@@ -604,12 +676,23 @@ pub async fn handle_mcp_sse(State(_shared): State<SharedState>) -> Response {
     // Create channel for this session
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Register session
-    sse_sessions().write().await.insert(session_id.clone(), tx);
+    if register_sse_session(session_id.clone(), tx).await.is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(McpResponse::error(
+                None,
+                -32000,
+                "Too many active MCP sessions".to_string(),
+            )),
+        )
+            .into_response();
+    }
 
     // Build SSE stream
     let session_id_clone = session_id.clone();
     let stream = async_stream::stream! {
+        let _session_guard = SessionGuard(session_id_clone.clone());
+
         // 1. Send endpoint event — tells client where to POST JSON-RPC
         let endpoint_url = format!("/mcp?session_id={}", session_id_clone);
         let endpoint_event = format!(
@@ -621,6 +704,8 @@ pub async fn handle_mcp_sse(State(_shared): State<SharedState>) -> Response {
         // 2. Keep-alive loop + forward JSON-RPC responses
         let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         keepalive_interval.tick().await; // first tick is immediate
+        let session_deadline = tokio::time::sleep(SSE_SESSION_TTL);
+        tokio::pin!(session_deadline);
 
         loop {
             tokio::select! {
@@ -633,21 +718,12 @@ pub async fn handle_mcp_sse(State(_shared): State<SharedState>) -> Response {
                 _ = keepalive_interval.tick() => {
                     yield Ok::<_, std::io::Error>(b": keepalive\n\n".to_vec());
                 }
+                _ = &mut session_deadline => {
+                    break;
+                }
             }
         }
     };
-
-    // Clean up session when client disconnects (stream dropped)
-    let session_id_cleanup = session_id.clone();
-    let cleanup_sessions = sse_sessions().clone();
-    tokio::spawn(async move {
-        // Wait a bit then check if the sender is still registered
-        // The stream drop will cause rx to be dropped, but tx remains in the map.
-        // We use a periodic cleanup: if sending fails, the session is dead.
-        // For simplicity, clean up after a long timeout.
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        cleanup_sessions.write().await.remove(&session_id_cleanup);
-    });
 
     Response::builder()
         .status(StatusCode::OK)
@@ -677,21 +753,53 @@ pub async fn handle_mcp(
     // Parse JSON-RPC request
     let req: McpRequest = match serde_json::from_str(&body_str) {
         Ok(r) => r,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(McpResponse::error(None, -32700, "Parse error".to_string())),
+            )
+                .into_response();
         }
     };
+
+    if let Err(response) = validate_jsonrpc_request(&req) {
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
 
     // Check if this is a notification (no id → no response)
     let is_notification = req.id.is_none();
 
     let response = dispatch_jsonrpc_async(&shared, &req).await;
 
-    // If session_id is provided, push response through SSE stream
+    // If session_id is provided, push non-notification responses through SSE.
     if let Some(session_id) = &params.session_id {
-        let sessions = sse_sessions().read().await;
-        if let Some(tx) = sessions.get(session_id) {
-            let _ = tx.send(response.to_json_string());
+        let sender = sse_sessions()
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.sender.clone());
+        let Some(sender) = sender else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(McpResponse::error(
+                    req.id.clone(),
+                    -32001,
+                    "MCP session not found".to_string(),
+                )),
+            )
+                .into_response();
+        };
+        if !is_notification && sender.send(response.to_json_string()).is_err() {
+            remove_sse_session(session_id).await;
+            return (
+                StatusCode::GONE,
+                Json(McpResponse::error(
+                    req.id.clone(),
+                    -32001,
+                    "MCP session is closed".to_string(),
+                )),
+            )
+                .into_response();
         }
     }
 
@@ -716,12 +824,50 @@ pub async fn handle_mcp(
 
 // ── Tool call handlers ────────────────────────────────────────────
 
+async fn ensure_mcp_kb_access(pool: &SqlitePool, kb_id: &str) -> Result<(), String> {
+    let kb = KbRepository::new(pool.clone())
+        .get_kb(kb_id)
+        .await
+        .map_err(|_| "Knowledge base not found".to_string())?;
+    if kb.mcp_enabled != 1 {
+        return Err("Knowledge base is not exposed through MCP".to_string());
+    }
+    Ok(())
+}
+
 async fn handle_tool_call(
     shared: &SharedState,
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let pool = &shared.state.db.pool;
+
+    const KB_SCOPED_TOOLS: &[&str] = &[
+        "read_document",
+        "get_knowledge_base_stats",
+        "update_knowledge_base",
+        "delete_knowledge_base",
+        "delete_document",
+        "list_documents",
+        "build_index",
+        "import_source",
+    ];
+    if KB_SCOPED_TOOLS.contains(&tool_name) {
+        let kb_id = args
+            .get("kb_id")
+            .and_then(|value| value.as_str())
+            .ok_or("Missing kb_id")?;
+        ensure_mcp_kb_access(pool, kb_id).await?;
+    }
+    if matches!(tool_name, "search_knowledge_base" | "ask_knowledge_base") {
+        if let Some(kb_id) = args
+            .get("kb_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        {
+            ensure_mcp_kb_access(pool, kb_id).await?;
+        }
+    }
 
     const PROJECT_SCOPED_WIKI_TOOLS: &[&str] = &[
         "get_wiki_project",
@@ -879,7 +1025,7 @@ async fn handle_tool_call(
         }
 
         "read_document" => {
-            let _kb_id = args
+            let kb_id = args
                 .get("kb_id")
                 .and_then(|k| k.as_str())
                 .ok_or("Missing kb_id")?;
@@ -890,7 +1036,7 @@ async fn handle_tool_call(
 
             let kb_repo = KbRepository::new(pool.clone());
             let doc = kb_repo
-                .get_document(doc_id)
+                .get_document_in_kb(kb_id, doc_id)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -1227,6 +1373,7 @@ async fn handle_tool_call(
                     }));
                 }
             };
+            ensure_mcp_kb_access(pool, &kb_id).await?;
 
             let filename = filename.to_string();
 
@@ -1332,7 +1479,7 @@ async fn handle_tool_call(
 
             let kb_repo = KbRepository::new(pool.clone());
             let doc = kb_repo
-                .get_document(doc_id)
+                .get_document_in_kb(kb_id, doc_id)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -1409,66 +1556,24 @@ async fn handle_tool_call(
                 .and_then(|k| k.as_str())
                 .ok_or("Missing kb_id")?;
 
-            let kb_repo = KbRepository::new(pool.clone());
-            kb_repo.update_kb_index_status(kb_id, "building").await.ok();
-
-            let pool_clone = pool.clone();
-            let app_clone = shared.app.clone();
-            let kb_id_clone = kb_id.to_string();
-
-            tokio::task::spawn_blocking(move || {
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let _ = app_clone.emit(
-                        "kb-index-progress",
-                        serde_json::json!({
-                            "kb_id": &kb_id_clone,
-                            "status": "building",
-                            "message": "Building HNSW index…"
-                        }),
-                    );
-
-                    match crate::services::knowledge::retriever::build_index(
-                        &pool_clone,
-                        &kb_id_clone,
-                        &app_clone,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            tracing::info!("HNSW index built for KB {}", kb_id_clone);
-                            let _ = app_clone.emit(
-                                "kb-index-progress",
-                                serde_json::json!({
-                                    "kb_id": &kb_id_clone,
-                                    "status": "ready",
-                                    "message": "Index build complete"
-                                }),
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!("Index build failed for KB {}: {}", kb_id_clone, e);
-                            let repo = KbRepository::new(pool_clone.clone());
-                            repo.update_kb_index_status(&kb_id_clone, "error")
-                                .await
-                                .ok();
-                            let _ = app_clone.emit(
-                                "kb-index-progress",
-                                serde_json::json!({
-                                    "kb_id": &kb_id_clone,
-                                    "status": "error",
-                                    "message": format!("Index build failed: {}", e)
-                                }),
-                            );
-                        }
-                    }
-                });
-            });
+            let task_id = crate::services::knowledge::retriever::start_index_build(
+                pool,
+                kb_id,
+                &shared.app,
+            )
+            .await
+            .map_err(|error| {
+                if error == crate::services::knowledge::retriever::INDEX_BUILD_ALREADY_RUNNING {
+                    "Index build is already running for this knowledge base".to_string()
+                } else {
+                    format!("Failed to start index build: {}", error)
+                }
+            })?;
 
             Ok(serde_json::json!({
                 "content": [{
                     "type": "text",
-                    "text": format!("Index build started for knowledge base {}. Use get_knowledge_base_stats to check progress.", kb_id)
+                    "text": format!("Index build started for knowledge base {} (task {}). Use get_knowledge_base_stats to check progress.", kb_id, task_id)
                 }],
                 "isError": false
             }))
@@ -2101,5 +2206,29 @@ async fn handle_tool_call(
         }
 
         _ => Err(format!("Unknown tool: {}", tool_name)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_jsonrpc_request, McpRequest};
+
+    #[test]
+    fn jsonrpc_version_and_method_are_required() {
+        let wrong_version = McpRequest {
+            jsonrpc: "1.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "ping".to_string(),
+            params: serde_json::json!({}),
+        };
+        let missing_method = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(2)),
+            method: " ".to_string(),
+            params: serde_json::json!({}),
+        };
+
+        assert!(validate_jsonrpc_request(&wrong_version).is_err());
+        assert!(validate_jsonrpc_request(&missing_method).is_err());
     }
 }

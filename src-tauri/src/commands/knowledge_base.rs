@@ -1,6 +1,7 @@
-use tauri::{State, Emitter};
+use tauri::State;
 use std::sync::Arc;
 use crate::AppState;
+use crate::core::error::{CommandError, CommandResult, CommandResultExt};
 use crate::db::repository::Repository;
 use crate::services::knowledge::{repository::KbRepository, models::*};
 use serde::Deserialize;
@@ -8,18 +9,22 @@ use serde::Deserialize;
 #[tauri::command]
 pub async fn get_knowledge_bases(
     state: State<'_, Arc<AppState>>,
-) -> Result<Vec<KbKnowledgeBase>, String> {
+) -> CommandResult<Vec<KbKnowledgeBase>> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.get_all_kbs().await.map_err(|e| e.to_string())
+    repo.get_all_kbs()
+        .await
+        .command_error("KB_LIST_FAILED", "读取知识库失败", true)
 }
 
 #[tauri::command]
 pub async fn create_knowledge_base(
     state: State<'_, Arc<AppState>>,
     input: CreateKbInput,
-) -> Result<KbKnowledgeBase, String> {
+) -> CommandResult<KbKnowledgeBase> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.create_kb(&input).await.map_err(|e| e.to_string())
+    repo.create_kb(&input)
+        .await
+        .command_error("KB_CREATE_FAILED", "创建知识库失败", false)
 }
 
 #[tauri::command]
@@ -27,27 +32,33 @@ pub async fn update_knowledge_base(
     state: State<'_, Arc<AppState>>,
     id: String,
     input: UpdateKbInput,
-) -> Result<KbKnowledgeBase, String> {
+) -> CommandResult<KbKnowledgeBase> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.update_kb(&id, &input).await.map_err(|e| e.to_string())
+    repo.update_kb(&id, &input)
+        .await
+        .command_error("KB_UPDATE_FAILED", "更新知识库失败", false)
 }
 
 #[tauri::command]
 pub async fn delete_knowledge_base(
     state: State<'_, Arc<AppState>>,
     id: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.delete_kb(&id).await.map_err(|e| e.to_string())
+    repo.delete_kb(&id)
+        .await
+        .command_error("KB_DELETE_FAILED", "删除知识库失败", false)
 }
 
 #[tauri::command]
 pub async fn get_kb_documents(
     state: State<'_, Arc<AppState>>,
     kb_id: String,
-) -> Result<Vec<KbDocument>, String> {
+) -> CommandResult<Vec<KbDocument>> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.get_documents(&kb_id).await.map_err(|e| e.to_string())
+    repo.get_documents(&kb_id)
+        .await
+        .command_error("KB_DOCUMENT_LIST_FAILED", "读取知识库文档失败", true)
 }
 
 #[tauri::command]
@@ -55,25 +66,29 @@ pub async fn delete_kb_document(
     state: State<'_, Arc<AppState>>,
     doc_id: String,
     kb_id: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let repo = KbRepository::new(state.db.pool.clone());
     let doc = match repo.get_document(&doc_id).await {
         Ok(doc) if doc.kb_id == kb_id => doc,
-        Ok(_) => return Err("文档不属于该知识库".to_string()),
-        Err(sqlx::Error::RowNotFound) => return Err("文档不存在".to_string()),
-        Err(error) => return Err(format!("读取文档失败: {}", error)),
+        Ok(_) => return Err(CommandError::conflict("KB_DOCUMENT_OWNERSHIP_MISMATCH", "文档不属于该知识库")),
+        Err(sqlx::Error::RowNotFound) => return Err(CommandError::new("KB_DOCUMENT_NOT_FOUND", "文档不存在", false)),
+        Err(error) => return Err(CommandError::reported("KB_DOCUMENT_READ_FAILED", "读取文档失败", true, error)),
     };
     if doc.source_type == "upload" {
         if let Some(path) = &doc.file_path {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("删除文档文件失败: {}", error)),
+                Err(error) => return Err(CommandError::reported("KB_DOCUMENT_FILE_DELETE_FAILED", "删除文档文件失败", false, error)),
             }
         }
     }
-    repo.delete_document(&doc_id).await.map_err(|e| e.to_string())?;
-    repo.update_kb_counts(&kb_id).await.map_err(|e| e.to_string())?;
+    repo.delete_document(&doc_id)
+        .await
+        .command_error("KB_DOCUMENT_DELETE_FAILED", "删除知识库文档失败", false)?;
+    repo.update_kb_counts(&kb_id)
+        .await
+        .command_error("KB_COUNT_UPDATE_FAILED", "更新知识库统计失败", true)?;
     Ok(())
 }
 
@@ -82,11 +97,11 @@ pub async fn reindex_kb_document(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     doc_id: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let pool = state.db.pool.clone();
     crate::services::knowledge::processor::reindex_document(&pool, &app, &doc_id)
         .await
-        .map_err(|e| e)
+        .command_error("KB_DOCUMENT_REINDEX_FAILED", "重新处理知识库文档失败", true)
 }
 
 #[tauri::command]
@@ -95,7 +110,7 @@ pub async fn get_kb_tags(
     kb_id: String,
     #[allow(unused_variables)]
     limit: Option<usize>,
-) -> Result<Vec<KbTag>, String> {
+) -> CommandResult<Vec<KbTag>> {
     let pool = &state.db.pool;
     let limit = limit.unwrap_or(15);
 
@@ -106,7 +121,7 @@ pub async fn get_kb_tags(
     .bind(&kb_id)
     .fetch_all(pool)
     .await
-    .map_err(|e| e.to_string())?;
+    .command_error("KB_TAGS_FAILED", "读取知识库标签失败", true)?;
 
     if chunks.is_empty() {
         return Ok(vec![]);
@@ -231,7 +246,7 @@ fn default_top_k() -> usize { 5 }
 pub async fn search_knowledge_base(
     state: State<'_, Arc<AppState>>,
     input: KbSearchInput,
-) -> Result<Vec<SearchResult>, String> {
+) -> CommandResult<Vec<SearchResult>> {
     let pool = &state.db.pool;
     let repo = Repository::new(pool.clone());
     let search_mode = input
@@ -239,11 +254,11 @@ pub async fn search_knowledge_base(
         .as_deref()
         .unwrap_or(if input.kb_id.is_some() { "hybrid" } else { "vector" });
     if !matches!(search_mode, "hybrid" | "vector" | "keyword") {
-        return Err(format!("Unsupported search_mode: {}", search_mode));
+        return Err(CommandError::validation(format!("不支持的检索模式: {}", search_mode)));
     }
 
     if input.kb_id.is_none() && search_mode != "vector" {
-        return Err("Cross-knowledge-base search currently supports vector mode only".to_string());
+        return Err(CommandError::validation("跨知识库检索目前仅支持向量模式"));
     }
 
     let vector_weight = input.vector_weight.unwrap_or(0.7);
@@ -255,7 +270,7 @@ pub async fn search_knowledge_base(
             || keyword_weight < 0.0
             || vector_weight + keyword_weight <= 0.0)
     {
-        return Err("Hybrid search weights must be finite, non-negative, and have a positive sum".to_string());
+        return Err(CommandError::validation("混合检索权重必须是有限的非负数，且总和大于 0"));
     }
 
     if search_mode == "keyword" {
@@ -266,7 +281,8 @@ pub async fn search_knowledge_base(
             &input.query,
             input.top_k,
         )
-        .await;
+        .await
+        .command_error("KB_SEARCH_FAILED", "知识库关键词检索失败", true);
     }
 
     let (emb_model, embedding_channel_id) = if let Some(kb_id) = &input.kb_id {
@@ -274,7 +290,7 @@ pub async fn search_knowledge_base(
         let kb = kb_repo
             .get_kb(kb_id)
             .await
-            .map_err(|e| format!("Failed to load knowledge base: {}", e))?;
+            .command_error("KB_READ_FAILED", "读取知识库配置失败", true)?;
         (
             kb.embedding_model.unwrap_or_else(|| "text-embedding-3-small".to_string()),
             kb.embedding_channel_id,
@@ -285,10 +301,10 @@ pub async fn search_knowledge_base(
 
     let embeddings = crate::services::knowledge::embedder::embed_with_channel(
         &[input.query.clone()], &emb_model, &repo, embedding_channel_id.as_deref()
-    ).await.map_err(|e| e)?;
+    ).await.command_error("KB_EMBEDDING_FAILED", "生成检索向量失败", true)?;
 
     if embeddings.is_empty() {
-        return Err("Failed to embed query".to_string());
+        return Err(CommandError::new("KB_EMBEDDING_EMPTY", "模型没有返回检索向量", true));
     }
 
     let results = if let Some(kb_id) = &input.kb_id {
@@ -316,7 +332,7 @@ pub async fn search_knowledge_base(
         crate::services::knowledge::retriever::search_all(pool, &embeddings[0], input.top_k, false).await
     };
 
-    results.map_err(|e| e.to_string())
+    results.command_error("KB_SEARCH_FAILED", "知识库检索失败", true)
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,7 +365,7 @@ pub async fn ask_knowledge_base(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     input: KbAskInput,
-) -> Result<RagAnswer, String> {
+) -> CommandResult<RagAnswer> {
     let pool = &state.db.pool;
     let kb_id = input.kb_id.clone().unwrap_or_default();
 
@@ -358,7 +374,7 @@ pub async fn ask_knowledge_base(
         let kb = kb_repo
             .get_kb(&kb_id)
             .await
-            .map_err(|error| format!("Failed to load knowledge base: {}", error))?;
+            .command_error("KB_READ_FAILED", "读取知识库配置失败", true)?;
         kb.embedding_model
             .unwrap_or_else(|| "text-embedding-3-small".to_string())
     } else {
@@ -369,7 +385,7 @@ pub async fn ask_knowledge_base(
         crate::services::knowledge::rag::deep_research(
             pool, &kb_id, &input.question, &emb_model, &input.model,
             input.top_k, input.max_rounds, &app,
-        ).await.map_err(|e| e)
+        ).await.command_error("KB_DEEP_RESEARCH_FAILED", "知识库深度研究失败", true)
     } else {
         let history = input.history.unwrap_or_default();
         let vector_weight = input.vector_weight.unwrap_or(0.7);
@@ -379,7 +395,7 @@ pub async fn ask_knowledge_base(
             pool, &kb_id, &input.question, &emb_model, &input.model,
             input.top_k, false, &history, &app,
             vector_weight, keyword_weight, search_mode,
-        ).await.map_err(|e| e)
+        ).await.command_error("KB_ASK_FAILED", "知识库问答失败", true)
     }
 }
 
@@ -387,15 +403,24 @@ pub async fn ask_knowledge_base(
 pub async fn get_kb_stats(
     state: State<'_, Arc<AppState>>,
     kb_id: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let repo = KbRepository::new(state.db.pool.clone());
-    let kb = repo.get_kb(&kb_id).await.map_err(|e| e.to_string())?;
-    let docs = repo.get_documents(&kb_id).await.map_err(|e| e.to_string())?;
+    let kb = repo
+        .get_kb(&kb_id)
+        .await
+        .command_error("KB_READ_FAILED", "读取知识库失败", true)?;
+    let docs = repo
+        .get_documents(&kb_id)
+        .await
+        .command_error("KB_DOCUMENT_LIST_FAILED", "读取知识库文档失败", true)?;
     let ready = docs.iter().filter(|d| d.status == "ready").count();
     let processing = docs.iter().filter(|d| d.status == "processing").count();
     let failed = docs.iter().filter(|d| d.status == "failed").count();
 
-    let index_meta = repo.get_index_meta(&kb_id).await.map_err(|e| e.to_string())?;
+    let index_meta = repo
+        .get_index_meta(&kb_id)
+        .await
+        .command_error("KB_INDEX_STATUS_FAILED", "读取知识库索引状态失败", true)?;
 
     Ok(serde_json::json!({
         "kb": kb,
@@ -421,7 +446,7 @@ pub async fn upload_kb_document(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     input: UploadDocInput,
-) -> Result<KbDocument, String> {
+) -> CommandResult<KbDocument> {
     use sha2::Digest;
     use tauri::Manager;
 
@@ -430,18 +455,19 @@ pub async fn upload_kb_document(
 
     let content = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD, &input.content
-    ).map_err(|e| format!("Invalid base64: {}", e))?;
+    ).map_err(|_| CommandError::validation("文档内容不是有效的 Base64 数据"))?;
 
     let hash = sha2::Sha256::digest(&content);
     let hash_hex = hex::encode(hash);
 
     match repo.find_document_by_hash(&input.kb_id, &hash_hex).await {
-        Ok(Some(_)) => return Err("Document with same content already exists".to_string()),
+        Ok(Some(_)) => return Err(CommandError::conflict("KB_DOCUMENT_DUPLICATE", "相同内容的文档已存在")),
         Ok(None) => {}
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(CommandError::reported("KB_DOCUMENT_HASH_CHECK_FAILED", "检查重复文档失败", true, error)),
     }
 
-    crate::services::knowledge::safe_path_component(&input.filename, "filename")?;
+    crate::services::knowledge::safe_path_component(&input.filename, "filename")
+        .map_err(CommandError::validation)?;
 
     let file_type = crate::services::knowledge::parser::get_file_type(&input.filename);
     let file_size = content.len() as i64;
@@ -450,11 +476,11 @@ pub async fn upload_kb_document(
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let kb_dir = app_data_dir.join("kb_files").join(&input.kb_id);
     std::fs::create_dir_all(&kb_dir)
-        .map_err(|error| format!("创建知识库文件目录失败: {}", error))?;
+        .command_error("KB_STORAGE_CREATE_FAILED", "创建知识库文件目录失败", false)?;
     let doc_id = uuid::Uuid::new_v4().to_string();
     let file_path = kb_dir.join(format!("{}_{}", &doc_id, &input.filename));
     std::fs::write(&file_path, &content)
-        .map_err(|error| format!("保存文档文件失败: {}", error))?;
+        .command_error("KB_DOCUMENT_FILE_WRITE_FAILED", "保存知识库文档失败", false)?;
     let file_path_str = file_path.to_string_lossy().to_string();
 
     let doc = match repo.create_document(
@@ -466,11 +492,14 @@ pub async fn upload_kb_document(
             if let Err(remove_error) = std::fs::remove_file(&file_path) {
                 tracing::warn!(%remove_error, path = %file_path.display(), "failed to remove document after DB insert error");
             }
-            return Err(error.to_string());
+            return Err(CommandError::reported("KB_DOCUMENT_CREATE_FAILED", "保存知识库文档记录失败", false, error));
         }
     };
 
-    let kb = repo.get_kb(&input.kb_id).await.map_err(|e| e.to_string())?;
+    let kb = repo
+        .get_kb(&input.kb_id)
+        .await
+        .command_error("KB_READ_FAILED", "读取知识库配置失败", true)?;
     let emb_model = kb.embedding_model.clone();
 
     let pool_clone = pool.clone();
@@ -498,27 +527,33 @@ pub async fn upload_kb_document(
 pub async fn get_kb_conversations(
     state: State<'_, Arc<AppState>>,
     kb_id: String,
-) -> Result<Vec<KbConversation>, String> {
+) -> CommandResult<Vec<KbConversation>> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.get_conversations(&kb_id).await.map_err(|e| e.to_string())
+    repo.get_conversations(&kb_id)
+        .await
+        .command_error("KB_CONVERSATION_LIST_FAILED", "读取知识库对话失败", true)
 }
 
 #[tauri::command]
 pub async fn clear_kb_conversations(
     state: State<'_, Arc<AppState>>,
     kb_id: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.clear_conversations(&kb_id).await.map_err(|e| e.to_string())
+    repo.clear_conversations(&kb_id)
+        .await
+        .command_error("KB_CONVERSATION_CLEAR_FAILED", "清空知识库对话失败", false)
 }
 
 #[tauri::command]
 pub async fn get_kb_sources(
     state: State<'_, Arc<AppState>>,
     kb_id: String,
-) -> Result<Vec<KbSource>, String> {
+) -> CommandResult<Vec<KbSource>> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.get_sources(&kb_id).await.map_err(|e| e.to_string())
+    repo.get_sources(&kb_id)
+        .await
+        .command_error("KB_SOURCE_LIST_FAILED", "读取知识库来源失败", true)
 }
 
 #[tauri::command]
@@ -526,15 +561,21 @@ pub async fn delete_kb_source(
     state: State<'_, Arc<AppState>>,
     source_id: String,
     kb_id: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let repo = KbRepository::new(state.db.pool.clone());
     repo.delete_source_with_documents(&kb_id, &source_id)
         .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => "来源不存在或不属于该知识库".to_string(),
-            error => error.to_string(),
+        .map_err(|error| match error {
+            sqlx::Error::RowNotFound => CommandError::new(
+                "KB_SOURCE_NOT_FOUND",
+                "来源不存在或不属于该知识库",
+                false,
+            ),
+            error => CommandError::reported("KB_SOURCE_DELETE_FAILED", "删除知识库来源失败", false, error),
         })?;
-    repo.update_kb_counts(&kb_id).await.map_err(|e| e.to_string())?;
+    repo.update_kb_counts(&kb_id)
+        .await
+        .command_error("KB_COUNT_UPDATE_FAILED", "更新知识库统计失败", true)?;
     Ok(())
 }
 
@@ -544,9 +585,23 @@ pub async fn import_kb_source(
     app: tauri::AppHandle,
     kb_id: String,
     input: ImportSourceInput,
-) -> Result<KbSource, String> {
+) -> CommandResult<KbSource> {
     let pool = state.db.pool.clone();
     let repo = KbRepository::new(pool.clone());
+
+    match input.source_type.as_str() {
+        "git" if input.repo_url.as_deref().is_none_or(str::is_empty) => {
+            return Err(CommandError::validation("Git 来源缺少仓库地址"));
+        }
+        "url" if input.url.as_deref().is_none_or(str::is_empty) => {
+            return Err(CommandError::validation("URL 来源缺少页面地址"));
+        }
+        "local_dir" if input.dir_path.as_deref().is_none_or(str::is_empty) => {
+            return Err(CommandError::validation("本地目录来源缺少目录路径"));
+        }
+        "git" | "url" | "local_dir" => {}
+        _ => return Err(CommandError::validation("不支持的知识库来源类型")),
+    }
 
     let source = repo.create_source(
         &kb_id,
@@ -554,7 +609,7 @@ pub async fn import_kb_source(
         input.repo_url.as_deref().or(input.url.as_deref()),
         input.dir_path.as_deref(),
         input.branch.as_deref(),
-    ).await.map_err(|e| e.to_string())?;
+    ).await.command_error("KB_SOURCE_CREATE_FAILED", "创建知识库来源失败", false)?;
 
     let source_id = source.id.clone();
     let source_type = input.source_type.clone();
@@ -599,9 +654,11 @@ pub async fn import_kb_source(
 pub async fn get_kb_index_status(
     state: State<'_, Arc<AppState>>,
     kb_id: String,
-) -> Result<Option<KbIndexMeta>, String> {
+) -> CommandResult<Option<KbIndexMeta>> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.get_index_meta(&kb_id).await.map_err(|e| e.to_string())
+    repo.get_index_meta(&kb_id)
+        .await
+        .command_error("KB_INDEX_STATUS_FAILED", "读取知识库索引状态失败", true)
 }
 
 #[tauri::command]
@@ -609,65 +666,40 @@ pub async fn build_kb_index(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     kb_id: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let pool = state.db.pool.clone();
-
-    // Update status to building immediately
-    let repo = KbRepository::new(pool.clone());
-    repo.update_kb_index_status(&kb_id, "building")
+    crate::services::knowledge::retriever::start_index_build(&pool, &kb_id, &app)
         .await
-        .map_err(|error| format!("Failed to update index status: {}", error))?;
-
-    // Spawn the actual HNSW index build
-    tokio::spawn(async move {
-        let app = app.clone();
-        let kb_id_clone = kb_id.clone();
-
-        // Emit starting event
-        let _ = app.emit("kb-index-progress", serde_json::json!({
-            "kb_id": &kb_id_clone,
-            "status": "building",
-            "progress": 0,
-            "current": 0,
-            "total": 0,
-            "message": "正在加载切片数据…"
-        }));
-
-        match crate::services::knowledge::retriever::build_index(&pool, &kb_id_clone, &app).await {
-            Ok(()) => {
-                tracing::info!("HNSW index built successfully for KB {}", kb_id_clone);
-                let _ = app.emit("kb-index-progress", serde_json::json!({
-                    "kb_id": &kb_id_clone,
-                    "status": "ready",
-                    "progress": 100,
-                    "message": "索引构建完成"
-                }));
+        .map(|_| ())
+        .map_err(|error| {
+            if error == crate::services::knowledge::retriever::INDEX_BUILD_ALREADY_RUNNING {
+                CommandError::new(
+                    "KB_INDEX_BUILD_ALREADY_RUNNING",
+                    "该知识库的索引正在构建",
+                    true,
+                )
+            } else {
+                CommandError::reported(
+                    "KB_INDEX_BUILD_START_FAILED",
+                    "启动知识库索引构建失败",
+                    true,
+                    error,
+                )
             }
-            Err(e) => {
-                tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id_clone, e);
-                let repo = KbRepository::new(pool.clone());
-                if let Err(error) = repo.update_kb_index_status(&kb_id_clone, "error").await {
-                    tracing::warn!(%error, knowledge_base_id = %kb_id_clone, "failed to persist index failure status");
-                }
-                let _ = app.emit("kb-index-progress", serde_json::json!({
-                    "kb_id": &kb_id_clone,
-                    "status": "error",
-                    "message": format!("索引构建失败: {}", e)
-                }));
-            }
-        }
-    });
-
-    Ok(())
+        })
 }
 
 #[tauri::command]
 pub async fn drop_kb_index(
     state: State<'_, Arc<AppState>>,
     kb_id: String,
-) -> Result<(), String> {
+) -> CommandResult<()> {
     let repo = KbRepository::new(state.db.pool.clone());
-    repo.upsert_index_meta(&kb_id, 0, 0, None, "none").await.map_err(|e| e.to_string())?;
-    repo.update_kb_index_status(&kb_id, "none").await.map_err(|e| e.to_string())?;
+    repo.upsert_index_meta(&kb_id, 0, 0, None, "none")
+        .await
+        .command_error("KB_INDEX_DROP_FAILED", "删除知识库索引失败", false)?;
+    repo.update_kb_index_status(&kb_id, "none")
+        .await
+        .command_error("KB_INDEX_STATUS_UPDATE_FAILED", "更新知识库索引状态失败", false)?;
     Ok(())
 }

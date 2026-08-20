@@ -126,7 +126,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::channel::get_channels,
             commands::channel::get_channel,
-            commands::channel::get_channel_api_key,
             commands::channel::create_channel,
             commands::channel::update_channel,
             commands::channel::reorder_channels,
@@ -169,6 +168,9 @@ pub fn run() {
             commands::import_export::import_scanned_sources,
             commands::import_export::pick_import_file,
             commands::import_export::save_export_file,
+            commands::backup::create_full_backup,
+            commands::backup::inspect_full_backup,
+            commands::backup::schedule_full_restore,
             commands::services::get_service_statuses,
             // Wiki
             commands::wiki::get_wiki_projects,

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::core::error::{CommandError, CommandResult, CommandResultExt};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_store::StoreExt;
@@ -113,8 +114,10 @@ fn get_non_negative_i64(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str
 }
 
 #[tauri::command]
-pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+pub async fn get_settings(app: AppHandle) -> CommandResult<Settings> {
+    let store = app
+        .store("settings.json")
+        .command_error("SETTINGS_READ_FAILED", "读取设置失败", true)?;
     let settings = Settings {
         server_port: get_u64(&store, "server.port", 8777) as u16,
         server_host: get_str(&store, "server.host", "127.0.0.1"),
@@ -149,31 +152,33 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
 }
 
 #[tauri::command]
-pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), String> {
+pub async fn save_settings(settings: Settings, app: AppHandle) -> CommandResult<()> {
     let server_host = settings.server_host.trim();
     if server_host.is_empty() {
-        return Err("监听地址不能为空".to_string());
+        return Err(CommandError::validation("监听地址不能为空"));
     }
     if settings.server_port < 1024 {
-        return Err("服务端口必须在 1024 到 65535 之间".to_string());
+        return Err(CommandError::validation("服务端口必须在 1024 到 65535 之间"));
     }
     if !(0..=5).contains(&settings.retry_times) {
-        return Err("最大重试次数必须在 0 到 5 之间".to_string());
+        return Err(CommandError::validation("最大重试次数必须在 0 到 5 之间"));
     }
     if settings.default_key_quota < 0 || settings.total_quota < 0 {
-        return Err("配额不能小于 0".to_string());
+        return Err(CommandError::validation("配额不能小于 0"));
     }
     if !(1..=100).contains(&settings.quota_warning_threshold) {
-        return Err("配额告警阈值必须在 1 到 100 之间".to_string());
+        return Err(CommandError::validation("配额告警阈值必须在 1 到 100 之间"));
     }
     if !crate::config::is_supported_ui_theme(&settings.ui_theme) {
-        return Err("不支持的界面主题".to_string());
+        return Err(CommandError::validation("不支持的界面主题"));
     }
     if !matches!(settings.security_mode.as_str(), "audit" | "redact" | "block") {
-        return Err("安全模式必须是 audit、redact 或 block".to_string());
+        return Err(CommandError::validation("安全模式必须是 audit、redact 或 block"));
     }
 
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let store = app
+        .store("settings.json")
+        .command_error("SETTINGS_WRITE_FAILED", "保存设置失败", false)?;
     store.set("server.port", serde_json::json!(settings.server_port));
     store.set("server.host", serde_json::json!(server_host));
     store.set("ui.theme", serde_json::json!(settings.ui_theme));
@@ -194,27 +199,33 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     store.set("security.scan_response", settings.security_scan_response);
     store.set("security.redact_secrets", settings.security_redact_secrets);
     store.set("security.block_on_critical", settings.security_block_on_critical);
-    store.save().map_err(|e| e.to_string())?;
+    store
+        .save()
+        .command_error("SETTINGS_WRITE_FAILED", "保存设置失败", false)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn apply_theme(theme: String, app: AppHandle) -> Result<(), String> {
+pub async fn apply_theme(theme: String, app: AppHandle) -> CommandResult<()> {
     if let Some(window) = app.get_webview_window("main") {
         window
             .emit("theme-changed", serde_json::json!({ "theme": theme }))
-            .map_err(|e| e.to_string())?;
+            .command_error("THEME_APPLY_FAILED", "应用界面主题失败", false)?;
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn set_auto_start(enabled: bool, app: AppHandle) -> Result<(), String> {
+pub async fn set_auto_start(enabled: bool, app: AppHandle) -> CommandResult<()> {
     let autostart = app.autolaunch();
     if enabled {
-        autostart.enable().map_err(|e| e.to_string())?;
+        autostart
+            .enable()
+            .command_error("AUTOSTART_UPDATE_FAILED", "启用开机启动失败", false)?;
     } else {
-        autostart.disable().map_err(|e| e.to_string())?;
+        autostart
+            .disable()
+            .command_error("AUTOSTART_UPDATE_FAILED", "关闭开机启动失败", false)?;
     }
     Ok(())
 }

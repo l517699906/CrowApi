@@ -1,5 +1,6 @@
 pub mod router;
 pub mod handlers;
+pub mod error;
 
 use crate::AppState;
 use tauri::{AppHandle, Emitter};

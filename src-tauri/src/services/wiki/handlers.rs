@@ -2,6 +2,7 @@ use super::models::*;
 use super::ingest;
 use super::project;
 use super::repository::WikiRepository;
+use crate::server::error::HttpError;
 use crate::server::router::SharedState;
 use crate::core::proxy;
 use crate::db::repository::Repository;
@@ -29,7 +30,11 @@ pub async fn list_projects(State(shared): State<SharedState>) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.list_projects().await {
         Ok(projects) => Json(serde_json::json!({ "data": projects })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_PROJECT_LIST_FAILED",
+            "读取 Wiki 项目失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -46,7 +51,11 @@ pub async fn create_project(
     // Create directory structure
     let dir = match project::init_project_dir(&project_id, &schema).await {
         Ok(dir) => dir,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        Err(error) => return HttpError::internal(
+            "WIKI_DIRECTORY_CREATE_FAILED",
+            "创建 Wiki 项目目录失败",
+            error,
+        ).into_response(),
     };
     let wiki_dir = dir.to_string_lossy().to_string();
 
@@ -54,12 +63,13 @@ pub async fn create_project(
         Ok(p) => (StatusCode::CREATED, Json(p)).into_response(),
         Err(error) => {
             if let Err(cleanup_error) = project::remove_project_dir(&project_id).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{}; failed to clean up project directory: {}", error, cleanup_error),
-                ).into_response();
+                tracing::warn!(%cleanup_error, %project_id, "failed to clean up Wiki project directory");
             }
-            (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+            HttpError::internal(
+                "WIKI_PROJECT_CREATE_FAILED",
+                "创建 Wiki 项目失败",
+                error,
+            ).into_response()
         }
     }
 }
@@ -69,9 +79,17 @@ pub async fn get_project(
     Path(id): Path<String>,
 ) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
-    match repo.get_project(&id).await {
-        Ok(p) => Json(p).into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+    match repo.find_project(&id).await {
+        Ok(Some(project)) => Json(project).into_response(),
+        Ok(None) => HttpError::not_found(
+            "WIKI_PROJECT_NOT_FOUND",
+            "Wiki 项目不存在",
+        ).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_PROJECT_READ_FAILED",
+            "读取 Wiki 项目失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -82,25 +100,45 @@ pub async fn update_project(
 ) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
 
+    match repo.find_project(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return HttpError::not_found(
+            "WIKI_PROJECT_NOT_FOUND",
+            "Wiki 项目不存在",
+        ).into_response(),
+        Err(error) => return HttpError::internal(
+            "WIKI_PROJECT_READ_FAILED",
+            "读取 Wiki 项目失败",
+            error,
+        ).into_response(),
+    }
+
     // If schema_text changed, write to disk
     if let Some(ref schema) = input.schema_text {
         let dir = match project::project_wiki_dir(&id) {
             Ok(dir) => dir,
-            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+            Err(error) => return HttpError::bad_request(
+                "WIKI_PROJECT_PATH_INVALID",
+                error,
+            ).into_response(),
         };
         let schema_path = dir.join("schema").join("CLAUDE.md");
         if let Err(e) = tokio::fs::write(&schema_path, schema).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to write Wiki schema {}: {}", schema_path.display(), e),
-            )
-                .into_response();
+            return HttpError::internal(
+                "WIKI_SCHEMA_WRITE_FAILED",
+                "保存 Wiki 结构定义失败",
+                e,
+            ).into_response();
         }
     }
 
     match repo.update_project(&id, &input).await {
         Ok(p) => Json(p).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_PROJECT_UPDATE_FAILED",
+            "更新 Wiki 项目失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -109,20 +147,37 @@ pub async fn delete_project(
     Path(id): Path<String>,
 ) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
+    match repo.find_project(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return HttpError::not_found(
+            "WIKI_PROJECT_NOT_FOUND",
+            "Wiki 项目不存在",
+        ).into_response(),
+        Err(error) => return HttpError::internal(
+            "WIKI_PROJECT_READ_FAILED",
+            "读取 Wiki 项目失败",
+            error,
+        ).into_response(),
+    }
     let staged = match project::stage_project_dir_removal(&id).await {
         Ok(staged) => staged,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        Err(error) => return HttpError::internal(
+            "WIKI_DIRECTORY_STAGE_FAILED",
+            "准备删除 Wiki 项目目录失败",
+            error,
+        ).into_response(),
     };
     if let Err(error) = repo.delete_project(&id).await {
         if let Some(ref removal) = staged {
             if let Err(restore_error) = project::restore_staged_removal(removal).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{}; failed to restore project directory: {}", error, restore_error),
-                ).into_response();
+                tracing::error!(%restore_error, %id, "failed to restore staged Wiki project directory");
             }
         }
-        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        return HttpError::internal(
+            "WIKI_PROJECT_DELETE_FAILED",
+            "删除 Wiki 项目失败",
+            error,
+        ).into_response();
     }
     if let Some(removal) = staged {
         if let Err(error) = project::finalize_staged_removal(removal).await {
@@ -139,7 +194,11 @@ pub async fn get_project_stats(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.get_stats(&id).await {
         Ok(stats) => Json(stats).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_STATS_READ_FAILED",
+            "读取 Wiki 统计失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -152,7 +211,11 @@ pub async fn list_sources(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.list_sources(&id).await {
         Ok(sources) => Json(serde_json::json!({ "data": sources })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_SOURCE_LIST_FAILED",
+            "读取 Wiki 来源失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -174,7 +237,11 @@ pub async fn add_source(
     let written_path = if let Some(ref content) = input.content {
         match project::write_source_file(&id, &input.filename, content.as_bytes()).await {
             Ok(path) => Some(path),
-            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+            Err(error) => return HttpError::internal(
+                "WIKI_SOURCE_FILE_WRITE_FAILED",
+                "保存 Wiki 来源文件失败",
+                error,
+            ).into_response(),
         }
     } else {
         None
@@ -190,13 +257,14 @@ pub async fn add_source(
         Err(error) => {
             if let Some(path) = written_path {
                 if let Err(cleanup_error) = tokio::fs::remove_file(&path).await {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("{}; failed to clean up source file: {}", error, cleanup_error),
-                    ).into_response();
+                    tracing::warn!(%cleanup_error, path = %path.display(), "failed to clean up Wiki source file");
                 }
             }
-            (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+            HttpError::internal(
+                "WIKI_SOURCE_CREATE_FAILED",
+                "创建 Wiki 来源失败",
+                error,
+            ).into_response()
         }
     }
 }
@@ -206,10 +274,17 @@ pub async fn delete_source(
     Path((id, sid)): Path<(String, String)>,
 ) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
-    let source = match repo.get_source(&sid).await {
-        Ok(source) if source.project_id == id => source,
-        Ok(_) => return (StatusCode::NOT_FOUND, "Wiki source not found").into_response(),
-        Err(error) => return (StatusCode::NOT_FOUND, error).into_response(),
+    let source = match repo.find_source(&sid).await {
+        Ok(Some(source)) if source.project_id == id => source,
+        Ok(Some(_)) | Ok(None) => return HttpError::not_found(
+            "WIKI_SOURCE_NOT_FOUND",
+            "Wiki 来源不存在",
+        ).into_response(),
+        Err(error) => return HttpError::internal(
+            "WIKI_SOURCE_READ_FAILED",
+            "读取 Wiki 来源失败",
+            error,
+        ).into_response(),
     };
     let staged = match project::stage_source_file_removal(
         &id,
@@ -217,22 +292,30 @@ pub async fn delete_source(
         source.file_path.as_deref(),
     ).await {
         Ok(staged) => staged,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        Err(error) => return HttpError::bad_request(
+            "WIKI_SOURCE_PATH_INVALID",
+            error,
+        ).into_response(),
     };
     if let Err(error) = repo.delete_source(&sid).await {
         if let Some(ref removal) = staged {
             if let Err(restore_error) = project::restore_staged_removal(removal).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{}; failed to restore source file: {}", error, restore_error),
-                ).into_response();
+                tracing::error!(%restore_error, %sid, "failed to restore staged Wiki source file");
             }
         }
-        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        return HttpError::internal(
+            "WIKI_SOURCE_DELETE_FAILED",
+            "删除 Wiki 来源失败",
+            error,
+        ).into_response();
     }
     if let Some(removal) = staged {
         if let Err(error) = project::finalize_staged_removal(removal).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            return HttpError::internal(
+                "WIKI_SOURCE_FILE_DELETE_FAILED",
+                "删除 Wiki 来源文件失败",
+                error,
+            ).into_response();
         }
     }
     (StatusCode::NO_CONTENT, "").into_response()
@@ -252,16 +335,25 @@ pub async fn ingest_source(
     match ingest::ingest_source(&app, &pool, &project_id, &source_id).await {
         Ok(result) => Json(serde_json::json!({
             "status": "done",
+            "task_id": result.task_id,
             "pages_created": result.pages_created,
             "page_paths": result.page_paths,
         })).into_response(),
+        Err(error) if error == ingest::INGEST_ALREADY_RUNNING => HttpError::conflict(
+            "WIKI_INGEST_ALREADY_RUNNING",
+            "该 Wiki 来源正在摄入",
+        ).into_response(),
         Err(e) => {
             // Update source status to failed
             let repo = WikiRepository::new(pool);
             if let Err(error) = repo.update_source_status(&source_id, "failed", 0, Some(&e)).await {
                 tracing::warn!(%error, source_id, "failed to persist Wiki source failure status");
             }
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+            HttpError::internal(
+                "WIKI_INGEST_FAILED",
+                "Wiki 来源摄入失败",
+                e,
+            ).into_response()
         }
     }
 }
@@ -277,10 +369,17 @@ pub async fn rescan_sources(
     // Get all pending sources and ingest them
     let sources = match repo.list_sources(&id).await {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => return HttpError::internal(
+            "WIKI_SOURCE_LIST_FAILED",
+            "读取 Wiki 来源失败",
+            error,
+        ).into_response(),
     };
 
-    let pending: Vec<_> = sources.iter().filter(|s| s.status == "pending").collect();
+    let pending: Vec<_> = sources
+        .iter()
+        .filter(|source| source.status == "pending" || source.status == "failed")
+        .collect();
     let mut results = Vec::new();
 
     for source in &pending {
@@ -291,12 +390,24 @@ pub async fn rescan_sources(
                 "status": "done",
                 "pages": r.pages_created,
             })),
-            Err(e) => results.push(serde_json::json!({
-                "source_id": source.id,
-                "filename": source.filename,
-                "status": "failed",
-                "error": e,
-            })),
+            Err(error) => {
+                tracing::error!(%error, source_id = %source.id, "Wiki source rescan failed");
+                if let Err(status_error) = repo
+                    .update_source_status(&source.id, "failed", 0, Some("摄入失败"))
+                    .await
+                {
+                    tracing::warn!(%status_error, source_id = %source.id, "failed to persist Wiki source failure status");
+                }
+                results.push(serde_json::json!({
+                    "source_id": source.id,
+                    "filename": source.filename,
+                    "status": "failed",
+                    "error": {
+                        "code": "WIKI_INGEST_FAILED",
+                        "message": "Wiki 来源摄入失败"
+                    },
+                }));
+            }
         }
     }
 
@@ -316,7 +427,11 @@ pub async fn list_pages(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.list_pages(&id).await {
         Ok(pages) => Json(serde_json::json!({ "data": pages })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_PAGE_LIST_FAILED",
+            "读取 Wiki 页面失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -328,8 +443,8 @@ pub async fn get_page(
 
     // Try DB first, but do not turn database failures into a misleading file fallback.
     match repo.get_page(&id, &path).await {
-        Ok(Some(page)) => match project::read_page(&id, &path).await {
-            Ok(content) => {
+        Ok(Some(page)) => match project::snapshot_page(&id, &path).await {
+            Ok(Some(content)) => {
                 return Json(serde_json::json!({
                     "id": page.id,
                     "project_id": page.project_id,
@@ -347,15 +462,24 @@ pub async fn get_page(
                 }))
                 .into_response();
             }
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            Ok(None) => {}
+            Err(error) => return HttpError::internal(
+                "WIKI_PAGE_FILE_READ_FAILED",
+                "读取 Wiki 页面文件失败",
+                error,
+            ).into_response(),
         },
         Ok(None) => {}
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => return HttpError::internal(
+            "WIKI_PAGE_READ_FAILED",
+            "读取 Wiki 页面失败",
+            error,
+        ).into_response(),
     }
 
     // Try reading file directly from disk
-    match project::read_page(&id, &path).await {
-        Ok(content) => {
+    match project::snapshot_page(&id, &path).await {
+        Ok(Some(content)) => {
             let title = path.split('/').last().unwrap_or(&path)
                 .trim_end_matches(".md").to_string();
             Json(serde_json::json!({
@@ -365,7 +489,15 @@ pub async fn get_page(
                 "page_type": "unknown",
             })).into_response()
         }
-        Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+        Ok(None) => HttpError::not_found(
+            "WIKI_PAGE_NOT_FOUND",
+            "Wiki 页面不存在",
+        ).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_PAGE_FILE_READ_FAILED",
+            "读取 Wiki 页面文件失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -381,7 +513,11 @@ pub async fn update_page(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match update_page_inner(&shared.state.db.pool, &repo, &id, &path, content).await {
         Ok(()) => Json(serde_json::json!({ "ok": true, "path": path })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_PAGE_UPDATE_FAILED",
+            "保存 Wiki 页面失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -446,18 +582,22 @@ pub async fn delete_page(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     let staged = match project::stage_page_file_removal(&id, &path).await {
         Ok(staged) => staged,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        Err(error) => return HttpError::bad_request(
+            "WIKI_PAGE_PATH_INVALID",
+            error,
+        ).into_response(),
     };
     if let Err(error) = repo.delete_page(&id, &path).await {
         if let Some(ref removal) = staged {
             if let Err(restore_error) = project::restore_staged_removal(removal).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{}; failed to restore page file: {}", error, restore_error),
-                ).into_response();
+                tracing::error!(%restore_error, %id, %path, "failed to restore staged Wiki page file");
             }
         }
-        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        return HttpError::internal(
+            "WIKI_PAGE_DELETE_FAILED",
+            "删除 Wiki 页面失败",
+            error,
+        ).into_response();
     }
     if let Some(removal) = staged {
         if let Err(error) = project::finalize_staged_removal(removal).await {
@@ -481,7 +621,11 @@ pub async fn search(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.search_pages(&id, &params.q, params.top_k).await {
         Ok(results) => Json(serde_json::json!({ "data": results, "query": params.q })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_SEARCH_FAILED",
+            "搜索 Wiki 失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -495,7 +639,11 @@ pub async fn ask(
 
     match ask_inner(&shared, &id, &input.question, top_k, model).await {
         Ok(json) => Json(json).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_ASK_FAILED",
+            "Wiki 问答失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -653,7 +801,11 @@ pub async fn get_graph(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.get_graph(&id).await {
         Ok(graph) => Json(graph).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_GRAPH_READ_FAILED",
+            "读取 Wiki 知识图谱失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -666,7 +818,11 @@ pub async fn list_sessions(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.list_sessions(&id).await {
         Ok(sessions) => Json(serde_json::json!({ "data": sessions })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_SESSION_LIST_FAILED",
+            "读取 Wiki 会话失败",
+            error,
+        ).into_response(),
     }
 }
 
@@ -675,8 +831,12 @@ pub async fn clear_sessions(
     Path(id): Path<String>,
 ) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
-    if let Err(e) = repo.clear_sessions(&id).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = repo.clear_sessions(&id).await {
+        return HttpError::internal(
+            "WIKI_SESSION_CLEAR_FAILED",
+            "清空 Wiki 会话失败",
+            error,
+        ).into_response();
     }
     (StatusCode::NO_CONTENT, "").into_response()
 }
@@ -690,7 +850,11 @@ pub async fn get_queue_status(
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.list_tasks(&id).await {
         Ok(tasks) => Json(serde_json::json!({ "data": tasks })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(error) => HttpError::internal(
+            "WIKI_TASK_LIST_FAILED",
+            "读取 Wiki 任务失败",
+            error,
+        ).into_response(),
     }
 }
 

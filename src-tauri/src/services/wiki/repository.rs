@@ -65,6 +65,14 @@ impl WikiRepository {
             .map_err(|e| format!("DB error: {}", e))
     }
 
+    pub async fn find_project(&self, id: &str) -> Result<Option<WikiProject>, String> {
+        sqlx::query_as::<_, WikiProject>("SELECT * FROM wiki_projects WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))
+    }
+
     pub async fn create_project(&self, input: &CreateProjectInput, wiki_dir: &str) -> Result<WikiProject, String> {
         let id = Self::uuid();
         self.create_project_with_id(&id, input, wiki_dir).await
@@ -343,6 +351,16 @@ impl WikiRepository {
             .map_err(|e| format!("DB error: {}", e))
     }
 
+    pub async fn find_source(&self, source_id: &str) -> Result<Option<WikiSource>, String> {
+        sqlx::query_as::<_, WikiSource>(
+            "SELECT * FROM wiki_sources WHERE id = ?"
+        )
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))
+    }
+
     pub async fn delete_source(&self, source_id: &str) -> Result<(), String> {
         sqlx::query("DELETE FROM wiki_sources WHERE id = ?")
             .bind(source_id)
@@ -370,22 +388,36 @@ impl WikiRepository {
 
     // ── Ingest Queue ──
 
-    pub async fn create_task(&self, project_id: &str, source_id: Option<&str>, task_type: &str) -> Result<String, String> {
+    pub async fn create_task_if_idle(
+        &self,
+        project_id: &str,
+        source_id: &str,
+        task_type: &str,
+    ) -> Result<Option<String>, String> {
         let id = Self::uuid();
         let now = Self::now();
-        sqlx::query(
-            "INSERT INTO wiki_ingest_queue (id, project_id, source_id, task_type, status, progress, total_steps, done_steps, created_at)
-             VALUES (?, ?, ?, ?, 'pending', 0, 0, 0, ?)"
+        let inserted = sqlx::query(
+            "INSERT INTO wiki_ingest_queue
+             (id, project_id, source_id, task_type, status, progress, total_steps, done_steps, created_at)
+             SELECT ?, ?, ?, ?, 'pending', 0, 0, 0, ?
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM wiki_ingest_queue
+                 WHERE project_id = ? AND source_id = ? AND task_type = ?
+                   AND status IN ('pending', 'running')
+             )",
         )
         .bind(&id)
         .bind(project_id)
         .bind(source_id)
         .bind(task_type)
         .bind(&now)
+        .bind(project_id)
+        .bind(source_id)
+        .bind(task_type)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("DB error: {}", e))?;
-        Ok(id)
+        Ok((inserted.rows_affected() == 1).then_some(id))
     }
 
     pub async fn update_task_status(&self, task_id: &str, status: &str, progress: i64, done_steps: i64, total_steps: i64, result: Option<&str>, error: Option<&str>) -> Result<(), String> {
@@ -578,7 +610,8 @@ impl WikiRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_snippet, escape_like_pattern};
+    use super::{content_snippet, escape_like_pattern, WikiRepository};
+    use sqlx::sqlite::SqlitePoolOptions;
 
     #[test]
     fn like_patterns_escape_sql_wildcards() {
@@ -591,6 +624,59 @@ mod tests {
         let snippet = content_snippet(&content, "目标词");
         assert!(snippet.contains("目标词"));
         assert!(std::str::from_utf8(snippet.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ingest_task_claim_is_atomic_for_a_source() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create Wiki repository test database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("apply migrations");
+        let now = "2026-08-20T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO wiki_projects
+             (id, name, status, wiki_dir, mcp_enabled, source_count, page_count, created_at, updated_at)
+             VALUES ('project', 'test', 1, '/tmp/wiki', 1, 0, 0, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert project");
+        sqlx::query(
+            "INSERT INTO wiki_sources
+             (id, project_id, source_type, filename, file_size, status, page_count, created_at)
+             VALUES ('source', 'project', 'upload', 'source.md', 0, 'pending', 0, ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert source");
+
+        let repo = WikiRepository::new(pool);
+        let first = repo
+            .create_task_if_idle("project", "source", "ingest")
+            .await
+            .expect("claim first ingest")
+            .expect("first ingest is claimed");
+        assert!(repo
+            .create_task_if_idle("project", "source", "ingest")
+            .await
+            .expect("attempt duplicate ingest")
+            .is_none());
+        repo.update_task_status(&first, "failed", 0, 0, 3, None, Some("failed"))
+            .await
+            .expect("finish first ingest");
+        assert!(repo
+            .create_task_if_idle("project", "source", "ingest")
+            .await
+            .expect("claim retry ingest")
+            .is_some());
     }
 }
 

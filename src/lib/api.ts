@@ -5,7 +5,8 @@ import type { Channel, CreateChannelInput, ReorderChannelsInput, UpdateChannelIn
     UsageStatsInput, KnowledgeBase, KbDocument, KbConversation, KbSource, KbIndexMeta,
     ConversationMessage, KbSearchResult, KbRagAnswer, KbTag, ServiceStatus, ChannelStats, ApiKeyStats,
     ImportResult, ScanResult, ScannedSource, BuiltinRule, CustomRule,
-    CreateCustomRuleInput, UpdateBuiltinRuleInput } from "../types";
+    CreateCustomRuleInput, UpdateBuiltinRuleInput, BackupPreview, BackupWriteResult,
+    RestoreScheduleResult } from "../types";
 
 // 渠道管理 API
 export const channelApi = {
@@ -74,6 +75,22 @@ export const importExportApi = {
         invoke<ImportResult>("import_scanned_sources", { sources })
     ),
     pickImportFile: () => invoke<string | null>("pick_import_file"),
+};
+
+export const backupApi = {
+    create: (password: string, includeLogs: boolean) => (
+        invoke<BackupWriteResult | null>("create_full_backup", { password, includeLogs })
+    ),
+    inspect: (password: string) => (
+        invoke<BackupPreview | null>("inspect_full_backup", { password })
+    ),
+    scheduleRestore: (selectionId: string, password: string, keepLocalSettings: boolean) => (
+        invoke<RestoreScheduleResult>("schedule_full_restore", {
+            selectionId,
+            password,
+            keepLocalSettings,
+        })
+    ),
 };
 
 export const securityApi = {

@@ -1,9 +1,11 @@
-use super::models::SearchResult;
+use super::models::{KbTask, SearchResult};
 use super::repository::KbRepository;
 use super::index::HnswIndex;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
+
+pub const INDEX_BUILD_ALREADY_RUNNING: &str = "KB_INDEX_BUILD_ALREADY_RUNNING";
 
 /// Default HNSW parameters
 const DEFAULT_M: usize = 16;
@@ -20,9 +22,19 @@ fn index_path(kb_id: &str) -> PathBuf {
     dir.join(format!("kb_{}.hnsw", kb_id))
 }
 
+fn index_backup_path(kb_id: &str) -> PathBuf {
+    index_path(kb_id).with_extension("hnsw.bak")
+}
+
 /// Try to load the HNSW index for a KB. Returns None if not built.
 fn load_index(kb_id: &str) -> Option<HnswIndex> {
     let path = index_path(kb_id);
+    let backup = index_backup_path(kb_id);
+    if !path.exists() && backup.exists() {
+        if let Err(error) = std::fs::rename(&backup, &path) {
+            tracing::warn!(%error, %kb_id, "failed to recover HNSW index backup");
+        }
+    }
     if path.exists() {
         match HnswIndex::load(&path) {
             Ok(index) if index.initialized && !index.is_empty() => Some(index),
@@ -47,8 +59,24 @@ pub async fn search(
 ) -> Result<Vec<SearchResult>, String> {
     let repo = KbRepository::new(pool.clone());
 
-    // Try HNSW index first
-    if let Some(index) = load_index(kb_id) {
+    let index_is_current = match (repo.get_kb(kb_id).await, repo.get_index_meta(kb_id).await) {
+        (Ok(kb), Ok(Some(meta))) => {
+            kb.index_status == "ready"
+                && meta.status == "ready"
+                && meta.chunk_count == repo
+                    .get_chunk_count_by_kb(kb_id)
+                    .await
+                    .map_err(|e| format!("Failed to count chunks: {}", e))?
+        }
+        (Ok(_), Ok(None)) => false,
+        (Err(error), _) | (_, Err(error)) => {
+            return Err(format!("Failed to read index status: {}", error));
+        }
+    };
+
+    // Only a ready index whose snapshot matches the database can be loaded.
+    if index_is_current {
+        if let Some(index) = load_index(kb_id) {
         if index.dim == query_embedding.len() {
             tracing::debug!("Using HNSW index for KB {} ({} nodes)", kb_id, index.len());
             let hnsw_results = index.search(query_embedding, top_k);
@@ -109,6 +137,7 @@ pub async fn search(
                 "HNSW index dim ({}) != query dim ({}) for KB {}, falling back to linear scan",
                 index.dim, query_embedding.len(), kb_id
             );
+        }
         }
     }
 
@@ -249,6 +278,79 @@ pub async fn detect_embedding_dim(pool: &SqlitePool, kb_id: &str) -> Result<Opti
 /// Emits `kb-index-progress` Tauri events with percentage.
 pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Result<(), String> {
     let repo = KbRepository::new(pool.clone());
+    let task = claim_index_task(&repo, kb_id).await?;
+    run_index_task(pool, kb_id, app, task).await
+}
+
+pub async fn start_index_build(
+    pool: &SqlitePool,
+    kb_id: &str,
+    app: &AppHandle,
+) -> Result<String, String> {
+    let repo = KbRepository::new(pool.clone());
+    let task = claim_index_task(&repo, kb_id).await?;
+    let task_id = task.id.clone();
+    let pool = pool.clone();
+    let kb_id = kb_id.to_string();
+    let app = app.clone();
+    tokio::spawn(async move {
+        if let Err(error) = run_index_task(&pool, &kb_id, &app, task).await {
+            tracing::error!(%error, %kb_id, "knowledge index build failed");
+        }
+    });
+    Ok(task_id)
+}
+
+async fn claim_index_task(repo: &KbRepository, kb_id: &str) -> Result<KbTask, String> {
+    repo
+        .create_task_if_idle(kb_id, None, "build_index", 1)
+        .await
+        .map_err(|e| format!("Failed to create index task: {}", e))?
+        .ok_or_else(|| INDEX_BUILD_ALREADY_RUNNING.to_string())
+}
+
+async fn run_index_task(
+    pool: &SqlitePool,
+    kb_id: &str,
+    app: &AppHandle,
+    task: KbTask,
+) -> Result<(), String> {
+    let repo = KbRepository::new(pool.clone());
+
+    if let Err(error) = repo.update_kb_index_status(kb_id, "building").await {
+        let message = format!("Failed to update index status: {}", error);
+        let _ = repo.complete_task(&task.id, Some(&message)).await;
+        return Err(message);
+    }
+    if let Err(error) = repo.update_index_meta_status(kb_id, "building").await {
+        tracing::warn!(%error, %kb_id, "failed to mark index metadata as building");
+    }
+
+    let result = build_index_inner(pool, kb_id, app).await;
+    match &result {
+        Ok(()) => {
+            let _ = repo.update_task_progress(&task.id, 1, 100).await;
+            if let Err(error) = repo.complete_task(&task.id, None).await {
+                tracing::warn!(%error, %kb_id, task_id = %task.id, "failed to complete index task");
+            }
+        }
+        Err(error) => {
+            if let Err(status_error) = repo.update_kb_index_status(kb_id, "error").await {
+                tracing::warn!(%status_error, %kb_id, "failed to persist index error status");
+            }
+            if let Err(status_error) = repo.update_index_meta_status(kb_id, "error").await {
+                tracing::warn!(%status_error, %kb_id, "failed to persist index metadata error status");
+            }
+            if let Err(status_error) = repo.complete_task(&task.id, Some(error)).await {
+                tracing::warn!(%status_error, %kb_id, task_id = %task.id, "failed to fail index task");
+            }
+        }
+    }
+    result
+}
+
+async fn build_index_inner(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Result<(), String> {
+    let repo = KbRepository::new(pool.clone());
 
     let chunks = repo
         .get_chunks_by_kb(kb_id)
@@ -316,11 +418,17 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
 
     let index = index;
 
-    // Save to file
+    // Save to a temporary file and only expose the complete snapshot.
     let path = index_path(kb_id);
+    let temporary_path = path.with_extension(format!("hnsw.tmp-{}", uuid::Uuid::new_v4()));
     index
-        .save(&path)
+        .save(&temporary_path)
         .map_err(|e| format!("Failed to save index: {}", e))?;
+
+    if let Err(error) = replace_index_file(kb_id, &temporary_path, &path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
 
     // Update DB metadata
     repo.upsert_index_meta(kb_id, dim as i64, total_items as i64, Some(path.to_str().unwrap_or("")), "ready")
@@ -337,6 +445,39 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
     );
 
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_index_file(_kb_id: &str, temporary: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    std::fs::rename(temporary, target)
+        .map_err(|e| format!("Failed to replace index file: {}", e))
+}
+
+#[cfg(windows)]
+fn replace_index_file(kb_id: &str, temporary: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    let backup = index_backup_path(kb_id);
+    if backup.exists() {
+        std::fs::remove_file(&backup)
+            .map_err(|e| format!("Failed to remove stale index backup: {}", e))?;
+    }
+    if target.exists() {
+        std::fs::rename(target, &backup)
+            .map_err(|e| format!("Failed to stage previous index: {}", e))?;
+    }
+    match std::fs::rename(temporary, target) {
+        Ok(()) => {
+            if backup.exists() {
+                let _ = std::fs::remove_file(backup);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if backup.exists() {
+                let _ = std::fs::rename(&backup, target);
+            }
+            Err(format!("Failed to replace index file: {}", error))
+        }
+    }
 }
 
 /// Drop the HNSW index for a KB.

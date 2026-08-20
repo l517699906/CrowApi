@@ -1,6 +1,6 @@
 pub mod handlers;
 
-use super::{Service, ServiceStatus};
+use super::{Service, ServiceIssue, ServiceStatus};
 use crate::server::router::SharedState;
 use crate::AppState;
 use async_trait::async_trait;
@@ -23,20 +23,51 @@ impl Service for McpService {
 
     async fn status(&self, state: &Arc<AppState>) -> ServiceStatus {
         let pool = &state.db.pool;
-        let kb_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM kb_knowledge_bases WHERE status = 1")
-                .fetch_one(pool)
-                .await
-                .unwrap_or(0);
+        let gateway_running = state
+            .server_running
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let counts = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT
+                (SELECT COUNT(*) FROM kb_knowledge_bases WHERE status = 1 AND mcp_enabled = 1),
+                (SELECT COUNT(*) FROM wiki_projects WHERE status = 1 AND mcp_enabled = 1)",
+        )
+        .fetch_one(pool)
+        .await;
+        let mut issues = Vec::new();
+        if !gateway_running {
+            issues.push(ServiceIssue::new("GATEWAY_STOPPED", "网关服务未启动", true));
+        }
+        let (kb_count, wiki_count) = match counts {
+            Ok(counts) => counts,
+            Err(error) => {
+                tracing::error!(%error, "MCP service health query failed");
+                issues.push(ServiceIssue::new(
+                    "DATABASE_UNAVAILABLE",
+                    "MCP 服务数据库不可用",
+                    true,
+                ));
+                (0, 0)
+            }
+        };
+        let database_ok = !issues.iter().any(|issue| issue.code == "DATABASE_UNAVAILABLE");
 
         ServiceStatus {
             id: self.id().to_string(),
             name: self.name().to_string(),
             description: self.description().to_string(),
             enabled: true,
-            running: true,
+            running: gateway_running && database_ok,
+            health: if !gateway_running || !database_ok {
+                "unavailable"
+            } else if issues.is_empty() {
+                "healthy"
+            } else {
+                "degraded"
+            }.to_string(),
+            issues,
             stats: serde_json::json!({
                 "available_knowledge_bases": kb_count,
+                "available_wikis": wiki_count,
                 "tools": [
                 {"name": "search_knowledge_base", "label": "语义搜索", "desc": "基于 HNSW 向量索引的语义搜索，返回匹配文本片段及相似度评分"},
                 {"name": "list_knowledge_bases", "label": "列出 RAG", "desc": "列出所有已启用 MCP 的 RAG，含 ID、名称、文档数、切片数"},

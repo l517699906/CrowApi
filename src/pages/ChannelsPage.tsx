@@ -718,7 +718,7 @@ export function ChannelsPage() {
                                             />
                                             <span>
                                                 <strong>{source.name}</strong>
-                                                <small>{source.source} · {source.models.length} 个模型</small>
+                                                <small>{source.source} · {source.models.length} 个模型 · 密钥 {source.key_preview}</small>
                                                 <code>{source.base_url || "使用默认 API 地址"}</code>
                                             </span>
                                         </label>

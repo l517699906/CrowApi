@@ -59,6 +59,11 @@ rand = "0.9"
 dirs = "5"
 async-trait = "0.1"
 bytes = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+zeroize = "1"
+zstd = "0.13"
 
 # Logging
 log = "0.4"
@@ -78,4 +83,3 @@ tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"
-

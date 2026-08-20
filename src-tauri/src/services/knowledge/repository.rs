@@ -163,6 +163,20 @@ impl KbRepository {
             .await
     }
 
+    pub async fn get_document_in_kb(
+        &self,
+        kb_id: &str,
+        id: &str,
+    ) -> Result<KbDocument, sqlx::Error> {
+        sqlx::query_as::<_, KbDocument>(
+            "SELECT * FROM kb_documents WHERE kb_id = ? AND id = ?",
+        )
+        .bind(kb_id)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub async fn find_document_by_hash(&self, kb_id: &str, hash: &str) -> Result<Option<KbDocument>, sqlx::Error> {
         sqlx::query_as::<_, KbDocument>("SELECT * FROM kb_documents WHERE kb_id = ? AND content_hash = ?")
             .bind(kb_id)
@@ -335,12 +349,94 @@ impl KbRepository {
         Ok(())
     }
 
+    pub async fn replace_document_chunks(
+        &self,
+        kb_id: &str,
+        doc_id: &str,
+        chunks: &[ChunkInsert],
+        total_tokens: i64,
+    ) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM kb_chunks WHERE doc_id = ?")
+            .bind(doc_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for chunk in chunks {
+            let metadata: serde_json::Value =
+                serde_json::from_str(&chunk.metadata).unwrap_or_default();
+            let symbol_name = metadata.get("symbol_name").and_then(|value| value.as_str());
+            let symbol_kind = metadata.get("symbol_kind").and_then(|value| value.as_str());
+            sqlx::query(
+                "INSERT INTO kb_chunks
+                 (id, doc_id, kb_id, chunk_index, content, token_count, embedding, embedding_dim, metadata, symbol_name, symbol_kind, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&chunk.id)
+            .bind(doc_id)
+            .bind(kb_id)
+            .bind(chunk.chunk_index)
+            .bind(&chunk.content)
+            .bind(chunk.token_count)
+            .bind(&chunk.embedding)
+            .bind(chunk.embedding_dim)
+            .bind(&chunk.metadata)
+            .bind(symbol_name)
+            .bind(symbol_kind)
+            .bind(&chunk.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let updated = sqlx::query(
+            "UPDATE kb_documents
+             SET chunk_count = ?, token_count = ?, status = 'ready', error_message = NULL, updated_at = ?
+             WHERE id = ? AND kb_id = ?",
+        )
+        .bind(chunks.len() as i64)
+        .bind(total_tokens)
+        .bind(&now)
+        .bind(doc_id)
+        .bind(kb_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        sqlx::query(
+            "UPDATE kb_knowledge_bases
+             SET doc_count = (SELECT COUNT(*) FROM kb_documents WHERE kb_id = ?),
+                 chunk_count = (SELECT COUNT(*) FROM kb_chunks WHERE kb_id = ?),
+                 total_tokens = (SELECT COALESCE(SUM(token_count), 0) FROM kb_chunks WHERE kb_id = ?),
+                 index_status = 'stale', updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(kb_id)
+        .bind(kb_id)
+        .bind(kb_id)
+        .bind(&now)
+        .bind(kb_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE kb_index_meta SET status = 'stale' WHERE kb_id = ?")
+            .bind(kb_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await
+    }
+
     pub async fn get_chunks_by_kb(&self, kb_id: &str) -> Result<Vec<(String, String, String, Vec<u8>, String, String)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT c.id, c.content, c.metadata, c.embedding, d.filename, c.doc_id
              FROM kb_chunks c
              JOIN kb_documents d ON c.doc_id = d.id
-             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'"
+             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'
+             ORDER BY d.id, c.chunk_index, c.id"
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
@@ -352,7 +448,8 @@ impl KbRepository {
             "SELECT c.id, c.content, c.metadata, c.embedding, c.embedding_dim, d.filename, c.doc_id
              FROM kb_chunks c
              JOIN kb_documents d ON c.doc_id = d.id
-             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'"
+             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'
+             ORDER BY d.id, c.chunk_index, c.id"
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
@@ -388,6 +485,49 @@ impl KbRepository {
             .bind(&id)
             .fetch_one(&self.pool)
             .await
+    }
+
+    pub async fn create_task_if_idle(
+        &self,
+        kb_id: &str,
+        doc_id: Option<&str>,
+        task_type: &str,
+        total_items: i64,
+    ) -> Result<Option<KbTask>, sqlx::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_iso();
+        let inserted = sqlx::query(
+            "INSERT INTO kb_tasks
+             (id, kb_id, doc_id, task_type, status, progress, total_items, done_items, created_at)
+             SELECT ?, ?, ?, ?, 'running', 0, ?, 0, ?
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM kb_tasks
+                 WHERE kb_id = ?
+                   AND ((doc_id = ?) OR (doc_id IS NULL AND ? IS NULL))
+                   AND task_type = ? AND status = 'running'
+             )",
+        )
+        .bind(&id)
+        .bind(kb_id)
+        .bind(doc_id)
+        .bind(task_type)
+        .bind(total_items)
+        .bind(&now)
+        .bind(kb_id)
+        .bind(doc_id)
+        .bind(doc_id)
+        .bind(task_type)
+        .execute(&self.pool)
+        .await?;
+
+        if inserted.rows_affected() == 0 {
+            return Ok(None);
+        }
+        sqlx::query_as::<_, KbTask>("SELECT * FROM kb_tasks WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map(Some)
     }
 
     pub async fn update_task_progress(&self, id: &str, done_items: i64, progress: i64) -> Result<(), sqlx::Error> {
@@ -567,6 +707,15 @@ impl KbRepository {
             .await
     }
 
+    pub async fn update_index_meta_status(&self, kb_id: &str, status: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE kb_index_meta SET status = ? WHERE kb_id = ?")
+            .bind(status)
+            .bind(kb_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn upsert_index_meta(&self, kb_id: &str, dim: i64, chunk_count: i64, index_path: Option<&str>, status: &str) -> Result<(), sqlx::Error> {
         let now = now_iso();
         sqlx::query(
@@ -613,4 +762,192 @@ pub struct ChunkWithEmbedding {
     pub embedding_dim: i64,
     pub filename: String,
     pub doc_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkInsert, KbRepository};
+    use crate::services::knowledge::models::CreateKbInput;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn migrated_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create knowledge repository test database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("apply migrations");
+        pool
+    }
+
+    fn chunk(id: &str, doc_id: &str, kb_id: &str, content: &str) -> ChunkInsert {
+        ChunkInsert {
+            id: id.to_string(),
+            doc_id: doc_id.to_string(),
+            kb_id: kb_id.to_string(),
+            chunk_index: 0,
+            content: content.to_string(),
+            token_count: 2,
+            embedding: vec![0, 0, 128, 63],
+            embedding_dim: 1,
+            metadata: "{}".to_string(),
+            created_at: "2026-08-20T00:00:00Z".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_replacement_is_atomic_and_marks_index_stale() {
+        let pool = migrated_pool().await;
+        let repo = KbRepository::new(pool.clone());
+        let kb = repo
+            .create_kb(&CreateKbInput {
+                name: "atomic test".to_string(),
+                description: None,
+                embedding_model: None,
+                embedding_channel_id: None,
+            })
+            .await
+            .expect("create knowledge base");
+        let document = repo
+            .create_document(&kb.id, "test.txt", None, "text", 4, "hash")
+            .await
+            .expect("create document");
+        repo.replace_document_chunks(
+            &kb.id,
+            &document.id,
+            &[chunk("old", &document.id, &kb.id, "old")],
+            2,
+        )
+        .await
+        .expect("store initial snapshot");
+        repo.upsert_index_meta(&kb.id, 1, 1, Some("index"), "ready")
+            .await
+            .expect("create ready index metadata");
+        repo.update_kb_index_status(&kb.id, "ready")
+            .await
+            .expect("mark index ready");
+
+        let failed = repo
+            .replace_document_chunks(
+                &kb.id,
+                &document.id,
+                &[
+                    chunk("duplicate", &document.id, &kb.id, "new"),
+                    chunk("duplicate", &document.id, &kb.id, "newer"),
+                ],
+                4,
+            )
+            .await;
+        assert!(failed.is_err());
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM kb_chunks WHERE doc_id = ?",
+        )
+        .bind(&document.id)
+        .fetch_one(&pool)
+        .await
+        .expect("old snapshot remains after rollback");
+        assert_eq!(content, "old");
+
+        repo.replace_document_chunks(
+            &kb.id,
+            &document.id,
+            &[chunk("new", &document.id, &kb.id, "new")],
+            2,
+        )
+        .await
+        .expect("replace document snapshot");
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM kb_chunks WHERE doc_id = ?",
+        )
+        .bind(&document.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read replacement snapshot");
+        assert_eq!(content, "new");
+        assert_eq!(repo.get_kb(&kb.id).await.expect("read KB").index_status, "stale");
+        assert_eq!(
+            repo.get_index_meta(&kb.id)
+                .await
+                .expect("read index metadata")
+                .expect("index metadata exists")
+                .status,
+            "stale",
+        );
+    }
+
+    #[tokio::test]
+    async fn task_claim_allows_only_one_active_task() {
+        let pool = migrated_pool().await;
+        let repo = KbRepository::new(pool);
+        let kb = repo
+            .create_kb(&CreateKbInput {
+                name: "task test".to_string(),
+                description: None,
+                embedding_model: None,
+                embedding_channel_id: None,
+            })
+            .await
+            .expect("create knowledge base");
+        let first = repo
+            .create_task_if_idle(&kb.id, None, "build_index", 1)
+            .await
+            .expect("claim first task")
+            .expect("first task is claimed");
+        assert!(repo
+            .create_task_if_idle(&kb.id, None, "build_index", 1)
+            .await
+            .expect("attempt duplicate claim")
+            .is_none());
+        repo.complete_task(&first.id, None)
+            .await
+            .expect("complete first task");
+        assert!(repo
+            .create_task_if_idle(&kb.id, None, "build_index", 1)
+            .await
+            .expect("claim replacement task")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn document_lookup_is_scoped_to_its_knowledge_base() {
+        let pool = migrated_pool().await;
+        let repo = KbRepository::new(pool);
+        let first_kb = repo
+            .create_kb(&CreateKbInput {
+                name: "first".to_string(),
+                description: None,
+                embedding_model: None,
+                embedding_channel_id: None,
+            })
+            .await
+            .expect("create first knowledge base");
+        let second_kb = repo
+            .create_kb(&CreateKbInput {
+                name: "second".to_string(),
+                description: None,
+                embedding_model: None,
+                embedding_channel_id: None,
+            })
+            .await
+            .expect("create second knowledge base");
+        let document = repo
+            .create_document(&first_kb.id, "scope.txt", None, "text", 5, "scope-hash")
+            .await
+            .expect("create scoped document");
+
+        assert_eq!(
+            repo.get_document_in_kb(&first_kb.id, &document.id)
+                .await
+                .expect("read document from owner")
+                .id,
+            document.id
+        );
+        assert!(matches!(
+            repo.get_document_in_kb(&second_kb.id, &document.id).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+    }
 }

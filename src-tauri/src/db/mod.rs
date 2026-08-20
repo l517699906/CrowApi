@@ -2,47 +2,48 @@ pub mod models;
 pub mod repository;
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 pub struct Database {
     pub pool: SqlitePool,
 }
 
-/// 修复旧版迁移记录的 checksum，使 v0.1.1 用户升级到 v0.1.3 时不会 VersionMismatch
-///
-/// v0.1.1 → v0.1.3 迁移文件变更：
-/// - 005_add_response_choices.sql → 005_add_response_choices_and_seq.sql（内容变更）
-/// - 007 文件可能被本地修改过（description 不匹配）
-///
-/// 此函数在 sqlx::migrate 之前运行，将旧 checksum 更新为当前文件的 checksum。
-/// 仅更新已有记录，不会跳过任何迁移。
-async fn fix_legacy_migration_checksums(pool: &SqlitePool) {
-    use sha2::Digest;
-
-    // 计算当前迁移文件的 SHA-384 checksum（与 sqlx 算法一致：对文件内容原始字节做 SHA-384）
-    let migration_005 = include_str!("../../migrations/005_add_response_choices_and_seq.sql");
-    let checksum_005: Vec<u8> = sha2::Sha384::digest(migration_005.as_bytes()).to_vec();
-
-    let migration_007 = include_str!("../../migrations/007_fix_log_seq.sql");
-    let checksum_007: Vec<u8> = sha2::Sha384::digest(migration_007.as_bytes()).to_vec();
-
-    // 更新 version=5 和 version=7 的 checksum（BLOB 类型），使其匹配当前文件
-    for (version, new_checksum) in [(5i64, checksum_005), (7i64, checksum_007)] {
-        let result = sqlx::query(
-            "UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND checksum != ?",
-        )
-        .bind(&new_checksum)
-        .bind(version)
-        .bind(&new_checksum)
-        .execute(pool)
-        .await;
-
-        if let Ok(res) = result {
-            if res.rows_affected() > 0 {
-                log::warn!("已修复迁移版本 {} 的 checksum 以兼容 v0.1.3", version);
-            }
-        }
+async fn secure_secret_migration_pending(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let migration_table_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if migration_table_exists == 0 {
+        return Ok(true);
     }
+    let applied: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 20 AND success = 1",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(applied == 0)
+}
+
+async fn backup_before_secure_secret_migration(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+) -> Result<PathBuf, String> {
+    let backup_dir = app_data_dir.join("backups");
+    std::fs::create_dir_all(&backup_dir)
+        .map_err(|error| format!("failed to create database backup directory: {}", error))?;
+    let filename = format!(
+        "crowapi-before-secret-migration-{}.db",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f")
+    );
+    let path = backup_dir.join(filename);
+    let escaped = path.to_string_lossy().replace('\'', "''");
+    sqlx::query(&format!("VACUUM INTO '{}'", escaped))
+        .execute(pool)
+        .await
+        .map_err(|error| format!("failed to create database migration backup: {}", error))?;
+    Ok(path)
 }
 
 impl Database {
@@ -55,8 +56,21 @@ impl Database {
 
         std::fs::create_dir_all(&app_data_dir).expect("failed to create app data dir");
 
+        if let Some(rollback_path) = crate::commands::backup::apply_pending_restore(&app_data_dir)
+            .expect("failed to apply pending full restore")
+        {
+            log::warn!(
+                "完整备份恢复成功，原数据保存在: {}",
+                rollback_path.display()
+            );
+        }
+
         // mode=rwc：不存在则创建
         let db_path = app_data_dir.join("crowapi.db");
+        let existing_database = db_path
+            .metadata()
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false);
         let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
 
         let pool = SqlitePoolOptions::new()
@@ -65,8 +79,19 @@ impl Database {
             .await
             .expect("failed to connect to database");
 
-        // 修复旧版迁移 checksum（v0.1.1 → v0.1.3 兼容）
-        fix_legacy_migration_checksums(&pool).await;
+        if existing_database
+            && secure_secret_migration_pending(&pool)
+                .await
+                .expect("failed to inspect secure secret migration state")
+        {
+            let backup_path = backup_before_secure_secret_migration(&pool, &app_data_dir)
+                .await
+                .expect("failed to back up database before secure secret migration");
+            log::warn!(
+                "已在密钥迁移前备份数据库: {}",
+                backup_path.display()
+            );
+        }
 
         // 执行 migrations（编译时嵌入 SQL 文件）
         sqlx::migrate!("./migrations")
@@ -74,9 +99,70 @@ impl Database {
             .await
             .expect("failed to run database migrations");
 
+        let secret_report = repository::Repository::new(pool.clone())
+            .migrate_legacy_secrets()
+            .await
+            .expect("failed to migrate legacy API keys");
+        if secret_report.channels_migrated > 0
+            || secret_report.api_keys_migrated > 0
+        {
+            log::warn!(
+                "密钥迁移完成: 渠道 {}, 访问密钥 {}",
+                secret_report.channels_migrated,
+                secret_report.api_keys_migrated,
+            );
+        }
+
         // Seed built-in security rules if table exists and is empty
         let _ = crate::security::rules::seed_builtin_rules(&pool).await;
 
         Self { pool }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::migrate::MigrateError;
+
+    #[tokio::test]
+    async fn all_migrations_apply_cleanly_and_are_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create migration test database");
+
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run(&pool).await.expect("apply all migrations");
+        migrator.run(&pool).await.expect("reapply all migrations");
+
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .expect("check migrated database integrity");
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn migration_checksum_drift_is_rejected() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create migration drift test database");
+        let migrator = sqlx::migrate!("./migrations");
+        migrator.run(&pool).await.expect("apply migrations");
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = zeroblob(48) WHERE version = 5")
+            .execute(&pool)
+            .await
+            .expect("tamper migration checksum");
+
+        let error = migrator
+            .run(&pool)
+            .await
+            .expect_err("checksum drift must block startup migration");
+
+        assert!(matches!(error, MigrateError::VersionMismatch(5)));
     }
 }

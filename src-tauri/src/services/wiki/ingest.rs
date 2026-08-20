@@ -1,4 +1,5 @@
 use super::project;
+use super::models::WikiSource;
 use super::repository::WikiRepository;
 use crate::core::proxy;
 use crate::db::repository::Repository;
@@ -6,6 +7,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+
+pub const INGEST_ALREADY_RUNNING: &str = "WIKI_INGEST_ALREADY_RUNNING";
 
 /// Ingest a source file: read → parse → generate wiki pages via LLM → write to disk+DB.
 pub async fn ingest_source(
@@ -22,10 +25,72 @@ pub async fn ingest_source(
     let source = sources.iter().find(|s| s.id == source_id)
         .ok_or_else(|| format!("Source {} not found", source_id))?;
 
-    // 2. Update task status
-    let task_id = repo.create_task(project_id, Some(source_id), "ingest").await?;
+    // 2. Claim a single active ingest task for this source.
+    let task_id = repo
+        .create_task_if_idle(project_id, source_id, "ingest")
+        .await?
+        .ok_or_else(|| INGEST_ALREADY_RUNNING.to_string())?;
     repo.update_task_status(&task_id, "running", 0, 0, 3, None, None).await?;
     emit_wiki_progress(app, source_id, project_id, &source.filename, "processing", 0, "准备摄入");
+
+    let result = run_ingest_source(
+        app,
+        pool,
+        project_id,
+        source_id,
+        source,
+        &task_id,
+        &repo,
+        &db_repo,
+    )
+    .await;
+
+    if let Err(error) = &result {
+        tracing::error!(%error, project_id, source_id, task_id, "Wiki ingest failed");
+        if let Err(status_error) = repo
+            .update_task_status(
+                &task_id,
+                "failed",
+                0,
+                0,
+                3,
+                None,
+                Some("Wiki 来源摄入失败"),
+            )
+            .await
+        {
+            tracing::warn!(%status_error, project_id, source_id, task_id, "failed to persist Wiki ingest task failure");
+        }
+        if let Err(status_error) = repo
+            .update_source_status(source_id, "failed", 0, Some("Wiki 来源摄入失败"))
+            .await
+        {
+            tracing::warn!(%status_error, project_id, source_id, "failed to persist Wiki source failure");
+        }
+        emit_wiki_progress(
+            app,
+            source_id,
+            project_id,
+            &source.filename,
+            "failed",
+            0,
+            "摄入失败",
+        );
+    }
+
+    result
+}
+
+async fn run_ingest_source(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    source_id: &str,
+    source: &WikiSource,
+    task_id: &str,
+    repo: &WikiRepository,
+    db_repo: &Arc<Repository>,
+) -> Result<IngestResult, String> {
 
     // 3. Read source file content
     let content = if let Some(ref file_path) = source.file_path {
@@ -67,7 +132,7 @@ pub async fn ingest_source(
     emit_wiki_progress(app, source_id, project_id, &source.filename, "generating", 30, "LLM 生成页面");
     let pages = generate_wiki_pages(
         app,
-        &db_repo,
+        db_repo,
         ingest_model,
         &ingest_channel_id,
         project_id,
@@ -171,6 +236,7 @@ pub async fn ingest_source(
     emit_wiki_progress(app, source_id, project_id, &source.filename, "done", 100, &format!("完成，生成 {} 个页面", written_pages.len()));
 
     Ok(IngestResult {
+        task_id: task_id.to_string(),
         pages_created: written_pages.len(),
         page_paths: written_pages.iter().map(|p| p.path.clone()).collect(),
     })
@@ -178,6 +244,7 @@ pub async fn ingest_source(
 
 #[derive(Debug, Clone)]
 pub struct IngestResult {
+    pub task_id: String,
     pub pages_created: usize,
     pub page_paths: Vec<String>,
 }

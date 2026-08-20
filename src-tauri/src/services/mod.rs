@@ -35,7 +35,26 @@ pub struct ServiceStatus {
     pub description: String,
     pub enabled: bool,
     pub running: bool,
+    pub health: String,
+    pub issues: Vec<ServiceIssue>,
     pub stats: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceIssue {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ServiceIssue {
+    pub fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable,
+        }
+    }
 }
 
 /// Service manager

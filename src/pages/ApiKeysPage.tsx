@@ -62,6 +62,7 @@ export function ApiKeysPage() {
     const [createdKey, setCreatedKey] = useState<ApiKey | null>(null);
     const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
     const [quotaDraft, setQuotaDraft] = useState(0);
+    const [expiresAtDraft, setExpiresAtDraft] = useState("");
     const [deletingKey, setDeletingKey] = useState<ApiKey | null>(null);
     const [copiedKey, setCopiedKey] = useState<string | null>(null);
     const [toast, setToast] = useState("");
@@ -117,9 +118,12 @@ export function ApiKeysPage() {
         onError: (mutationError) => showToast(errorMessage(mutationError)),
     });
     const updateQuotaMutation = useMutation({
-        mutationFn: ({ id, quotaLimit }: { id: string; quotaLimit: number }) => apiKeyApi.update({
+        mutationFn: ({ id, quotaLimit, expiresAt }: { id: string; quotaLimit: number; expiresAt: string }) => apiKeyApi.update({
             id,
             quota_limit: quotaLimit,
+            ...(expiresAt
+                ? { expires_at: new Date(`${expiresAt}T23:59:59`).toISOString() }
+                : { clear_expires_at: true }),
         }),
         onSuccess: async () => {
             await refreshKeys();
@@ -153,6 +157,7 @@ export function ApiKeysPage() {
 
     const openQuotaDialog = (apiKey: ApiKey) => {
         setQuotaDraft(normalizeQuota(apiKey.quota_limit));
+        setExpiresAtDraft(apiKey.expires_at ? new Date(apiKey.expires_at).toISOString().slice(0, 10) : "");
         setEditingKey(apiKey);
     };
 
@@ -183,6 +188,7 @@ export function ApiKeysPage() {
         updateQuotaMutation.mutate({
             id: editingKey.id,
             quotaLimit: normalizeQuota(quotaDraft),
+            expiresAt: expiresAtDraft,
         });
     };
 
@@ -237,7 +243,7 @@ export function ApiKeysPage() {
                         <h2>访问密钥</h2>
                         <p>前缀统一为 sk-crowapi-</p>
                     </div>
-                    <StatusBadge status="info"><ShieldCheck size={13} />本地存储</StatusBadge>
+                    <StatusBadge status="info"><ShieldCheck size={13} />密钥仅创建时显示</StatusBadge>
                 </div>
                 <div className="table-scroll">
                     <table className="data-table min-w-[920px]">
@@ -370,7 +376,7 @@ export function ApiKeysPage() {
                             </div>
                             <div className="mt-4 flex items-start gap-3 rounded-md border border-warning/30 bg-warning-soft p-3 text-sm leading-6 text-warning-ink">
                                 <ShieldCheck className="mt-0.5 shrink-0" size={17} />
-                                <span>请妥善保管此密钥，并仅用于受信任的本地应用。</span>
+                                <span>请立即复制并妥善保管。关闭此窗口后，CrowAPI 不会再次显示完整密钥。</span>
                             </div>
                         </div>
                     ) : (
@@ -441,7 +447,7 @@ export function ApiKeysPage() {
 
             {editingKey ? (
                 <Modal
-                    title="编辑密钥配额"
+                    title="编辑密钥"
                     description={editingKey.name}
                     size="sm"
                     onClose={() => setEditingKey(null)}
@@ -449,7 +455,7 @@ export function ApiKeysPage() {
                         <>
                             <button type="button" className="button-secondary" onClick={() => setEditingKey(null)}>取消</button>
                             <button type="submit" form="quota-form" className="button-primary" disabled={updateQuotaMutation.isPending}>
-                                {updateQuotaMutation.isPending ? "保存中..." : "保存配额"}
+                                {updateQuotaMutation.isPending ? "保存中..." : "保存设置"}
                             </button>
                         </>
                     )}
@@ -468,6 +474,17 @@ export function ApiKeysPage() {
                                 onChange={(event) => setQuotaDraft(normalizeQuota(event.target.value))}
                             />
                             <small>已使用 {formatCompactNumber(editingKey.quota_used)} Token；0 表示不限制</small>
+                        </label>
+                        <label className="field-label mt-4">
+                            <span>到期日期</span>
+                            <input
+                                className="field-input"
+                                type="date"
+                                value={expiresAtDraft}
+                                min={new Date().toISOString().slice(0, 10)}
+                                onChange={(event) => setExpiresAtDraft(event.target.value)}
+                            />
+                            <small>留空表示永不过期</small>
                         </label>
                     </form>
                 </Modal>
