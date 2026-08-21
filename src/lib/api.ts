@@ -1,12 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Channel, CreateChannelInput, ReorderChannelsInput, UpdateChannelInput, TestChannelResult,
     ApiKey, CreateApiKeyInput, UpdateApiKeyInput, RequestLog, RequestSecurityFinding, LogStats,
-    DashboardStats, DashboardStatsInput, Settings, GetLogsInput, ServerStatus, UsageStats,
-    UsageStatsInput, KnowledgeBase, KbDocument, KbConversation, KbSource, KbIndexMeta,
+    DashboardStatsInput, Settings, GetLogsInput, ServerStatus, UsageStatsInput,
+    KnowledgeBase, KbDocument, KbConversation, KbSource,
     ConversationMessage, KbSearchResult, KbRagAnswer, KbTag, ServiceStatus, ChannelStats, ApiKeyStats,
     ImportResult, ScanResult, ScannedSource, BuiltinRule, CustomRule,
     CreateCustomRuleInput, UpdateBuiltinRuleInput, BackupPreview, BackupWriteResult,
-    RestoreScheduleResult } from "../types";
+    RestoreScheduleResult, MasterKeyStatus, MasterKeyRotationResult,
+    BackgroundTask, BackgroundTaskFilter, StartedDocumentTask,
+    StartedSourceTask, StartedTask } from "../types";
+import { normalizeDashboardStats, normalizeUsageStats } from "./statistics";
+import { normalizeKbIndexMeta } from "./contracts";
 
 // 渠道管理 API
 export const channelApi = {
@@ -43,9 +47,11 @@ export const logApi = {
 
 // 仪表盘 API
 export const statsApi = {
-    getDashboard: (input?: DashboardStatsInput) => invoke<DashboardStats>("get_dashboard_stats", { input: input || {} }),
-    getUsage: (input?: UsageStatsInput) => (
-        invoke<UsageStats>("get_usage_stats", { input: input || {} })
+    getDashboard: async (input?: DashboardStatsInput) => (
+        normalizeDashboardStats(await invoke<unknown>("get_dashboard_stats", { input: input || {} }))
+    ),
+    getUsage: async (input?: UsageStatsInput) => (
+        normalizeUsageStats(await invoke<unknown>("get_usage_stats", { input: input || {} }))
     ),
 };
 
@@ -53,6 +59,11 @@ export const statsApi = {
 export const settingsApi = {
     get: () => invoke<Settings>("get_settings"),
     save: (settings: Settings) => invoke<void>("save_settings", { settings }),
+};
+
+export const secretApi = {
+    getMasterKeyStatus: () => invoke<MasterKeyStatus>("get_master_key_status"),
+    rotateMasterKey: () => invoke<MasterKeyRotationResult>("rotate_master_key"),
 };
 
 export const serverApi = {
@@ -68,7 +79,10 @@ export const fileApi = {
 
 export const importExportApi = {
     exportChannels: () => invoke<string>("export_channels"),
-    importCrowcodeBackup: (content: string) => invoke<ImportResult>("import_crowcode_backup", { content }),
+    importCrowcodeBackup: (content: string, allowPlaintextKeys = false) => invoke<ImportResult>("import_crowcode_backup", {
+        content,
+        allowPlaintextKeys,
+    }),
     importCrowapiExport: (content: string) => invoke<ImportResult>("import_crowapi_export", { content }),
     scanLocalAiConfigs: () => invoke<ScanResult>("scan_local_ai_configs"),
     importScannedSources: (sources: ScannedSource[]) => (
@@ -91,6 +105,15 @@ export const backupApi = {
             keepLocalSettings,
         })
     ),
+};
+
+export const taskApi = {
+    getAll: (filter?: BackgroundTaskFilter) => (
+        invoke<BackgroundTask[]>("get_background_tasks", { filter: filter ?? null })
+    ),
+    get: (id: string) => invoke<BackgroundTask>("get_background_task", { id }),
+    cancel: (id: string) => invoke<BackgroundTask>("cancel_background_task", { id }),
+    retry: (id: string) => invoke<BackgroundTask>("retry_background_task", { id }),
 };
 
 export const securityApi = {
@@ -132,10 +155,10 @@ export const kbApi = {
     delete: (id: string) => invoke<void>("delete_knowledge_base", { id }),
     getDocuments: (kbId: string) => invoke<KbDocument[]>("get_kb_documents", { kbId }),
     uploadDocument: (input: { kb_id: string; filename: string; content: string }) =>
-        invoke<KbDocument>("upload_kb_document", { input }),
+        invoke<StartedDocumentTask>("upload_kb_document", { input }),
     deleteDocument: (docId: string, kbId: string) =>
         invoke<void>("delete_kb_document", { docId, kbId }),
-    reindexDocument: (docId: string) => invoke<void>("reindex_kb_document", { docId }),
+    reindexDocument: (docId: string) => invoke<StartedTask>("reindex_kb_document", { docId }),
     search: (input: {
         query: string;
         kb_id?: string;
@@ -171,9 +194,11 @@ export const kbApi = {
         excluded_dirs?: string[];
         included_files?: string[];
         max_file_size?: number;
-    }) => invoke<KbSource>("import_kb_source", { kbId, input }),
-    getIndexStatus: (kbId: string) => invoke<KbIndexMeta | null>("get_kb_index_status", { kbId }),
-    buildIndex: (kbId: string) => invoke<void>("build_kb_index", { kbId }),
+    }) => invoke<StartedSourceTask>("import_kb_source", { kbId, input }),
+    getIndexStatus: async (kbId: string) => (
+        normalizeKbIndexMeta(await invoke<unknown>("get_kb_index_status", { kbId }))
+    ),
+    buildIndex: (kbId: string) => invoke<StartedTask>("build_kb_index", { kbId }),
     dropIndex: (kbId: string) => invoke<void>("drop_kb_index", { kbId }),
     getTags: (kbId: string, limit?: number) => invoke<KbTag[]>("get_kb_tags", { kbId, limit }),
 };
@@ -263,6 +288,14 @@ export interface WikiSearchResult {
     page_type: string;
 }
 
+export interface WikiSearchPage {
+    results: WikiSearchResult[];
+    total: number;
+    offset: number;
+    limit: number;
+    query: string;
+}
+
 export interface WikiGraphData {
     nodes: Array<{
         id: string;
@@ -305,9 +338,10 @@ export const wikiApi = {
     addSource: (projectId: string, input: AddWikiSourceInput) => invoke<WikiSource>("add_wiki_source", { projectId, input }),
     deleteSource: (sourceId: string) => invoke<void>("delete_wiki_source", { sourceId }),
     search: (projectId: string, query: string, topK?: number) => invoke<WikiSearchResult[]>("search_wiki", { projectId, query, topK }),
+    searchPage: (projectId: string, query: string, topK?: number, offset?: number) => invoke<WikiSearchPage>("search_wiki_page", { projectId, query, topK, offset }),
     getGraph: (projectId: string) => invoke<WikiGraphData>("get_wiki_graph", { projectId }),
     getStats: (projectId: string) => invoke<Record<string, unknown>>("get_wiki_stats", { projectId }),
-    ingestSource: (projectId: string, sourceId: string) => invoke<{ status: string; pages_created: number; page_paths: string[] }>("ingest_wiki_source", { projectId, sourceId }),
+    ingestSource: (projectId: string, sourceId: string) => invoke<{ status: "pending"; task_id: string }>("ingest_wiki_source", { projectId, sourceId }),
     rescanSources: (projectId: string) => invoke<{ status: string; processed: number; results: unknown[] }>("rescan_wiki_sources", { projectId }),
     getTags: (projectId: string, limit?: number) => invoke<WikiTag[]>("get_wiki_tags", { projectId, limit }),
 };

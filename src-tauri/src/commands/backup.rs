@@ -15,9 +15,9 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Manager;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const BACKUP_MAGIC: &str = "CROWAPI_FULL_BACKUP";
 const BACKUP_VERSION: u32 = 1;
@@ -29,10 +29,13 @@ const MAX_BACKUP_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PAYLOAD_JSON_BYTES: u64 = MAX_BACKUP_BYTES * 2;
 const MAX_BACKUP_FILES: usize = 100_000;
 const MIN_RESTORE_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 20;
 
 fn current_schema_version() -> i64 {
-    CURRENT_SCHEMA_VERSION
+    sqlx::migrate!("./migrations")
+        .iter()
+        .map(|migration| migration.version as i64)
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,12 +98,20 @@ struct KdfMetadata {
     parallelism: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct BackupPayload {
     summary: BackupSummary,
     database: BackupBlob,
     files: Vec<BackupFile>,
     channel_secrets: HashMap<String, String>,
+}
+
+impl Drop for BackupPayload {
+    fn drop(&mut self) {
+        for secret in self.channel_secrets.values_mut() {
+            secret.zeroize();
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,9 +163,13 @@ fn derive_backup_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>,
 
 fn encrypt_payload(payload: &BackupPayload, password: &str) -> Result<Vec<u8>, String> {
     validate_payload(payload)?;
-    let serialized = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
-    let compressed = zstd::stream::encode_all(serialized.as_slice(), 6)
-        .map_err(|error| error.to_string())?;
+    let serialized = Zeroizing::new(
+        serde_json::to_vec(payload).map_err(|error| error.to_string())?,
+    );
+    let compressed = Zeroizing::new(
+        zstd::stream::encode_all(serialized.as_slice(), 6)
+            .map_err(|error| error.to_string())?,
+    );
     let payload_sha256 = hex::encode(Sha256::digest(&serialized));
     let mut salt = [0_u8; 16];
     let mut nonce = [0_u8; 24];
@@ -222,18 +237,19 @@ fn decrypt_payload(content: &[u8], password: &str) -> Result<BackupPayload, Stri
     let key = derive_backup_key(password, &salt)?;
     let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| "无法初始化备份解密器".to_string())?;
-    let compressed = cipher
-        .decrypt(
+    let compressed = Zeroizing::new(
+        cipher.decrypt(
             XNonce::from_slice(&nonce),
             Payload {
                 msg: &ciphertext,
                 aad: BACKUP_AAD,
             },
         )
-        .map_err(|_| "备份口令错误或文件已损坏".to_string())?;
+        .map_err(|_| "备份口令错误或文件已损坏".to_string())?,
+    );
     let decoder = zstd::stream::read::Decoder::new(compressed.as_slice())
         .map_err(|_| "备份压缩数据已损坏".to_string())?;
-    let mut serialized = Vec::new();
+    let mut serialized = Zeroizing::new(Vec::new());
     decoder
         .take(MAX_PAYLOAD_JSON_BYTES + 1)
         .read_to_end(&mut serialized)
@@ -251,8 +267,9 @@ fn decrypt_payload(content: &[u8], password: &str) -> Result<BackupPayload, Stri
 }
 
 fn validate_payload(payload: &BackupPayload) -> Result<(), String> {
+    let current_schema_version = current_schema_version();
     if payload.summary.schema_version < MIN_RESTORE_SCHEMA_VERSION
-        || payload.summary.schema_version > CURRENT_SCHEMA_VERSION
+        || payload.summary.schema_version > current_schema_version
     {
         return Err(format!(
             "不支持的数据库结构版本: {}",
@@ -333,6 +350,7 @@ async fn create_database_snapshot(
     path: &Path,
     include_logs: bool,
 ) -> Result<Vec<u8>, String> {
+    ensure_database_integrity(pool, "当前数据库").await?;
     let escaped = path.to_string_lossy().replace('\'', "''");
     sqlx::query(&format!("VACUUM INTO '{}'", escaped))
         .execute(pool)
@@ -360,21 +378,55 @@ async fn create_database_snapshot(
         .execute(&snapshot_pool)
         .await
         .map_err(|error| error.to_string())?;
-    sqlx::query("UPDATE kb_index_meta SET status = 'stale', index_path = NULL")
+    sqlx::query(
+        "UPDATE kb_index_meta
+         SET status = CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM kb_chunks WHERE kb_chunks.kb_id = kb_index_meta.kb_id
+                 ) THEN 'stale'
+                 ELSE 'none'
+             END,
+             indexed_revision = CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM kb_chunks WHERE kb_chunks.kb_id = kb_index_meta.kb_id
+                 ) THEN 0
+                 ELSE COALESCE((
+                     SELECT content_revision
+                     FROM kb_knowledge_bases
+                     WHERE kb_knowledge_bases.id = kb_index_meta.kb_id
+                 ), 0)
+             END,
+             index_path = NULL,
+             built_at = NULL,
+             format_version = 0,
+             config_revision = 0,
+             content_fingerprint = NULL,
+             index_checksum = NULL",
+    )
         .execute(&snapshot_pool)
         .await
         .map_err(|error| error.to_string())?;
-    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
-        .fetch_one(&snapshot_pool)
-        .await
-        .map_err(|error| error.to_string())?;
+    let integrity_result = ensure_database_integrity(&snapshot_pool, "数据库快照").await;
     snapshot_pool.close().await;
-    if integrity != "ok" {
-        return Err(format!("数据库快照完整性检查失败: {}", integrity));
-    }
+    integrity_result?;
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
     let _ = std::fs::remove_file(path);
     Ok(bytes)
+}
+
+async fn ensure_database_integrity(
+    pool: &sqlx::SqlitePool,
+    label: &str,
+) -> Result<(), String> {
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("{}完整性检查失败: {}", label, error))?;
+    if integrity == "ok" {
+        Ok(())
+    } else {
+        Err(format!("{}完整性检查失败: {}", label, integrity))
+    }
 }
 
 fn collect_directory(
@@ -552,18 +604,20 @@ pub async fn create_full_backup(
     app: tauri::AppHandle,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> CommandResult<Option<BackupWriteResult>> {
-    validate_password(&password)?;
+    let _maintenance = state.maintenance_lock.lock().await;
+    let password = Zeroizing::new(password);
+    validate_password(password.as_str())?;
     let payload = build_payload(&app, &state, include_logs)
         .await
         .map_err(|error| CommandError::reported("BACKUP_BUILD_FAILED", "生成完整备份失败", false, error))?;
-    let content = encrypt_payload(&payload, &password)
+    let content = encrypt_payload(&payload, password.as_str())
         .map_err(|error| CommandError::reported("BACKUP_ENCRYPT_FAILED", "加密完整备份失败", false, error))?;
     let path = save_backup_dialog(&app, content)
         .await
         .command_error("BACKUP_WRITE_FAILED", "保存完整备份失败", false)?;
     Ok(path.map(|path| BackupWriteResult {
         path: path.to_string_lossy().to_string(),
-        summary: payload.summary,
+        summary: payload.summary.clone(),
     }))
 }
 
@@ -572,7 +626,8 @@ pub async fn inspect_full_backup(
     password: String,
     app: tauri::AppHandle,
 ) -> CommandResult<Option<BackupPreview>> {
-    validate_password(&password)?;
+    let password = Zeroizing::new(password);
+    validate_password(password.as_str())?;
     let Some(path) = pick_backup_dialog(&app)
         .await
         .command_error("BACKUP_READ_FAILED", "选择完整备份失败", false)?
@@ -581,7 +636,7 @@ pub async fn inspect_full_backup(
     };
     let content = std::fs::read(&path)
         .map_err(|error| CommandError::reported("BACKUP_READ_FAILED", "读取完整备份失败", false, error))?;
-    let payload = decrypt_payload(&content, &password)
+    let payload = decrypt_payload(&content, password.as_str())
         .map_err(|error| CommandError::new("BACKUP_DECRYPT_FAILED", error, false))?;
     let selection_id = uuid::Uuid::new_v4().to_string();
     let mut selections = selected_backups()
@@ -591,7 +646,7 @@ pub async fn inspect_full_backup(
     selections.insert(selection_id.clone(), path);
     Ok(Some(BackupPreview {
         selection_id,
-        summary: payload.summary,
+        summary: payload.summary.clone(),
         warnings: vec![
             "恢复会在应用重启时替换本地数据库、知识库文件和 Wiki 文件".to_string(),
             "HNSW 索引不会从备份恢复，知识库会回退到线性检索并可重新构建索引".to_string(),
@@ -639,13 +694,30 @@ async fn prepare_staged_database(
     database_path: &Path,
     channel_secrets: &HashMap<String, String>,
 ) -> Result<(), String> {
+    prepare_staged_database_with_store(
+        database_path,
+        channel_secrets,
+        default_secret_store(),
+    )
+    .await
+}
+
+async fn prepare_staged_database_with_store(
+    database_path: &Path,
+    channel_secrets: &HashMap<String, String>,
+    secret_store: Arc<dyn crate::core::secret_store::SecretStore>,
+) -> Result<(), String> {
     let url = format!("sqlite://{}?mode=rw", database_path.display());
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect(&url)
         .await
         .map_err(|error| error.to_string())?;
-    let secret_store = default_secret_store();
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .map_err(|error| format!("升级待恢复数据库失败: {}", error))?;
+    let active_key_version = secret_store.active_key_version();
     let mut transaction = pool.begin().await.map_err(|error| error.to_string())?;
     sqlx::query("DELETE FROM secure_secrets WHERE owner_type = 'channel'")
         .execute(&mut *transaction)
@@ -657,11 +729,12 @@ async fn prepare_staged_database(
         let (_, last_four) = key_preview_parts(plaintext);
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO secure_secrets (owner_type, owner_id, version, nonce, ciphertext, last_four, created_at, updated_at)
-             VALUES ('channel', ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO secure_secrets (owner_type, owner_id, version, key_version, nonce, ciphertext, last_four, created_at, updated_at)
+             VALUES ('channel', ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(channel_id)
         .bind(encrypted.version)
+        .bind(encrypted.key_version)
         .bind(encrypted.nonce)
         .bind(encrypted.ciphertext)
         .bind(&last_four)
@@ -684,6 +757,14 @@ async fn prepare_staged_database(
             return Err(format!("备份包含未知渠道密钥: {}", channel_id));
         }
     }
+    sqlx::query(
+        "UPDATE secret_store_metadata SET active_key_version = ?, updated_at = ? WHERE singleton = 1",
+    )
+    .bind(active_key_version)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| error.to_string())?;
     transaction.commit().await.map_err(|error| error.to_string())?;
     let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_one(&pool)
@@ -702,8 +783,11 @@ pub async fn schedule_full_restore(
     password: String,
     keep_local_settings: bool,
     app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> CommandResult<RestoreScheduleResult> {
-    validate_password(&password)?;
+    let _maintenance = state.maintenance_lock.lock().await;
+    let password = Zeroizing::new(password);
+    validate_password(password.as_str())?;
     let path = selected_backups()
         .lock()
         .map_err(|_| CommandError::new("BACKUP_SELECTION_FAILED", "备份选择状态不可用", true))?
@@ -711,7 +795,7 @@ pub async fn schedule_full_restore(
         .ok_or_else(|| CommandError::validation("备份选择已过期，请重新选择"))?;
     let content = std::fs::read(path)
         .map_err(|error| CommandError::reported("BACKUP_READ_FAILED", "读取完整备份失败", false, error))?;
-    let payload = decrypt_payload(&content, &password)
+    let payload = decrypt_payload(&content, password.as_str())
         .map_err(|error| CommandError::new("BACKUP_DECRYPT_FAILED", error, false))?;
     let app_data = app.path().app_data_dir().map_err(|error| {
         CommandError::reported("APP_DATA_UNAVAILABLE", "无法获取应用数据目录", false, error)
@@ -875,6 +959,29 @@ fn rollback_restore_operations(operations: &mut Vec<AppliedRestoreOperation>) ->
     }
 }
 
+fn quarantine_restore_marker(marker_path: &Path, reason: &str) -> Result<(), String> {
+    let parent = marker_path
+        .parent()
+        .ok_or_else(|| "恢复标记目录无效".to_string())?;
+    let quarantined = parent.join(format!(
+        "restore-pending.invalid-{}.json",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f")
+    ));
+    std::fs::rename(marker_path, &quarantined).map_err(|error| {
+        format!(
+            "恢复标记无效，且无法隔离 {}: {}",
+            marker_path.display(),
+            error
+        )
+    })?;
+    log::error!(
+        "已隔离无效恢复标记 {}: {}",
+        quarantined.display(),
+        reason
+    );
+    Ok(())
+}
+
 fn apply_pending_restore_with_wiki_base<F>(
     app_data: &Path,
     wiki_base: &Path,
@@ -887,12 +994,17 @@ where
     if !marker_path.is_file() {
         return Ok(None);
     }
-    let pending: PendingRestore = serde_json::from_slice(
-        &std::fs::read(&marker_path).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let marker = std::fs::read(&marker_path).map_err(|error| error.to_string())?;
+    let pending: PendingRestore = match serde_json::from_slice(&marker) {
+        Ok(pending) => pending,
+        Err(error) => {
+            quarantine_restore_marker(&marker_path, &error.to_string())?;
+            return Ok(None);
+        }
+    };
     if uuid::Uuid::parse_str(&pending.token).is_err() {
-        return Err("恢复标记包含无效标识".to_string());
+        quarantine_restore_marker(&marker_path, "恢复标记包含无效标识")?;
+        return Ok(None);
     }
     let app_stage = app_data.join(format!(".restore-{}", pending.token));
     let wiki_parent = wiki_base
@@ -900,7 +1012,8 @@ where
         .ok_or_else(|| "Wiki 数据目录无效".to_string())?;
     let wiki_stage = wiki_parent.join(format!(".restore-{}", pending.token));
     if !app_stage.join("crowapi.db").is_file() {
-        return Err("待恢复数据库不存在".to_string());
+        quarantine_restore_marker(&marker_path, "待恢复数据库不存在")?;
+        return Ok(None);
     }
     let rollback = app_data
         .join("backups")
@@ -996,11 +1109,92 @@ pub fn apply_pending_restore(app_data: &Path) -> Result<Option<PathBuf>, String>
 mod tests {
     use super::{
         apply_pending_restore_with_wiki_base, decrypt_payload, encrypt_payload,
-        validate_logical_path, BackupBlob, BackupPayload, BackupSummary, PendingRestore,
+        current_schema_version, prepare_staged_database_with_store, validate_logical_path,
+        validate_payload, BackupBlob, BackupFile, BackupPayload, BackupSummary, PendingRestore,
     };
+    use crate::core::secret_store::{EncryptedSecret, SecretStore};
+    use sqlx::migrate::Migrator;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::borrow::Cow;
     use sha2::Digest;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    struct BackupTestSecretStore {
+        active_key_version: i64,
+    }
+
+    impl SecretStore for BackupTestSecretStore {
+        fn encrypt(&self, context: &str, plaintext: &str) -> Result<EncryptedSecret, String> {
+            self.encrypt_for_key_version(self.active_key_version, context, plaintext)
+        }
+
+        fn encrypt_for_key_version(
+            &self,
+            key_version: i64,
+            context: &str,
+            plaintext: &str,
+        ) -> Result<EncryptedSecret, String> {
+            let mut ciphertext = format!("{}:{}", key_version, context).into_bytes();
+            ciphertext.push(0);
+            let mask = 0x5A ^ key_version as u8;
+            ciphertext.extend(plaintext.bytes().map(|byte| byte ^ mask));
+            Ok(EncryptedSecret {
+                version: 1,
+                key_version,
+                nonce: vec![0; 24],
+                ciphertext,
+            })
+        }
+
+        fn decrypt(
+            &self,
+            context: &str,
+            version: i64,
+            key_version: i64,
+            _nonce: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<String, String> {
+            if version != 1 {
+                return Err("unsupported format".to_string());
+            }
+            let prefix = [format!("{}:{}", key_version, context).as_bytes(), &[0]].concat();
+            let mask = 0x5A ^ key_version as u8;
+            String::from_utf8(
+                ciphertext
+                    .strip_prefix(prefix.as_slice())
+                    .ok_or_else(|| "context mismatch".to_string())?
+                    .iter()
+                    .map(|byte| byte ^ mask)
+                    .collect(),
+            )
+            .map_err(|error| error.to_string())
+        }
+
+        fn active_key_version(&self) -> i64 {
+            self.active_key_version
+        }
+
+        fn ensure_key_version(&self, key_version: i64) -> Result<(), String> {
+            self.prepare_key_version(key_version)
+        }
+
+        fn prepare_key_version(&self, key_version: i64) -> Result<(), String> {
+            if key_version < 1 {
+                return Err("invalid key version".to_string());
+            }
+            Ok(())
+        }
+
+        fn set_active_key_version(&self, key_version: i64) -> Result<(), String> {
+            if key_version == self.active_key_version {
+                Ok(())
+            } else {
+                Err("immutable test store".to_string())
+            }
+        }
+    }
 
     fn temporary_directory(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1082,6 +1276,124 @@ mod tests {
         assert!(!String::from_utf8_lossy(&encrypted).contains("sk-secret"));
     }
 
+    #[tokio::test]
+    async fn staged_restore_upgrades_schema_21_and_uses_the_active_master_key() {
+        let root = temporary_directory("schema-21-key-version");
+        let database_path = root.join("crowapi.db");
+        let url = format!("sqlite://{}?mode=rwc", database_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("create schema 21 database");
+        let all_migrations = sqlx::migrate!("./migrations");
+        let legacy_migrations = all_migrations
+            .iter()
+            .filter(|migration| migration.version <= 21)
+            .cloned()
+            .collect::<Vec<_>>();
+        let legacy_migrator = Migrator {
+            migrations: Cow::Owned(legacy_migrations),
+            ..Migrator::DEFAULT
+        };
+        legacy_migrator
+            .run(&pool)
+            .await
+            .expect("apply schema 21 migrations");
+        sqlx::query(
+            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, weight, config, model_mapping, timeout_secs, created_at, updated_at)
+             VALUES ('channel-1', 'test', 'openai', 'https://api.example.com/v1', '', '[]', 1, 0, 1, '{}', '{}', 60, 'now', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert restored channel");
+        pool.close().await;
+
+        prepare_staged_database_with_store(
+            &database_path,
+            &HashMap::from([("channel-1".to_string(), "sk-restored-secret".to_string())]),
+            Arc::new(BackupTestSecretStore {
+                active_key_version: 4,
+            }),
+        )
+        .await
+        .expect("upgrade and prepare staged database");
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite://{}?mode=rw", database_path.display()))
+            .await
+            .expect("reopen prepared database");
+        let stored: (i64, i64, Vec<u8>) = sqlx::query_as(
+            "SELECT version, key_version, ciphertext FROM secure_secrets
+             WHERE owner_type = 'channel' AND owner_id = 'channel-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read restored encrypted secret");
+        assert_eq!(stored.0, 1);
+        assert_eq!(stored.1, 4);
+        assert!(!String::from_utf8_lossy(&stored.2).contains("sk-restored-secret"));
+        let active_version: i64 = sqlx::query_scalar(
+            "SELECT active_key_version FROM secret_store_metadata WHERE singleton = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read restored active key version");
+        assert_eq!(active_version, 4);
+        let schema_version: i64 = sqlx::query_scalar(
+            "SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read upgraded schema version");
+        assert_eq!(schema_version, current_schema_version());
+        pool.close().await;
+        std::fs::remove_dir_all(root).expect("remove restore test directory");
+    }
+
+    #[test]
+    fn encrypted_backup_rejects_ciphertext_tampering() {
+        let encrypted = encrypt_payload(&payload(), "correct horse battery")
+            .expect("encrypt backup");
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&encrypted).expect("decode backup envelope");
+        let ciphertext = envelope["ciphertext"]
+            .as_str()
+            .expect("read ciphertext")
+            .to_string();
+        let replacement = if ciphertext.starts_with('A') { "B" } else { "A" };
+        envelope["ciphertext"] =
+            serde_json::Value::String(format!("{}{}", replacement, &ciphertext[1..]));
+        let tampered = serde_json::to_vec(&envelope).expect("encode tampered envelope");
+
+        assert!(decrypt_payload(&tampered, "correct horse battery").is_err());
+    }
+
+    #[test]
+    fn backup_manifest_rejects_tampered_database_and_file_content() {
+        let mut database_tampered = payload();
+        database_tampered.database.data = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"tampered-snapshot",
+        );
+        assert!(validate_payload(&database_tampered).is_err());
+
+        let mut file_tampered = payload();
+        let data = b"settings";
+        file_tampered.files.push(BackupFile {
+            path: "app/settings.json".to_string(),
+            sha256: hex::encode(sha2::Sha256::digest(b"different")),
+            data: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                data,
+            ),
+        });
+        file_tampered.summary.file_count = 1;
+        file_tampered.summary.file_bytes = data.len() as u64;
+        assert!(validate_payload(&file_tampered).is_err());
+    }
+
     #[test]
     fn backup_paths_cannot_escape_managed_roots() {
         assert!(validate_logical_path("app/kb_files/doc.txt").is_ok());
@@ -1161,6 +1473,37 @@ mod tests {
         assert!(app_data
             .join(format!(".restore-{}/crowapi.db", token))
             .is_file());
+
+        std::fs::remove_dir_all(root).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn malformed_restore_marker_is_quarantined_without_touching_live_data() {
+        let root = temporary_directory("invalid-marker");
+        let app_data = root.join("app");
+        let wiki_base = root.join("data/crowapi/wiki");
+        write(&app_data.join("crowapi.db"), "live-db");
+        write(&app_data.join("restore-pending.json"), "{not-json");
+
+        let result = apply_pending_restore_with_wiki_base(&app_data, &wiki_base, |_| Ok(()))
+            .expect("quarantine malformed marker");
+
+        assert!(result.is_none());
+        assert_eq!(
+            std::fs::read_to_string(app_data.join("crowapi.db")).unwrap(),
+            "live-db"
+        );
+        assert!(!app_data.join("restore-pending.json").exists());
+        let quarantined = std::fs::read_dir(&app_data)
+            .expect("read app data")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("restore-pending.invalid-")
+            });
+        assert!(quarantined);
 
         std::fs::remove_dir_all(root).expect("remove temporary directory");
     }

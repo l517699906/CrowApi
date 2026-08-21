@@ -6,6 +6,7 @@ import {
     DownloadCloud,
     Gauge,
     Globe2,
+    KeyRound,
     Monitor,
     Palette,
     RefreshCcw,
@@ -28,14 +29,16 @@ import type { Settings, UiTheme } from "../types";
 import { PageTitle, Toast, Toggle } from "../components/ui";
 import { SecurityRulesPanel } from "../components/SecurityRulesPanel";
 import { BackupSettingsPanel } from "../components/BackupSettingsPanel";
+import { MasterKeySettingsPanel } from "../components/MasterKeySettingsPanel";
 
-type SettingsTab = "service" | "quota" | "general" | "security" | "interface" | "retry" | "backup" | "update";
+type SettingsTab = "service" | "quota" | "general" | "security" | "vault" | "interface" | "retry" | "backup" | "update";
 
 const tabs: Array<{ id: SettingsTab; label: string; icon: typeof Server }> = [
     { id: "service", label: "服务配置", icon: Server },
     { id: "quota", label: "配额管理", icon: Gauge },
     { id: "general", label: "通用设置", icon: Settings2 },
     { id: "security", label: "安全规则", icon: ShieldAlert },
+    { id: "vault", label: "密钥保险库", icon: KeyRound },
     { id: "interface", label: "界面设置", icon: Palette },
     { id: "retry", label: "重试策略", icon: RefreshCcw },
     { id: "backup", label: "备份恢复", icon: DatabaseBackup },
@@ -172,7 +175,7 @@ export function SettingsPage() {
             <PageTitle
                 title="设置"
                 meta="本地网关配置"
-                action={activeTab === "backup" ? undefined : (
+                action={activeTab === "backup" || activeTab === "vault" ? undefined : (
                     <button type="button" className="button-primary" onClick={save} disabled={saveMutation.isPending || isPending}>
                         <Save size={16} />{saveMutation.isPending ? "保存中..." : "保存更改"}
                     </button>
@@ -206,6 +209,17 @@ export function SettingsPage() {
                                 <div><h2>服务配置</h2><p>本地监听地址与端口</p></div>
                             </div>
                             <div className="settings-form-block">
+                                <div className="settings-row settings-row-bordered">
+                                    <div>
+                                        <strong>允许远程访问</strong>
+                                        <span>关闭时仅允许监听 localhost 或环回地址</span>
+                                    </div>
+                                    <Toggle
+                                        checked={draft.allow_remote_access}
+                                        label="允许远程设备访问 CrowAPI"
+                                        onChange={(checked) => updateSetting("allow_remote_access", checked)}
+                                    />
+                                </div>
                                 <div className="form-grid">
                                     <label className="field-label">
                                         <span>监听地址</span>
@@ -223,8 +237,41 @@ export function SettingsPage() {
                                         <Check size={15} className="text-accent" />
                                     </div>
                                 </label>
+                                <label className="field-label mt-5">
+                                    <span>浏览器跨域白名单</span>
+                                    <textarea
+                                        className="field-input min-h-28 resize-y font-mono text-xs"
+                                        value={draft.allowed_origins.join("\n")}
+                                        placeholder="每行填写一个完整 origin"
+                                        onChange={(event) => updateSetting(
+                                            "allowed_origins",
+                                            event.target.value.split(/\r?\n/),
+                                        )}
+                                    />
+                                    <small>仅填写协议、主机和端口；命令行客户端不受浏览器 CORS 限制。</small>
+                                </label>
+                                <label className="field-label mt-5">
+                                    <span>可信代理网段（可选）</span>
+                                    <textarea
+                                        className="field-input min-h-24 resize-y font-mono text-xs"
+                                        value={draft.trusted_proxy_cidrs.join("\n")}
+                                        placeholder="例如 10.0.0.0/8；每行一个 CIDR"
+                                        onChange={(event) => updateSetting(
+                                            "trusted_proxy_cidrs",
+                                            event.target.value.split(/\r?\n/),
+                                        )}
+                                    />
+                                    <small>仅当 TCP 连接来自这些网段时才读取 Forwarded 或 X-Forwarded-For；留空则只信任直连地址。</small>
+                                </label>
                             </div>
-                            <div className="settings-note"><CircleHelp size={17} /><span>服务配置将在网关下次启动时生效。</span></div>
+                            <div className="settings-note">
+                                {draft.allow_remote_access ? <ShieldAlert size={17} /> : <CircleHelp size={17} />}
+                                <span>
+                                    {draft.allow_remote_access
+                                        ? "远程监听不会自动启用 TLS；跨设备使用时请通过受信任的 HTTPS 反向代理暴露服务。"
+                                        : "服务配置将在网关下次启动时生效。"}
+                                </span>
+                            </div>
                         </div>
                     ) : null}
 
@@ -305,6 +352,35 @@ export function SettingsPage() {
                                 <div className="setting-row">
                                     <div><strong>关闭到托盘</strong><span>关闭窗口时不停止服务</span></div>
                                     <Toggle checked={draft.close_to_tray} label="关闭到托盘" onChange={(value) => updateSetting("close_to_tray", value)} />
+                                </div>
+                            </div>
+                            <div className="settings-form-block mt-6">
+                                <div className="settings-subheading"><strong>数据保留</strong><span>后台维护会在低频空闲周期清理已过期记录</span></div>
+                                <div className="form-grid mt-4">
+                                    <label className="field-label">
+                                        <span>请求日志保留天数</span>
+                                        <input
+                                            className="field-input font-mono"
+                                            type="number"
+                                            min="0"
+                                            max="3650"
+                                            value={draft.log_retention_days}
+                                            onChange={(event) => updateSetting("log_retention_days", Math.min(3650, Math.max(0, Math.trunc(Number(event.target.value) || 0))))}
+                                        />
+                                        <small>0 表示停用自动清理；手动删除仍可用</small>
+                                    </label>
+                                    <label className="field-label">
+                                        <span>已结束任务保留天数</span>
+                                        <input
+                                            className="field-input font-mono"
+                                            type="number"
+                                            min="0"
+                                            max="3650"
+                                            value={draft.task_retention_days}
+                                            onChange={(event) => updateSetting("task_retention_days", Math.min(3650, Math.max(0, Math.trunc(Number(event.target.value) || 0))))}
+                                        />
+                                        <small>保留父子任务和重试链引用后再清理</small>
+                                    </label>
                                 </div>
                             </div>
                         </div>
@@ -474,6 +550,19 @@ export function SettingsPage() {
                                 {updatePhase === "error" ? <p className="update-message is-error"><CircleHelp size={15} />{updateError}</p> : null}
                             </div>
                             <div className="settings-note"><CircleHelp size={17} /><span>发现新版本后会直接下载并安装，完成后自动重启应用。</span></div>
+                        </div>
+                    ) : null}
+
+                    {activeTab === "vault" ? (
+                        <div className="settings-section page-enter" key="vault">
+                            <div className="settings-heading">
+                                <span className="settings-heading-icon settings-heading-amber"><KeyRound size={19} /></span>
+                                <div><h2>密钥保险库</h2><p>本地主密钥版本与受保护密文</p></div>
+                            </div>
+                            <MasterKeySettingsPanel onNotice={(message) => {
+                                setToast(message);
+                                window.setTimeout(() => setToast(""), 1800);
+                            }} />
                         </div>
                     ) : null}
 

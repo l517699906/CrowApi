@@ -1,5 +1,6 @@
 pub mod knowledge;
 pub mod mcp;
+pub mod tasks;
 pub mod wiki;
 
 use crate::server::router::SharedState;

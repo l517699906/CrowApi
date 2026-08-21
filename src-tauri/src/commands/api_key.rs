@@ -1,5 +1,6 @@
 use crate::db::models::{ApiKey, CreateApiKeyInput, ApiKeyStats};
 use crate::db::repository::Repository;
+use crate::core::access::{normalize_access_scopes, parse_access_scopes};
 use crate::core::error::{CommandError, CommandResult, CommandResultExt};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,7 @@ pub struct ApiKeyDto {
     pub status: i64,
     pub allowed_models: Vec<String>,
     pub allowed_channels: Vec<String>,
+    pub access_scopes: Vec<String>,
     pub quota_limit: i64,
     pub quota_used: i64,
     pub expires_at: Option<String>,
@@ -39,6 +41,7 @@ impl ApiKeyDto {
             status: k.status,
             allowed_models: serde_json::from_str(&k.allowed_models).unwrap_or_default(),
             allowed_channels: serde_json::from_str(&k.allowed_channels).unwrap_or_default(),
+            access_scopes: parse_access_scopes(&k.access_scopes).unwrap_or_default(),
             quota_limit: k.quota_limit,
             quota_used: k.quota_used,
             expires_at: k.expires_at,
@@ -88,6 +91,10 @@ pub async fn create_api_key(
         return Err(CommandError::validation("密钥配额不能小于 0"));
     }
     validate_expiration(input.expires_at.as_deref())?;
+    input.access_scopes = Some(
+        normalize_access_scopes(input.access_scopes.as_deref())
+            .map_err(CommandError::validation)?,
+    );
     input.quota_limit = Some(quota_limit);
 
     let repo = Repository::new(state.db.pool.clone());
@@ -105,6 +112,7 @@ pub struct UpdateApiKeyInput {
     pub quota_limit: Option<i64>,
     pub expires_at: Option<String>,
     pub clear_expires_at: Option<bool>,
+    pub access_scopes: Option<Vec<String>>,
 }
 
 #[tauri::command]
@@ -114,6 +122,7 @@ pub async fn update_api_key(input: UpdateApiKeyInput, state: tauri::State<'_, st
         && input.quota_limit.is_none()
         && input.expires_at.is_none()
         && input.clear_expires_at != Some(true)
+        && input.access_scopes.is_none()
     {
         return Err(CommandError::validation("没有可更新的密钥字段"));
     }
@@ -129,6 +138,11 @@ pub async fn update_api_key(input: UpdateApiKeyInput, state: tauri::State<'_, st
         return Err(CommandError::validation("不能同时设置和清除密钥到期时间"));
     }
     validate_expiration(input.expires_at.as_deref())?;
+    let access_scopes = input
+        .access_scopes
+        .as_deref()
+        .map(|scopes| normalize_access_scopes(Some(scopes)).map_err(CommandError::validation))
+        .transpose()?;
 
     if let Some(status) = input.status {
         repo.update_api_key_status(&input.id, status)
@@ -144,6 +158,11 @@ pub async fn update_api_key(input: UpdateApiKeyInput, state: tauri::State<'_, st
         repo.update_api_key_expiration(&input.id, input.expires_at.as_deref())
             .await
             .command_error("API_KEY_UPDATE_FAILED", "更新访问密钥有效期失败", false)?;
+    }
+    if let Some(access_scopes) = access_scopes {
+        repo.update_api_key_access_scopes(&input.id, &access_scopes)
+            .await
+            .command_error("API_KEY_UPDATE_FAILED", "更新访问密钥权限失败", false)?;
     }
     Ok(())
 }
@@ -189,6 +208,7 @@ mod tests {
             status: 1,
             allowed_models: "[]".to_string(),
             allowed_channels: "[]".to_string(),
+            access_scopes: "[\"gateway\"]".to_string(),
             quota_limit: 0,
             quota_used: 0,
             expires_at: None,

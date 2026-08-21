@@ -1,6 +1,7 @@
 pub mod router;
 pub mod handlers;
 pub mod error;
+pub mod auth;
 
 use crate::AppState;
 use tauri::{AppHandle, Emitter};
@@ -9,6 +10,10 @@ pub async fn start_server(app: AppHandle, state: std::sync::Arc<AppState>) -> Re
     let settings = crate::config::load_settings(&app);
     let host = settings.server_host;
     let port = settings.server_port;
+
+    if !settings.allow_remote_access && !crate::config::is_loopback_host(&host) {
+        anyhow::bail!("remote server binding requires allow_remote_access");
+    }
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -26,17 +31,22 @@ pub async fn start_server(app: AppHandle, state: std::sync::Arc<AppState>) -> Re
         "server-started",
         serde_json::json!({
             "port": actual_port,
-            "url": format!("http://{}:{}", host, actual_port)
+            "url": crate::config::server_url(&host, actual_port)
         }),
     )
     .ok();
 
-    tracing::info!("CrowAPI server listening on http://{}:{}", host, actual_port);
+    tracing::info!("CrowAPI server listening on {}", crate::config::server_url(&host, actual_port));
 
     // 启动 Axum 服务（阻塞直到服务器停止）
-    axum::serve(listener, router).await?;
+    let result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await;
 
     state.server_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    *state.server_port.write().await = 0;
 
-    Ok(())
+    result.map_err(Into::into)
 }

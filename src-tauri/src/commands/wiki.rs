@@ -350,6 +350,24 @@ pub async fn search_wiki(
         .command_error("WIKI_SEARCH_FAILED", "搜索 Wiki 页面失败", true)
 }
 
+/// Paged variant for the desktop search view.  Keep `search_wiki` above
+/// unchanged so existing integrations that expect a bare result array remain
+/// compatible.
+#[tauri::command]
+pub async fn search_wiki_page(
+    state: State<'_, Arc<AppState>>,
+    projectId: String,
+    query: String,
+    topK: Option<usize>,
+    offset: Option<usize>,
+) -> CommandResult<WikiSearchPage> {
+    let pool = state.db.pool.clone();
+    let repo = crate::services::wiki::repository::WikiRepository::new(pool);
+    repo.search_pages_page(&projectId, &query, offset.unwrap_or(0), topK.unwrap_or(20))
+        .await
+        .command_error("WIKI_SEARCH_FAILED", "搜索 Wiki 页面失败", true)
+}
+
 // ── Wiki Graph ──
 
 #[tauri::command]
@@ -403,12 +421,10 @@ pub async fn ingest_wiki_source(
     sourceId: String,
 ) -> CommandResult<serde_json::Value> {
     let pool = state.db.pool.clone();
-    crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &sourceId).await
-        .map(|r| serde_json::json!({
-            "status": "done",
-            "task_id": r.task_id,
-            "pages_created": r.pages_created,
-            "page_paths": r.page_paths,
+    crate::services::wiki::ingest::start_ingest_source(&app, &pool, &projectId, &sourceId).await
+        .map(|task_id| serde_json::json!({
+            "status": "pending",
+            "task_id": task_id,
         }))
         .map_err(|error| {
             if error == crate::services::wiki::ingest::INGEST_ALREADY_RUNNING {
@@ -448,12 +464,12 @@ pub async fn rescan_wiki_sources(
     let mut results = Vec::new();
 
     for source in &pending {
-        match crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &source.id).await {
-            Ok(r) => results.push(serde_json::json!({
+        match crate::services::wiki::ingest::start_ingest_source(&app, &pool, &projectId, &source.id).await {
+            Ok(task_id) => results.push(serde_json::json!({
                 "source_id": source.id,
                 "filename": source.filename,
-                "status": "done",
-                "pages": r.pages_created,
+                "status": "pending",
+                "task_id": task_id,
             })),
             Err(error) => {
                 tracing::error!(%error, source_id = %source.id, "Wiki source rescan failed");

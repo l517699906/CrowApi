@@ -12,6 +12,12 @@ pub struct Settings {
     pub server_port: u16,
     #[serde(default = "default_host")]
     pub server_host: String,
+    #[serde(default = "default_false")]
+    pub allow_remote_access: bool,
+    #[serde(default)]
+    pub trusted_proxy_cidrs: Vec<String>,
+    #[serde(default = "default_allowed_origins")]
+    pub allowed_origins: Vec<String>,
     #[serde(default = "default_theme")]
     pub ui_theme: String,
     #[serde(default = "default_language")]
@@ -30,6 +36,10 @@ pub struct Settings {
     pub default_key_quota: i64,
     #[serde(default = "default_total_quota")]
     pub total_quota: i64,
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: i64,
+    #[serde(default = "default_task_retention_days")]
+    pub task_retention_days: i64,
     #[serde(default = "default_quota_warning_threshold")]
     pub quota_warning_threshold: i64,
     #[serde(default = "default_security_enabled")]
@@ -52,6 +62,7 @@ pub struct Settings {
 
 fn default_port() -> u16 { 8777 }
 fn default_host() -> String { "127.0.0.1".to_string() }
+fn default_allowed_origins() -> Vec<String> { crate::config::default_allowed_origins() }
 fn default_theme() -> String { DEFAULT_THEME.to_string() }
 fn default_language() -> String { "zh-CN".to_string() }
 fn default_true() -> bool { true }
@@ -60,6 +71,8 @@ fn default_retry_enabled() -> bool { true }
 fn default_retry_times() -> i32 { 2 }
 fn default_key_quota() -> i64 { crate::config::DEFAULT_KEY_QUOTA }
 fn default_total_quota() -> i64 { crate::config::DEFAULT_TOTAL_QUOTA }
+fn default_log_retention_days() -> i64 { crate::config::DEFAULT_LOG_RETENTION_DAYS }
+fn default_task_retention_days() -> i64 { crate::config::DEFAULT_TASK_RETENTION_DAYS }
 fn default_quota_warning_threshold() -> i64 { 85 }
 fn default_security_enabled() -> bool { true }
 fn default_security_mode() -> String { "audit".to_string() }
@@ -69,6 +82,9 @@ impl Default for Settings {
         Settings {
             server_port: default_port(),
             server_host: default_host(),
+            allow_remote_access: default_false(),
+            trusted_proxy_cidrs: Vec::new(),
+            allowed_origins: default_allowed_origins(),
             ui_theme: default_theme(),
             ui_language: default_language(),
             minimize_to_tray: default_true(),
@@ -78,6 +94,8 @@ impl Default for Settings {
             retry_times: default_retry_times(),
             default_key_quota: default_key_quota(),
             total_quota: default_total_quota(),
+            log_retention_days: default_log_retention_days(),
+            task_retention_days: default_task_retention_days(),
             quota_warning_threshold: default_quota_warning_threshold(),
             security_enabled: default_security_enabled(),
             security_mode: default_security_mode(),
@@ -121,6 +139,29 @@ pub async fn get_settings(app: AppHandle) -> CommandResult<Settings> {
     let settings = Settings {
         server_port: get_u64(&store, "server.port", 8777) as u16,
         server_host: get_str(&store, "server.host", "127.0.0.1"),
+        allow_remote_access: get_bool(&store, "server.allow_remote_access", false),
+        trusted_proxy_cidrs: store
+            .get("server.trusted_proxy_cidrs")
+            .and_then(|value| value.as_array().cloned())
+            .map(|values| {
+                values
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .and_then(|values| crate::config::parse_trusted_proxy_cidrs(&values).ok().map(|_| values))
+            .unwrap_or_default(),
+        allowed_origins: store
+            .get("server.allowed_origins")
+            .and_then(|value| value.as_array().cloned())
+            .map(|values| {
+                values
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .and_then(|origins| crate::config::normalize_allowed_origins(&origins).ok())
+            .unwrap_or_else(default_allowed_origins),
         ui_theme: get_str(&store, "ui.theme", DEFAULT_THEME),
         ui_language: get_str(&store, "ui.language", "zh-CN"),
         minimize_to_tray: get_bool(&store, "general.minimize_to_tray", true),
@@ -138,6 +179,16 @@ pub async fn get_settings(app: AppHandle) -> CommandResult<Settings> {
             "quota.total_limit",
             crate::config::DEFAULT_TOTAL_QUOTA,
         ),
+        log_retention_days: get_non_negative_i64(
+            &store,
+            "retention.log_days",
+            crate::config::DEFAULT_LOG_RETENTION_DAYS,
+        ),
+        task_retention_days: get_non_negative_i64(
+            &store,
+            "retention.task_days",
+            crate::config::DEFAULT_TASK_RETENTION_DAYS,
+        ),
         quota_warning_threshold: get_u64(&store, "quota.warning_threshold", 85).clamp(1, 100) as i64,
         security_enabled: get_bool(&store, "security.enabled", true),
         security_mode: get_str(&store, "security.mode", "audit"),
@@ -152,7 +203,7 @@ pub async fn get_settings(app: AppHandle) -> CommandResult<Settings> {
 }
 
 #[tauri::command]
-pub async fn save_settings(settings: Settings, app: AppHandle) -> CommandResult<()> {
+pub async fn save_settings(mut settings: Settings, app: AppHandle) -> CommandResult<()> {
     let server_host = settings.server_host.trim();
     if server_host.is_empty() {
         return Err(CommandError::validation("监听地址不能为空"));
@@ -160,11 +211,31 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> CommandResult<
     if settings.server_port < 1024 {
         return Err(CommandError::validation("服务端口必须在 1024 到 65535 之间"));
     }
+    if !settings.allow_remote_access && !crate::config::is_loopback_host(server_host) {
+        return Err(CommandError::validation(
+            "监听非本机地址前必须显式启用远程访问",
+        ));
+    }
+    settings.trusted_proxy_cidrs = settings
+        .trusted_proxy_cidrs
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    crate::config::parse_trusted_proxy_cidrs(&settings.trusted_proxy_cidrs)
+        .map_err(CommandError::validation)?;
+    settings.allowed_origins = crate::config::normalize_allowed_origins(&settings.allowed_origins)
+        .map_err(CommandError::validation)?;
     if !(0..=5).contains(&settings.retry_times) {
         return Err(CommandError::validation("最大重试次数必须在 0 到 5 之间"));
     }
     if settings.default_key_quota < 0 || settings.total_quota < 0 {
         return Err(CommandError::validation("配额不能小于 0"));
+    }
+    if !(0..=3650).contains(&settings.log_retention_days)
+        || !(0..=3650).contains(&settings.task_retention_days)
+    {
+        return Err(CommandError::validation("数据保留天数必须在 0 到 3650 之间"));
     }
     if !(1..=100).contains(&settings.quota_warning_threshold) {
         return Err(CommandError::validation("配额告警阈值必须在 1 到 100 之间"));
@@ -181,6 +252,15 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> CommandResult<
         .command_error("SETTINGS_WRITE_FAILED", "保存设置失败", false)?;
     store.set("server.port", serde_json::json!(settings.server_port));
     store.set("server.host", serde_json::json!(server_host));
+    store.set("server.allow_remote_access", settings.allow_remote_access);
+    store.set(
+        "server.trusted_proxy_cidrs",
+        serde_json::json!(settings.trusted_proxy_cidrs),
+    );
+    store.set(
+        "server.allowed_origins",
+        serde_json::json!(settings.allowed_origins),
+    );
     store.set("ui.theme", serde_json::json!(settings.ui_theme));
     store.set("ui.language", serde_json::json!(settings.ui_language));
     store.set("general.minimize_to_tray", settings.minimize_to_tray);
@@ -190,6 +270,8 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> CommandResult<
     store.set("retry.times", settings.retry_times);
     store.set("quota.default_key_limit", serde_json::json!(settings.default_key_quota));
     store.set("quota.total_limit", serde_json::json!(settings.total_quota));
+    store.set("retention.log_days", serde_json::json!(settings.log_retention_days));
+    store.set("retention.task_days", serde_json::json!(settings.task_retention_days));
     store.set("quota.warning_threshold", serde_json::json!(settings.quota_warning_threshold));
     store.set("security.enabled", settings.security_enabled);
     store.set("security.mode", serde_json::json!(settings.security_mode));

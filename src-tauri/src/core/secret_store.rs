@@ -10,62 +10,128 @@ use chacha20poly1305::{
 use keyring::{Entry, Error as KeyringError};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+};
 use zeroize::Zeroizing;
 
 const KEYRING_SERVICE: &str = "com.llf.crowapi.vault";
-const MASTER_KEY_ACCOUNT: &str = "master-key-v1";
-pub const SECRET_VERSION: i64 = 1;
+const INITIAL_KEY_VERSION: i64 = 1;
+pub const SECRET_FORMAT_VERSION: i64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct EncryptedSecret {
     pub version: i64,
+    pub key_version: i64,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
 }
 
 pub trait SecretStore: Send + Sync {
     fn encrypt(&self, context: &str, plaintext: &str) -> Result<EncryptedSecret, String>;
+    fn encrypt_for_key_version(
+        &self,
+        key_version: i64,
+        context: &str,
+        plaintext: &str,
+    ) -> Result<EncryptedSecret, String>;
     fn decrypt(
         &self,
         context: &str,
         version: i64,
+        key_version: i64,
         nonce: &[u8],
         ciphertext: &[u8],
     ) -> Result<String, String>;
+    fn active_key_version(&self) -> i64;
+    fn ensure_key_version(&self, key_version: i64) -> Result<(), String>;
+    fn prepare_key_version(&self, key_version: i64) -> Result<(), String>;
+    fn set_active_key_version(&self, key_version: i64) -> Result<(), String>;
 }
 
 struct KeyMaterial(Zeroizing<[u8; 32]>);
 
 struct KeyringSecretStore {
-    key: OnceLock<Result<Arc<KeyMaterial>, String>>,
+    active_key_version: AtomicI64,
+    keys: Mutex<HashMap<i64, Arc<KeyMaterial>>>,
 }
 
 impl KeyringSecretStore {
     fn new() -> Self {
         Self {
-            key: OnceLock::new(),
+            active_key_version: AtomicI64::new(INITIAL_KEY_VERSION),
+            keys: Mutex::new(HashMap::new()),
         }
     }
 
-    fn key(&self) -> Result<Arc<KeyMaterial>, String> {
-        self.key.get_or_init(load_or_create_master_key).clone()
+    fn key(&self, key_version: i64, create: bool) -> Result<Arc<KeyMaterial>, String> {
+        validate_key_version(key_version)?;
+        let mut keys = self
+            .keys
+            .lock()
+            .map_err(|_| "主密钥缓存不可用".to_string())?;
+        if let Some(key) = keys.get(&key_version) {
+            return Ok(key.clone());
+        }
+        let key = load_master_key(key_version, create)?;
+        keys.insert(key_version, key.clone());
+        Ok(key)
     }
 }
 
 impl SecretStore for KeyringSecretStore {
     fn encrypt(&self, context: &str, plaintext: &str) -> Result<EncryptedSecret, String> {
-        encrypt_with_key(&self.key()?.0, context, plaintext)
+        let key_version = self.active_key_version();
+        self.encrypt_for_key_version(key_version, context, plaintext)
+    }
+
+    fn encrypt_for_key_version(
+        &self,
+        key_version: i64,
+        context: &str,
+        plaintext: &str,
+    ) -> Result<EncryptedSecret, String> {
+        encrypt_with_key(&self.key(key_version, true)?.0, key_version, context, plaintext)
     }
 
     fn decrypt(
         &self,
         context: &str,
         version: i64,
+        key_version: i64,
         nonce: &[u8],
         ciphertext: &[u8],
     ) -> Result<String, String> {
-        decrypt_with_key(&self.key()?.0, context, version, nonce, ciphertext)
+        decrypt_with_key(
+            &self.key(key_version, false)?.0,
+            context,
+            version,
+            nonce,
+            ciphertext,
+        )
+    }
+
+    fn active_key_version(&self) -> i64 {
+        self.active_key_version.load(Ordering::Acquire)
+    }
+
+    fn ensure_key_version(&self, key_version: i64) -> Result<(), String> {
+        self.key(key_version, false).map(|_| ())
+    }
+
+    fn prepare_key_version(&self, key_version: i64) -> Result<(), String> {
+        self.key(key_version, true).map(|_| ())
+    }
+
+    fn set_active_key_version(&self, key_version: i64) -> Result<(), String> {
+        validate_key_version(key_version)?;
+        self.active_key_version
+            .store(key_version, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -76,27 +142,47 @@ pub fn default_secret_store() -> Arc<dyn SecretStore> {
         .clone()
 }
 
-fn load_or_create_master_key() -> Result<Arc<KeyMaterial>, String> {
-    let entry = Entry::new(KEYRING_SERVICE, MASTER_KEY_ACCOUNT)
+fn validate_key_version(key_version: i64) -> Result<(), String> {
+    if key_version < INITIAL_KEY_VERSION {
+        return Err("主密钥版本无效".to_string());
+    }
+    Ok(())
+}
+
+fn master_key_account(key_version: i64) -> Result<String, String> {
+    validate_key_version(key_version)?;
+    Ok(format!("master-key-v{}", key_version))
+}
+
+fn load_master_key(key_version: i64, create: bool) -> Result<Arc<KeyMaterial>, String> {
+    let account = master_key_account(key_version)?;
+    let entry = Entry::new(KEYRING_SERVICE, &account)
         .map_err(|error| format!("无法打开系统密钥库: {}", error))?;
-    let encoded = match entry.get_password() {
+    let encoded = Zeroizing::new(match entry.get_password() {
         Ok(value) => value,
-        Err(KeyringError::NoEntry) => {
+        Err(KeyringError::NoEntry) if create => {
             let mut key = [0_u8; 32];
             rand::rng().fill_bytes(&mut key);
             let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+            key.fill(0);
             entry
                 .set_password(&encoded)
                 .map_err(|error| format!("无法保存密钥库主密钥: {}", error))?;
             encoded
         }
+        Err(KeyringError::NoEntry) => {
+            return Err(format!("系统密钥库中缺少主密钥版本 {}", key_version));
+        }
         Err(error) => return Err(format!("无法读取密钥库主密钥: {}", error)),
-    };
+    });
 
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|_| "系统密钥库中的主密钥格式无效".to_string())?;
+    let decoded = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(|_| "系统密钥库中的主密钥格式无效".to_string())?,
+    );
     let key: [u8; 32] = decoded
+        .as_slice()
         .try_into()
         .map_err(|_| "系统密钥库中的主密钥长度无效".to_string())?;
     Ok(Arc::new(KeyMaterial(Zeroizing::new(key))))
@@ -104,9 +190,11 @@ fn load_or_create_master_key() -> Result<Arc<KeyMaterial>, String> {
 
 fn encrypt_with_key(
     key: &[u8; 32],
+    key_version: i64,
     context: &str,
     plaintext: &str,
 ) -> Result<EncryptedSecret, String> {
+    validate_key_version(key_version)?;
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| "无法初始化密钥加密器".to_string())?;
     let mut nonce = [0_u8; 24];
@@ -121,7 +209,8 @@ fn encrypt_with_key(
         )
         .map_err(|_| "加密密钥失败".to_string())?;
     Ok(EncryptedSecret {
-        version: SECRET_VERSION,
+        version: SECRET_FORMAT_VERSION,
+        key_version,
         nonce: nonce.to_vec(),
         ciphertext,
     })
@@ -134,7 +223,7 @@ fn decrypt_with_key(
     nonce: &[u8],
     ciphertext: &[u8],
 ) -> Result<String, String> {
-    if version != SECRET_VERSION || nonce.len() != 24 {
+    if version != SECRET_FORMAT_VERSION || nonce.len() != 24 {
         return Err("不支持的密钥密文版本".to_string());
     }
     let cipher = XChaCha20Poly1305::new_from_slice(key)
@@ -191,8 +280,11 @@ mod tests {
     #[test]
     fn encrypted_secret_is_bound_to_its_context() {
         let key = [7_u8; 32];
-        let encrypted = encrypt_with_key(&key, "channel:one", "sk-secret")
+        let encrypted = encrypt_with_key(&key, 2, "channel:one", "sk-secret")
             .expect("encrypt secret");
+
+        assert_eq!(encrypted.version, 1);
+        assert_eq!(encrypted.key_version, 2);
 
         assert_eq!(
             decrypt_with_key(

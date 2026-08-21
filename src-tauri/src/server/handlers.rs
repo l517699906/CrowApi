@@ -1,12 +1,13 @@
 use axum::{
     body::{to_bytes, Body},
-    extract::State,
+    extract::{Extension, State},
     http::{HeaderMap, StatusCode, header},
     response::{Json, IntoResponse, Response},
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 use super::router::SharedState;
+use super::auth::AuthenticatedPrincipal;
 use super::error::HttpError;
 use crate::core::access::{api_key_is_expired, parse_scope, scope_allows};
 use crate::core::proxy;
@@ -16,6 +17,7 @@ use crate::adaptor::{get_adaptor, prepare_channel_request, resolve_model_mapping
 use crate::core::dispatcher::Dispatcher;
 use crate::security;
 use crate::protocol;
+use tauri::Manager;
 
 async fn persist_request_log(
     repo: &Repository,
@@ -204,14 +206,16 @@ async fn persist_anthropic_aux_log(
 
 pub async fn handle_chat_completions(
     State(shared): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    handle_chat_completions_for_mode(shared, headers, body, "chat").await
+    handle_chat_completions_for_mode(shared, principal, headers, body, "chat").await
 }
 
 async fn handle_chat_completions_for_mode(
     shared: SharedState,
+    principal: AuthenticatedPrincipal,
     headers: HeaderMap,
     body: axum::body::Bytes,
     request_mode: &'static str,
@@ -228,18 +232,8 @@ async fn handle_chat_completions_for_mode(
     let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let model = json.get("model").and_then(|value| value.as_str()).unwrap_or("");
 
-    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok()).unwrap_or("");
-    let api_key = auth_header.strip_prefix("Bearer ").unwrap_or("").trim();
-
-    if api_key.is_empty() {
-        return HttpError::unauthorized("MISSING_API_KEY", "Missing API key").into_response();
-    }
-
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
-    let key_record = match repo.get_api_key_by_key(api_key).await {
-        Ok(k) => k,
-        Err(_) => return HttpError::unauthorized("INVALID_API_KEY", "Invalid API key").into_response(),
-    };
+    let key_record = principal.api_key;
     let allowed_channels = match validate_api_key_access(&key_record, model) {
         Ok(scope) => scope,
         Err(error) => return error.into_response(),
@@ -704,6 +698,7 @@ async fn handle_stream(
 
 pub async fn handle_messages(
     State(shared): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -720,25 +715,8 @@ pub async fn handle_messages(
     let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
 
-    // Extract API key from x-api-key header or Authorization Bearer
-    let api_key = match protocol::extract_api_key(&headers) {
-        Some(k) => k,
-        None => return anthropic_error_response(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "缺少 API Key",
-        ),
-    };
-
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
-    let key_record = match repo.get_api_key_by_key(&api_key).await {
-        Ok(k) => k,
-        Err(_) => return anthropic_error_response(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "API Key 无效",
-        ),
-    };
+    let key_record = principal.api_key;
     let allowed_channels = match validate_api_key_access(&key_record, &model) {
         Ok(scope) => scope,
         Err(error) => {
@@ -800,6 +778,7 @@ pub async fn handle_messages(
 /// Forward Anthropic's exact token-count request only to native Claude channels.
 pub async fn handle_messages_count_tokens(
     State(shared): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -823,28 +802,8 @@ pub async fn handle_messages_count_tokens(
             );
         }
     };
-    let api_key = match protocol::extract_api_key(&headers) {
-        Some(value) => value,
-        None => {
-            return anthropic_error_response(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "Missing API key",
-            );
-        }
-    };
-
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
-    let key_record = match repo.get_api_key_by_key(&api_key).await {
-        Ok(value) => value,
-        Err(_) => {
-            return anthropic_error_response(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "Invalid API key",
-            );
-        }
-    };
+    let key_record = principal.api_key;
     let allowed_channels = match validate_api_key_access(&key_record, &model) {
         Ok(value) => value,
         Err(error) => {
@@ -1383,6 +1342,7 @@ async fn handle_messages_stream(
 
 pub async fn handle_responses(
     State(shared): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1398,22 +1358,8 @@ pub async fn handle_responses(
     let is_stream = json.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
 
-    let api_key = match protocol::extract_api_key(&headers) {
-        Some(k) => k,
-        None => return HttpError::unauthorized(
-            "MISSING_API_KEY",
-            "缺少 API Key",
-        ).into_response(),
-    };
-
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
-    let key_record = match repo.get_api_key_by_key(&api_key).await {
-        Ok(k) => k,
-        Err(_) => return HttpError::unauthorized(
-            "INVALID_API_KEY",
-            "API Key 无效",
-        ).into_response(),
-    };
+    let key_record = principal.api_key;
     let allowed_channels = match validate_api_key_access(&key_record, &model) {
         Ok(scope) => scope,
         Err(error) => return error.into_response(),
@@ -1870,6 +1816,7 @@ fn convert_chat_sse_event(
 /// so all authentication, quota, routing, security, and retry behavior stays shared.
 pub async fn handle_completions(
     State(shared): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1918,7 +1865,14 @@ pub async fn handle_completions(
             error,
         ).into_response(),
     };
-    let chat_response = handle_chat_completions_for_mode(shared, headers, translated, "completion").await;
+    let chat_response = handle_chat_completions_for_mode(
+        shared,
+        principal,
+        headers,
+        translated,
+        "completion",
+    )
+    .await;
     if !chat_response.status().is_success() {
         return chat_response;
     }
@@ -2030,6 +1984,7 @@ fn build_embedding_forward_body(
 
 pub async fn handle_embeddings(
     State(shared): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -2042,22 +1997,8 @@ pub async fn handle_embeddings(
         ).into_response(),
     };
 
-    let api_key = match protocol::extract_api_key(&headers) {
-        Some(k) => k,
-        None => return HttpError::unauthorized(
-            "MISSING_API_KEY",
-            "缺少 API Key",
-        ).into_response(),
-    };
-
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
-    let key_record = match repo.get_api_key_by_key(&api_key).await {
-        Ok(k) => k,
-        Err(_) => return HttpError::unauthorized(
-            "INVALID_API_KEY",
-            "API Key 无效",
-        ).into_response(),
-    };
+    let key_record = principal.api_key;
 
     let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     if model.is_empty() || json.get("input").is_none() {
@@ -2336,23 +2277,10 @@ pub async fn handle_embeddings(
 
 pub async fn handle_list_models(
     State(shared): State<SharedState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Response {
     let repo = Repository::new(shared.state.db.pool.clone());
-    let api_key = match protocol::extract_api_key(&headers) {
-        Some(key) => key,
-        None => return HttpError::unauthorized(
-            "MISSING_API_KEY",
-            "缺少 API Key",
-        ).into_response(),
-    };
-    let key_record = match repo.get_api_key_by_key(&api_key).await {
-        Ok(key) => key,
-        Err(_) => return HttpError::unauthorized(
-            "INVALID_API_KEY",
-            "API Key 无效",
-        ).into_response(),
-    };
+    let key_record = principal.api_key;
     let (allowed_models, allowed_channels) = match validate_api_key_scopes(&key_record) {
         Ok(scopes) => scopes,
         Err(error) => return error.into_response(),
@@ -2401,21 +2329,30 @@ pub async fn handle_list_models(
     }
 }
 
-pub async fn handle_images(State(_shared): State<SharedState>) -> Response {
+pub async fn handle_images(
+    State(_shared): State<SharedState>,
+    Extension(_principal): Extension<AuthenticatedPrincipal>,
+) -> Response {
     HttpError::not_implemented(
         "IMAGES_NOT_IMPLEMENTED",
         "图像接口暂未实现",
     ).into_response()
 }
 
-pub async fn handle_audio_transcriptions(State(_shared): State<SharedState>) -> Response {
+pub async fn handle_audio_transcriptions(
+    State(_shared): State<SharedState>,
+    Extension(_principal): Extension<AuthenticatedPrincipal>,
+) -> Response {
     HttpError::not_implemented(
         "AUDIO_TRANSCRIPTIONS_NOT_IMPLEMENTED",
         "音频转写接口暂未实现",
     ).into_response()
 }
 
-pub async fn handle_audio_speech(State(_shared): State<SharedState>) -> Response {
+pub async fn handle_audio_speech(
+    State(_shared): State<SharedState>,
+    Extension(_principal): Extension<AuthenticatedPrincipal>,
+) -> Response {
     HttpError::not_implemented(
         "AUDIO_SPEECH_NOT_IMPLEMENTED",
         "语音合成接口暂未实现",
@@ -2425,12 +2362,136 @@ pub async fn handle_audio_speech(State(_shared): State<SharedState>) -> Response
 pub async fn handle_health(State(shared): State<SharedState>) -> Response {
     let port = shared.state.server_port.read().await.clone();
     let running = shared.state.server_running.load(std::sync::atomic::Ordering::SeqCst);
+    let host = crate::config::load_settings(&shared.app).server_host;
     Json(serde_json::json!({
         "status": "ok",
         "running": running,
+        "liveness": true,
         "port": port,
-        "url": format!("http://127.0.0.1:{}", port),
+        "url": crate::config::server_url(&host, port),
     })).into_response()
+}
+
+pub async fn handle_health_live(State(shared): State<SharedState>) -> Response {
+    let running = shared.state.server_running.load(std::sync::atomic::Ordering::SeqCst);
+    let status = if running { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if running { "alive" } else { "starting" },
+            "running": running,
+        })),
+    )
+        .into_response()
+}
+
+pub async fn handle_health_ready(State(shared): State<SharedState>) -> Response {
+    const MAX_READY_TASK_BACKLOG: i64 = 10_000;
+    let running = shared.state.server_running.load(std::sync::atomic::Ordering::SeqCst);
+    let db_check = sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&shared.state.db.pool)
+        .await;
+    let migration_check = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success = 1",
+    )
+    .fetch_one(&shared.state.db.pool)
+    .await;
+    let expected_schema = sqlx::migrate!("./migrations")
+        .iter()
+        .map(|migration| migration.version as i64)
+        .max()
+        .unwrap_or(0);
+    let backlog = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM background_tasks WHERE status IN ('pending', 'running')",
+    )
+    .fetch_one(&shared.state.db.pool)
+    .await
+    .ok();
+    let app_data_dir = shared.app.path().app_data_dir().ok();
+    let disk_writable = app_data_dir
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.is_dir() && !metadata.permissions().readonly());
+    let maintenance_idle = shared.state.maintenance_lock.try_lock().is_ok();
+    let db_ready = db_check.is_ok();
+    let migration_version = migration_check.unwrap_or(0);
+    let migrations_ready = migration_version >= expected_schema;
+    let backlog_healthy = backlog.is_some_and(|value| value < MAX_READY_TASK_BACKLOG);
+    let ready = running
+        && db_ready
+        && migrations_ready
+        && disk_writable
+        && maintenance_idle
+        && backlog_healthy;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "running": running,
+            "database": db_ready,
+            "maintenance": if maintenance_idle { "idle" } else { "busy" },
+            "disk": {
+                "writable": disk_writable,
+                "path_available": app_data_dir.is_some(),
+            },
+            "migrations": {
+                "current": migration_version,
+                "expected": expected_schema,
+                "ready": migrations_ready,
+            },
+            "background_tasks": {
+                "backlog": backlog,
+                "healthy": backlog_healthy,
+                "ready_threshold": MAX_READY_TASK_BACKLOG,
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// Authenticated operational diagnostics. Keep this separate from readiness so
+/// probes stay cheap and remote operators can inspect failure reasons safely.
+pub async fn handle_diagnostics(
+    State(shared): State<SharedState>,
+    Extension(_principal): Extension<AuthenticatedPrincipal>,
+) -> Response {
+    let integrity = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+        .fetch_one(&shared.state.db.pool)
+        .await
+        .ok();
+    let task_counts = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, COUNT(*) FROM background_tasks GROUP BY status ORDER BY status",
+    )
+    .fetch_all(&shared.state.db.pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(status, count)| (status, count))
+    .collect::<std::collections::BTreeMap<_, _>>();
+    let log_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_logs")
+        .fetch_one(&shared.state.db.pool)
+        .await
+        .ok();
+    let api_key_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM api_keys")
+        .fetch_one(&shared.state.db.pool)
+        .await
+        .ok();
+    let running = shared.state.server_running.load(std::sync::atomic::Ordering::SeqCst);
+    Json(serde_json::json!({
+        "server": { "running": running },
+        "database": {
+            "integrity": integrity,
+            "logs": log_count,
+            "api_keys": api_key_count,
+        },
+        "background_tasks": task_counts,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

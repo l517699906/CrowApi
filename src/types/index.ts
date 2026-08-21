@@ -173,6 +173,8 @@ export interface UpdateBuiltinRuleInput {
     enabled?: boolean;
 }
 
+export type ApiAccessScope = "gateway" | "mcp:read" | "mcp:write" | "admin";
+
 export interface ApiKey {
     id: string;
     name: string;
@@ -180,6 +182,7 @@ export interface ApiKey {
     status: number;
     allowed_models: string[];
     allowed_channels: string[];
+    access_scopes: ApiAccessScope[];
     quota_limit: number;
     quota_used: number;
     expires_at: string | null;
@@ -192,6 +195,7 @@ export interface CreateApiKeyInput {
     quota_limit: number;
     allowed_models: string[];
     allowed_channels: string[];
+    access_scopes: ApiAccessScope[];
     expires_at: string | null;
 }
 
@@ -201,6 +205,7 @@ export interface UpdateApiKeyInput {
     quota_limit?: number;
     expires_at?: string;
     clear_expires_at?: boolean;
+    access_scopes?: ApiAccessScope[];
 }
 
 export type RiskLevel = "clean" | "info" | "low" | "medium" | "high" | "critical";
@@ -338,6 +343,9 @@ export type UiTheme =
 export interface Settings {
     server_port: number;
     server_host: string;
+    allow_remote_access: boolean;
+    trusted_proxy_cidrs: string[];
+    allowed_origins: string[];
     ui_theme: UiTheme;
     ui_language: string;
     minimize_to_tray: boolean;
@@ -348,6 +356,8 @@ export interface Settings {
     default_key_quota: number;
     total_quota: number;
     quota_warning_threshold: number;
+    log_retention_days: number;
+    task_retention_days: number;
     security_enabled: boolean;
     security_mode: string;
     security_scan_unicode: boolean;
@@ -356,6 +366,24 @@ export interface Settings {
     security_scan_response: boolean;
     security_redact_secrets: boolean;
     security_block_on_critical: boolean;
+}
+
+export interface MasterKeyVersionUsage {
+    keyVersion: number;
+    secretCount: number;
+}
+
+export interface MasterKeyStatus {
+    activeKeyVersion: number;
+    totalSecrets: number;
+    versions: MasterKeyVersionUsage[];
+}
+
+export interface MasterKeyRotationResult {
+    previousKeyVersion: number;
+    activeKeyVersion: number;
+    rotatedSecrets: number;
+    retainedKeyVersions: number[];
 }
 
 export interface ServerStatus {
@@ -382,6 +410,8 @@ export interface KnowledgeBase {
     included_files: string;
     embedding_dim: number;
     index_status: string;
+    content_revision: number;
+    config_revision: number;
     embedding_batch_size: number;
     created_at: string;
     updated_at: string;
@@ -399,12 +429,19 @@ export interface KbDocument {
     token_count: number;
     status: string;
     error_message: string | null;
+    source_id: string | null;
     source_type: string;
     source_url: string | null;
     source_path: string | null;
     doc_meta: string;
+    processed_config_revision: number;
     created_at: string;
     updated_at: string;
+}
+
+export interface StartedDocumentTask {
+    document: KbDocument;
+    task_id: string;
 }
 
 export interface KbConversation {
@@ -432,6 +469,15 @@ export interface KbSource {
     updated_at: string;
 }
 
+export interface StartedSourceTask {
+    source: KbSource;
+    task_id: string;
+}
+
+export interface StartedTask {
+    task_id: string;
+}
+
 export interface KbIndexMeta {
     kb_id: string;
     index_type: string;
@@ -440,6 +486,11 @@ export interface KbIndexMeta {
     index_path: string | null;
     built_at: string | null;
     status: string;
+    indexed_revision: number;
+    format_version: number;
+    config_revision: number;
+    content_fingerprint: string | null;
+    index_checksum: string | null;
 }
 
 export interface ConversationMessage {
@@ -500,4 +551,67 @@ export interface ServiceStatus {
         retryable: boolean;
     }>;
     stats: Record<string, unknown>;
+}
+
+export type BackgroundTaskStatus =
+    | "pending"
+    | "running"
+    | "succeeded"
+    | "failed"
+    | "cancelled"
+    | "interrupted";
+
+export interface BackgroundTask {
+    id: string;
+    domain: string;
+    taskType: string;
+    resourceType: string;
+    resourceId: string;
+    subjectId: string | null;
+    parentTaskId: string | null;
+    idempotencyKey: string | null;
+    retryOf: string | null;
+    status: BackgroundTaskStatus;
+    stage: string;
+    progress: number;
+    totalItems: number;
+    doneItems: number;
+    payloadJson: string;
+    resultJson: string | null;
+    errorMessage: string | null;
+    retryable: number;
+    autoResume: number;
+    cancelRequested: number;
+    attempt: number;
+    createdAt: string;
+    startedAt: string | null;
+    updatedAt: string;
+    completedAt: string | null;
+    leaseOwner: string | null;
+    leaseUntil: string | null;
+    heartbeatAt: string | null;
+    nextRetryAt: string | null;
+    maxAttempts: number;
+    deadLetter: number;
+}
+
+export interface BackgroundTaskFilter {
+    domain?: string;
+    resourceType?: string;
+    resourceId?: string;
+    status?: BackgroundTaskStatus;
+    limit?: number;
+}
+
+export interface BackgroundTaskEvent {
+    taskId: string;
+    domain: string;
+    resourceType: string;
+    resourceId: string;
+    subjectId: string | null;
+    parentTaskId: string | null;
+    status: BackgroundTaskStatus;
+    stage: string;
+    progress: number;
+    detail: string | null;
 }

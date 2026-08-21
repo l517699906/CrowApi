@@ -8,9 +8,12 @@ pub mod index;
 pub mod retriever;
 pub mod rag;
 pub mod processor;
+pub mod reprocessor;
 pub mod handlers;
 pub mod routes;
 pub mod importer;
+pub mod storage;
+pub mod lifecycle;
 
 use async_trait::async_trait;
 use axum::Router;

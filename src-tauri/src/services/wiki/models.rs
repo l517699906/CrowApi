@@ -134,6 +134,17 @@ pub struct WikiSearchResult {
     pub page_type: String,
 }
 
+/// A paged Wiki search response. `WikiSearchResult` remains the item-level
+/// contract used by the existing MCP and Tauri callers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiSearchPage {
+    pub results: Vec<WikiSearchResult>,
+    pub total: i64,
+    pub offset: usize,
+    pub limit: usize,
+    pub query: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WikiAskInput {
     pub question: String,

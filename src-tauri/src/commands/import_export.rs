@@ -183,6 +183,20 @@ pub struct ImportResult {
     pub errors: Vec<String>,
 }
 
+fn plaintext_key_count(backup: &CrowcodeBackup) -> usize {
+    let Some(settings) = backup.ai_settings.as_ref() else {
+        return 0;
+    };
+    usize::from(settings.api_key.as_deref().is_some_and(|key| !key.is_empty()))
+        + settings
+            .custom_providers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|provider| provider.api_key.as_deref().is_some_and(|key| !key.is_empty()))
+            .count()
+}
+
 // ─── Commands ───────────────────────────────────────────────────────────────
 
 /// Export all channels as a CrowAPI JSON backup
@@ -212,6 +226,7 @@ pub async fn export_channels(
 #[tauri::command]
 pub async fn import_crowcode_backup(
     content: String,
+    allow_plaintext_keys: Option<bool>,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> CommandResult<ImportResult> {
     validate_import_content_size(&content)?;
@@ -222,6 +237,18 @@ pub async fn import_crowcode_backup(
             false,
         )
     })?;
+    let plaintext_keys = plaintext_key_count(&backup);
+    if plaintext_keys > 0 && !allow_plaintext_keys.unwrap_or(false) {
+        return Err(CommandError::new(
+            "IMPORT_PLAINTEXT_KEY_CONFIRMATION_REQUIRED",
+            "Crowcode 备份包含明文 API Key，需要明确确认后才能导入",
+            false,
+        )
+        .with_details(serde_json::json!({
+            "plaintext_keys": plaintext_keys,
+            "legacy_format": true,
+        })));
+    }
 
     let repo = Repository::new(state.db.pool.clone());
     let existing = repo
@@ -888,7 +915,10 @@ fn guess_channel_type(base_url: &str, api_format: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_crowapi_export, CrowAPIExport, ExportedChannel, ScannedSource};
+    use super::{
+        plaintext_key_count, validate_crowapi_export, CrowAPIExport, CrowcodeAiSettings,
+        CrowcodeBackup, CrowcodeProvider, ExportedChannel, ScannedSource,
+    };
     use crate::db::models::Channel;
 
     fn channel_with_secret() -> Channel {
@@ -969,5 +999,42 @@ mod tests {
             validate_crowapi_export(&export).unwrap_err().code,
             "IMPORT_SECRET_POLICY_INVALID",
         );
+    }
+
+    #[test]
+    fn legacy_plaintext_key_count_covers_main_and_custom_providers() {
+        let backup = CrowcodeBackup {
+            version: serde_json::json!(1),
+            r#type: None,
+            ai_settings: Some(CrowcodeAiSettings {
+                provider: None,
+                provider_type: None,
+                api_key: Some("main-secret".to_string()),
+                base_url: Some("https://api.example.com/v1".to_string()),
+                model: None,
+                custom_models: None,
+                custom_providers: Some(vec![
+                    CrowcodeProvider {
+                        name: "one".to_string(),
+                        api_key: Some("provider-secret".to_string()),
+                        base_url: "https://one.example.com".to_string(),
+                        model: None,
+                        custom_models: None,
+                        api_format: None,
+                        enabled: None,
+                    },
+                    CrowcodeProvider {
+                        name: "two".to_string(),
+                        api_key: None,
+                        base_url: "http://localhost:11434".to_string(),
+                        model: None,
+                        custom_models: None,
+                        api_format: None,
+                        enabled: None,
+                    },
+                ]),
+            }),
+        };
+        assert_eq!(plaintext_key_count(&backup), 2);
     }
 }

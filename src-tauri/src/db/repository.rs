@@ -7,6 +7,7 @@ use sqlx::{
     sqlite::SqliteQueryResult, QueryBuilder, Sqlite, SqlitePool, Transaction,
 };
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 fn require_single_row(result: SqliteQueryResult) -> Result<(), sqlx::Error> {
     if result.rows_affected() == 1 {
@@ -23,6 +24,17 @@ fn secret_error(error: impl Into<String>) -> sqlx::Error {
 #[derive(sqlx::FromRow)]
 struct StoredSecret {
     version: i64,
+    key_version: i64,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RotatableSecret {
+    owner_type: String,
+    owner_id: String,
+    version: i64,
+    key_version: i64,
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
 }
@@ -33,10 +45,41 @@ struct PreparedChannelSecret {
     encrypted: EncryptedSecret,
 }
 
+struct PreparedApiKeyDigest {
+    lookup: String,
+    encoded_hash: String,
+    prefix: String,
+    last_four: String,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SecretMigrationReport {
     pub channels_migrated: usize,
     pub api_keys_migrated: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterKeyVersionUsage {
+    pub key_version: i64,
+    pub secret_count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterKeyStatus {
+    pub active_key_version: i64,
+    pub total_secrets: i64,
+    pub versions: Vec<MasterKeyVersionUsage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterKeyRotationReport {
+    pub previous_key_version: i64,
+    pub active_key_version: i64,
+    pub rotated_secrets: usize,
+    pub retained_key_versions: Vec<i64>,
 }
 
 pub struct Repository {
@@ -82,10 +125,11 @@ impl Repository {
         now: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO secure_secrets (owner_type, owner_id, version, nonce, ciphertext, last_four, created_at, updated_at)
-             VALUES ('channel', ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO secure_secrets (owner_type, owner_id, version, key_version, nonce, ciphertext, last_four, created_at, updated_at)
+             VALUES ('channel', ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(owner_type, owner_id) DO UPDATE SET
                  version = excluded.version,
+                 key_version = excluded.key_version,
                  nonce = excluded.nonce,
                  ciphertext = excluded.ciphertext,
                  last_four = excluded.last_four,
@@ -93,6 +137,7 @@ impl Repository {
         )
         .bind(channel_id)
         .bind(prepared.encrypted.version)
+        .bind(prepared.encrypted.key_version)
         .bind(&prepared.encrypted.nonce)
         .bind(&prepared.encrypted.ciphertext)
         .bind(&prepared.last_four)
@@ -108,7 +153,7 @@ impl Repository {
             return Ok(channel);
         };
         let stored = sqlx::query_as::<_, StoredSecret>(
-            "SELECT version, nonce, ciphertext FROM secure_secrets WHERE owner_type = 'channel' AND owner_id = ?",
+            "SELECT version, key_version, nonce, ciphertext FROM secure_secrets WHERE owner_type = 'channel' AND owner_id = ?",
         )
         .bind(&channel.id)
         .fetch_one(&self.pool)
@@ -118,11 +163,159 @@ impl Repository {
             .decrypt(
                 secret_ref,
                 stored.version,
+                stored.key_version,
                 &stored.nonce,
                 &stored.ciphertext,
             )
             .map_err(secret_error)?;
         Ok(channel)
+    }
+
+    pub async fn master_key_status(&self) -> Result<MasterKeyStatus, sqlx::Error> {
+        let active_key_version: i64 = sqlx::query_scalar(
+            "SELECT active_key_version FROM secret_store_metadata WHERE singleton = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let version_rows = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT key_version, COUNT(*) FROM secure_secrets GROUP BY key_version ORDER BY key_version",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let versions = version_rows
+            .into_iter()
+            .map(|(key_version, secret_count)| MasterKeyVersionUsage {
+                key_version,
+                secret_count,
+            })
+            .collect::<Vec<_>>();
+        let total_secrets = versions.iter().map(|item| item.secret_count).sum();
+        Ok(MasterKeyStatus {
+            active_key_version,
+            total_secrets,
+            versions,
+        })
+    }
+
+    pub async fn rotate_master_key(&self) -> Result<MasterKeyRotationReport, sqlx::Error> {
+        let before = self.master_key_status().await?;
+        let highest_used_version = before
+            .versions
+            .iter()
+            .map(|item| item.key_version)
+            .max()
+            .unwrap_or(before.active_key_version);
+        let next_key_version = highest_used_version
+            .max(before.active_key_version)
+            .checked_add(1)
+            .ok_or_else(|| secret_error("主密钥版本已达到上限"))?;
+        self.secrets
+            .prepare_key_version(next_key_version)
+            .map_err(secret_error)?;
+
+        let mut transaction = self.pool.begin().await?;
+        require_single_row(
+            sqlx::query(
+                "UPDATE secret_store_metadata SET updated_at = updated_at WHERE singleton = 1",
+            )
+            .execute(&mut *transaction)
+            .await?,
+        )?;
+        let transactional_active: i64 = sqlx::query_scalar(
+            "SELECT active_key_version FROM secret_store_metadata WHERE singleton = 1",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if transactional_active != before.active_key_version {
+            return Err(secret_error("主密钥版本已被其他轮换操作更新，请重试"));
+        }
+
+        let stored = sqlx::query_as::<_, RotatableSecret>(
+            "SELECT owner_type, owner_id, version, key_version, nonce, ciphertext
+             FROM secure_secrets ORDER BY owner_type, owner_id",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        let now = now_iso();
+        for item in &stored {
+            let context = format!("{}:{}", item.owner_type, item.owner_id);
+            let plaintext = Zeroizing::new(
+                self.secrets
+                    .decrypt(
+                        &context,
+                        item.version,
+                        item.key_version,
+                        &item.nonce,
+                        &item.ciphertext,
+                    )
+                    .map_err(secret_error)?,
+            );
+            let encrypted = self
+                .secrets
+                .encrypt_for_key_version(next_key_version, &context, plaintext.as_str())
+                .map_err(secret_error)?;
+            let verified = Zeroizing::new(
+                self.secrets
+                    .decrypt(
+                        &context,
+                        encrypted.version,
+                        encrypted.key_version,
+                        &encrypted.nonce,
+                        &encrypted.ciphertext,
+                    )
+                    .map_err(secret_error)?,
+            );
+            if verified.as_str() != plaintext.as_str() {
+                return Err(secret_error("主密钥轮换后的密文验证失败"));
+            }
+            require_single_row(
+                sqlx::query(
+                    "UPDATE secure_secrets
+                     SET version = ?, key_version = ?, nonce = ?, ciphertext = ?, updated_at = ?
+                     WHERE owner_type = ? AND owner_id = ? AND version = ? AND key_version = ?",
+                )
+                .bind(encrypted.version)
+                .bind(encrypted.key_version)
+                .bind(encrypted.nonce)
+                .bind(encrypted.ciphertext)
+                .bind(&now)
+                .bind(&item.owner_type)
+                .bind(&item.owner_id)
+                .bind(item.version)
+                .bind(item.key_version)
+                .execute(&mut *transaction)
+                .await?,
+            )?;
+        }
+        require_single_row(
+            sqlx::query(
+                "UPDATE secret_store_metadata SET active_key_version = ?, updated_at = ? WHERE singleton = 1",
+            )
+            .bind(next_key_version)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?,
+        )?;
+        transaction.commit().await?;
+        self.secrets
+            .set_active_key_version(next_key_version)
+            .map_err(secret_error)?;
+
+        let mut retained_key_versions = before
+            .versions
+            .iter()
+            .map(|item| item.key_version)
+            .chain(std::iter::once(before.active_key_version))
+            .filter(|version| *version != next_key_version)
+            .collect::<Vec<_>>();
+        retained_key_versions.sort_unstable();
+        retained_key_versions.dedup();
+        Ok(MasterKeyRotationReport {
+            previous_key_version: before.active_key_version,
+            active_key_version: next_key_version,
+            rotated_secrets: stored.len(),
+            retained_key_versions,
+        })
     }
 
     // ==================== Channel ====================
@@ -342,18 +535,40 @@ impl Repository {
     // ==================== API Key ====================
 
     pub async fn migrate_legacy_secrets(&self) -> Result<SecretMigrationReport, sqlx::Error> {
-        let mut report = SecretMigrationReport::default();
         let legacy_channels = sqlx::query_as::<_, (String, String)>(
-            "SELECT id, api_key FROM channels WHERE secret_ref IS NULL AND api_key != ''",
+            "SELECT id, api_key FROM channels WHERE secret_ref IS NULL AND api_key != '' ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await?;
+        let prepared_channels = legacy_channels
+            .into_iter()
+            .map(|(id, plaintext)| {
+                let prepared = self.prepare_channel_secret(&id, &plaintext)?;
+                Ok((id, prepared))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
-        for (id, plaintext) in legacy_channels {
-            let prepared = self.prepare_channel_secret(&id, &plaintext)?;
-            let now = now_iso();
-            let mut transaction = self.pool.begin().await?;
-            Self::upsert_channel_secret(&mut transaction, &id, &prepared, &now).await?;
+        let legacy_api_keys = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, key FROM api_keys WHERE key_hash IS NULL AND key != '' ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let prepared_api_keys = legacy_api_keys
+            .into_iter()
+            .map(|(id, plaintext)| {
+                let prepared = Self::prepare_api_key_digest(&plaintext)?;
+                Ok((id, prepared))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        if prepared_channels.is_empty() && prepared_api_keys.is_empty() {
+            return Ok(SecretMigrationReport::default());
+        }
+
+        let now = now_iso();
+        let mut transaction = self.pool.begin().await?;
+        for (id, prepared) in &prepared_channels {
+            Self::upsert_channel_secret(&mut transaction, id, prepared, &now).await?;
             let result = sqlx::query(
                 "UPDATE channels SET api_key = ?, secret_ref = ?, api_key_last4 = ?, updated_at = ? WHERE id = ? AND secret_ref IS NULL",
             )
@@ -364,41 +579,57 @@ impl Repository {
             .bind(&id)
             .execute(&mut *transaction)
             .await?;
-            if result.rows_affected() == 1 {
-                transaction.commit().await?;
-                report.channels_migrated += 1;
-            }
+            require_single_row(result)?;
         }
 
-        let legacy_api_keys = sqlx::query_as::<_, (String, String)>(
-            "SELECT id, key FROM api_keys WHERE key_hash IS NULL AND key != ''",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        for (id, plaintext) in legacy_api_keys {
-            self.persist_api_key_digest(&id, &plaintext).await?;
-            report.api_keys_migrated += 1;
+        for (id, prepared) in &prepared_api_keys {
+            Self::persist_api_key_digest_in(&mut transaction, id, prepared, &now).await?;
         }
+        transaction.commit().await?;
 
-        Ok(report)
+        Ok(SecretMigrationReport {
+            channels_migrated: prepared_channels.len(),
+            api_keys_migrated: prepared_api_keys.len(),
+        })
     }
 
     async fn persist_api_key_digest(&self, id: &str, plaintext: &str) -> Result<(), sqlx::Error> {
+        let prepared = Self::prepare_api_key_digest(plaintext)?;
+        let now = now_iso();
+        let mut transaction = self.pool.begin().await?;
+        Self::persist_api_key_digest_in(&mut transaction, id, &prepared, &now).await?;
+        transaction.commit().await
+    }
+
+    fn prepare_api_key_digest(plaintext: &str) -> Result<PreparedApiKeyDigest, sqlx::Error> {
         let lookup = api_key_lookup(plaintext);
         let encoded_hash = hash_api_key(plaintext).map_err(secret_error)?;
         let (prefix, last_four) = key_preview_parts(plaintext);
-        let now = now_iso();
+        Ok(PreparedApiKeyDigest {
+            lookup,
+            encoded_hash,
+            prefix,
+            last_four,
+        })
+    }
+
+    async fn persist_api_key_digest_in(
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        prepared: &PreparedApiKeyDigest,
+        now: &str,
+    ) -> Result<(), sqlx::Error> {
         let result = sqlx::query(
-            "UPDATE api_keys SET key = ?, key_lookup = ?, key_hash = ?, key_prefix = ?, key_last4 = ?, updated_at = ? WHERE id = ?",
+            "UPDATE api_keys SET key = ?, key_lookup = ?, key_hash = ?, key_prefix = ?, key_last4 = ?, updated_at = ? WHERE id = ? AND key_hash IS NULL",
         )
         .bind(format!("redacted:{}", id))
-        .bind(lookup)
-        .bind(encoded_hash)
-        .bind(prefix)
-        .bind(last_four)
+        .bind(&prepared.lookup)
+        .bind(&prepared.encoded_hash)
+        .bind(&prepared.prefix)
+        .bind(&prepared.last_four)
         .bind(now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await?;
         require_single_row(result)
     }
@@ -450,10 +681,15 @@ impl Repository {
         let (prefix, last_four) = key_preview_parts(&key);
         let allowed_models = serde_json::to_string(&input.allowed_models.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
         let allowed_channels = serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
+        let access_scopes = serde_json::to_string(
+            &crate::core::access::normalize_access_scopes(input.access_scopes.as_deref())
+                .map_err(secret_error)?,
+        )
+        .map_err(|error| secret_error(error.to_string()))?;
 
         sqlx::query(
-            "INSERT INTO api_keys (id, name, key, key_lookup, key_hash, key_prefix, key_last4, status, allowed_models, allowed_channels, quota_limit, quota_used, expires_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 0, ?, ?, ?)"
+            "INSERT INTO api_keys (id, name, key, key_lookup, key_hash, key_prefix, key_last4, status, allowed_models, allowed_channels, access_scopes, quota_limit, quota_used, expires_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 0, ?, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
@@ -464,6 +700,7 @@ impl Repository {
         .bind(&last_four)
         .bind(&allowed_models)
         .bind(&allowed_channels)
+        .bind(&access_scopes)
         .bind(input.quota_limit.unwrap_or(-1))
         .bind(&input.expires_at)
         .bind(&now)
@@ -513,6 +750,27 @@ impl Repository {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        require_single_row(result)
+    }
+
+    pub async fn update_api_key_access_scopes(
+        &self,
+        id: &str,
+        access_scopes: &[String],
+    ) -> Result<(), sqlx::Error> {
+        let normalized = crate::core::access::normalize_access_scopes(Some(access_scopes))
+            .map_err(secret_error)?;
+        let encoded = serde_json::to_string(&normalized)
+            .map_err(|error| secret_error(error.to_string()))?;
+        let now = now_iso();
+        let result = sqlx::query(
+            "UPDATE api_keys SET access_scopes = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(encoded)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         require_single_row(result)
     }
 
@@ -627,26 +885,58 @@ impl Repository {
     }
 
     pub async fn delete_logs_before(&self, before_date: &str) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM request_logs WHERE created_at < ?")
-            .bind(before_date)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+        self.purge_logs_before(before_date, i64::MAX).await
     }
 
     pub async fn delete_all_logs(&self) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM request_logs")
-            .execute(&self.pool)
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM request_security_findings")
+            .execute(&mut *transaction)
             .await?;
+        let result = sqlx::query("DELETE FROM request_logs")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         Ok(result.rows_affected())
     }
 
     pub async fn delete_log(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM request_security_findings WHERE log_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM request_logs WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Delete a bounded batch of old logs and their findings in one transaction.
+    /// The bound keeps the maintenance loop from monopolizing SQLite's writer lock.
+    pub async fn purge_logs_before(&self, before_date: &str, limit: i64) -> Result<u64, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM request_logs WHERE created_at < ? ORDER BY created_at ASC LIMIT ?",
+        )
+        .bind(before_date)
+        .bind(limit.max(1))
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut deleted = 0;
+        for id in ids {
+            sqlx::query("DELETE FROM request_security_findings WHERE log_id = ?")
+                .bind(&id)
+                .execute(&mut *transaction)
+                .await?;
+            let result = sqlx::query("DELETE FROM request_logs WHERE id = ?")
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+            deleted += result.rows_affected();
+        }
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     pub async fn get_logs(&self, limit: i64, offset: i64) -> Result<Vec<RequestLog>, sqlx::Error> {
@@ -1044,18 +1334,42 @@ fn push_log_filters(
 
 #[cfg(test)]
 mod tests {
-    use super::{Repository, SecretMigrationReport};
+    use super::{
+        MasterKeyStatus, MasterKeyVersionUsage, Repository, SecretMigrationReport,
+    };
     use crate::core::secret_store::{EncryptedSecret, SecretStore};
     use crate::db::models::{CreateApiKeyInput, CreateChannelInput, UpdateChannelInput};
     use sqlx::sqlite::SqlitePoolOptions;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    };
 
-    struct TestSecretStore;
+    struct TestSecretStore {
+        active_key_version: AtomicI64,
+    }
 
     struct FailingSecretStore;
 
+    impl Default for TestSecretStore {
+        fn default() -> Self {
+            Self {
+                active_key_version: AtomicI64::new(1),
+            }
+        }
+    }
+
     impl SecretStore for FailingSecretStore {
         fn encrypt(&self, _context: &str, _plaintext: &str) -> Result<EncryptedSecret, String> {
+            Err("system keychain unavailable".to_string())
+        }
+
+        fn encrypt_for_key_version(
+            &self,
+            _key_version: i64,
+            _context: &str,
+            _plaintext: &str,
+        ) -> Result<EncryptedSecret, String> {
             Err("system keychain unavailable".to_string())
         }
 
@@ -1063,20 +1377,51 @@ mod tests {
             &self,
             _context: &str,
             _version: i64,
+            _key_version: i64,
             _nonce: &[u8],
             _ciphertext: &[u8],
         ) -> Result<String, String> {
+            Err("system keychain unavailable".to_string())
+        }
+
+        fn active_key_version(&self) -> i64 {
+            1
+        }
+
+        fn ensure_key_version(&self, _key_version: i64) -> Result<(), String> {
+            Err("system keychain unavailable".to_string())
+        }
+
+        fn prepare_key_version(&self, _key_version: i64) -> Result<(), String> {
+            Err("system keychain unavailable".to_string())
+        }
+
+        fn set_active_key_version(&self, _key_version: i64) -> Result<(), String> {
             Err("system keychain unavailable".to_string())
         }
     }
 
     impl SecretStore for TestSecretStore {
         fn encrypt(&self, context: &str, plaintext: &str) -> Result<EncryptedSecret, String> {
-            let mut ciphertext = context.as_bytes().to_vec();
+            self.encrypt_for_key_version(self.active_key_version(), context, plaintext)
+        }
+
+        fn encrypt_for_key_version(
+            &self,
+            key_version: i64,
+            context: &str,
+            plaintext: &str,
+        ) -> Result<EncryptedSecret, String> {
+            if key_version < 1 {
+                return Err("invalid key version".to_string());
+            }
+            let mut ciphertext = format!("{}:{}", key_version, context).into_bytes();
             ciphertext.push(0);
-            ciphertext.extend(plaintext.bytes().map(|byte| byte ^ 0xA5));
+            let mask = 0xA5 ^ key_version as u8;
+            ciphertext.extend(plaintext.bytes().map(|byte| byte ^ mask));
             Ok(EncryptedSecret {
                 version: 1,
+                key_version,
                 nonce: vec![0; 24],
                 ciphertext,
             })
@@ -1086,23 +1431,50 @@ mod tests {
             &self,
             context: &str,
             version: i64,
+            key_version: i64,
             _nonce: &[u8],
             ciphertext: &[u8],
         ) -> Result<String, String> {
-            if version != 1 {
+            if version != 1 || key_version < 1 {
                 return Err("unsupported version".to_string());
             }
-            let prefix = [context.as_bytes(), &[0]].concat();
+            let prefix = [format!("{}:{}", key_version, context).as_bytes(), &[0]].concat();
             let encrypted = ciphertext
                 .strip_prefix(prefix.as_slice())
                 .ok_or_else(|| "context mismatch".to_string())?;
-            String::from_utf8(encrypted.iter().map(|byte| byte ^ 0xA5).collect())
+            let mask = 0xA5 ^ key_version as u8;
+            String::from_utf8(encrypted.iter().map(|byte| byte ^ mask).collect())
                 .map_err(|error| error.to_string())
+        }
+
+        fn active_key_version(&self) -> i64 {
+            self.active_key_version.load(Ordering::Acquire)
+        }
+
+        fn ensure_key_version(&self, key_version: i64) -> Result<(), String> {
+            if key_version < 1 {
+                return Err("invalid key version".to_string());
+            }
+            Ok(())
+        }
+
+        fn prepare_key_version(&self, key_version: i64) -> Result<(), String> {
+            if key_version < 1 {
+                return Err("invalid key version".to_string());
+            }
+            Ok(())
+        }
+
+        fn set_active_key_version(&self, key_version: i64) -> Result<(), String> {
+            self.prepare_key_version(key_version)?;
+            self.active_key_version
+                .store(key_version, Ordering::Release);
+            Ok(())
         }
     }
 
     fn test_repository(pool: sqlx::SqlitePool) -> Repository {
-        Repository::with_secret_store(pool, Arc::new(TestSecretStore))
+        Repository::with_secret_store(pool, Arc::new(TestSecretStore::default()))
     }
 
     async fn migrated_pool() -> sqlx::SqlitePool {
@@ -1176,6 +1548,7 @@ mod tests {
                 name: "expiring key".to_string(),
                 allowed_models: Some(vec!["gpt-4o".to_string()]),
                 allowed_channels: Some(vec!["channel-1".to_string()]),
+                access_scopes: Some(vec!["gateway".to_string()]),
                 quota_limit: Some(100),
                 expires_at: Some("2026-09-01T00:00:00Z".to_string()),
             })
@@ -1202,6 +1575,45 @@ mod tests {
             .await
             .expect("read API key with cleared expiration");
         assert!(cleared.expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn api_key_access_scopes_default_and_update_without_revealing_the_secret() {
+        let pool = migrated_pool().await;
+        let repository = Repository::new(pool.clone());
+        let created = repository
+            .create_api_key(&CreateApiKeyInput {
+                name: "scoped key".to_string(),
+                allowed_models: None,
+                allowed_channels: None,
+                access_scopes: None,
+                quota_limit: Some(0),
+                expires_at: None,
+            })
+            .await
+            .expect("create default-scoped API key");
+        assert_eq!(created.access_scopes, "[\"gateway\"]");
+
+        repository
+            .update_api_key_access_scopes(
+                &created.id,
+                &["mcp:write".to_string(), "admin".to_string()],
+            )
+            .await
+            .expect("update API key access scopes");
+        let updated = repository
+            .get_api_key_by_key(&created.key)
+            .await
+            .expect("authenticate updated API key");
+        assert_eq!(updated.access_scopes, "[\"mcp:write\",\"admin\"]");
+        assert!(updated.key.starts_with("redacted:"));
+
+        let stored_key: String = sqlx::query_scalar("SELECT key FROM api_keys WHERE id = ?")
+            .bind(&created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read stored API key placeholder");
+        assert!(!stored_key.contains(&created.key));
     }
 
     #[tokio::test]
@@ -1357,6 +1769,7 @@ mod tests {
                 name: "digest key".to_string(),
                 allowed_models: None,
                 allowed_channels: None,
+                access_scopes: None,
                 quota_limit: Some(0),
                 expires_at: None,
             })
@@ -1474,5 +1887,213 @@ mod tests {
                 .expect("read unchanged legacy channel");
         assert_eq!(stored.0, "legacy-provider-key");
         assert!(stored.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_secret_migration_rolls_back_every_row_on_database_failure() {
+        let pool = migrated_pool().await;
+        for (id, key) in [
+            ("legacy-channel-1", "legacy-provider-key-1"),
+            ("legacy-channel-2", "legacy-provider-key-2"),
+        ] {
+            sqlx::query(
+                "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, weight, config, model_mapping, timeout_secs, created_at, updated_at)
+                 VALUES (?, 'legacy', 'openai', 'https://api.example.com/v1', ?, '[]', 1, 0, 1, '{}', '{}', 60, 'now', 'now')",
+            )
+            .bind(id)
+            .bind(key)
+            .execute(&pool)
+            .await
+            .expect("insert legacy channel");
+        }
+        sqlx::query(
+            "CREATE TRIGGER fail_second_legacy_channel
+             BEFORE UPDATE OF secret_ref ON channels
+             WHEN NEW.id = 'legacy-channel-2'
+             BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install migration failure trigger");
+        let repository = test_repository(pool.clone());
+
+        assert!(repository.migrate_legacy_secrets().await.is_err());
+
+        let stored: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, api_key, secret_ref FROM channels WHERE id LIKE 'legacy-channel-%' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read rolled back legacy channels");
+        assert_eq!(
+            stored,
+            vec![
+                (
+                    "legacy-channel-1".to_string(),
+                    "legacy-provider-key-1".to_string(),
+                    None,
+                ),
+                (
+                    "legacy-channel-2".to_string(),
+                    "legacy-provider-key-2".to_string(),
+                    None,
+                ),
+            ]
+        );
+        let stored_secrets: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM secure_secrets WHERE owner_type = 'channel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count rolled back encrypted secrets");
+        assert_eq!(stored_secrets, 0);
+    }
+
+    fn rotation_channel_input(name: &str, api_key: &str) -> CreateChannelInput {
+        CreateChannelInput {
+            name: name.to_string(),
+            channel_type: "openai".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: api_key.to_string(),
+            models: vec!["test-model".to_string()],
+            priority: None,
+            weight: None,
+            config: None,
+            model_mapping: None,
+            timeout_secs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn master_key_rotation_reencrypts_all_rows_and_survives_new_store_instance() {
+        let pool = migrated_pool().await;
+        let secrets = Arc::new(TestSecretStore::default());
+        let repository = Repository::with_secret_store(pool.clone(), secrets.clone());
+        let first = repository
+            .create_channel(&rotation_channel_input("first", "sk-first-secret"))
+            .await
+            .expect("create first channel");
+        let second = repository
+            .create_channel(&rotation_channel_input("second", "sk-second-secret"))
+            .await
+            .expect("create second channel");
+
+        assert_eq!(
+            repository.master_key_status().await.expect("read status"),
+            MasterKeyStatus {
+                active_key_version: 1,
+                total_secrets: 2,
+                versions: vec![MasterKeyVersionUsage {
+                    key_version: 1,
+                    secret_count: 2,
+                }],
+            },
+        );
+        let report = repository
+            .rotate_master_key()
+            .await
+            .expect("rotate master key");
+
+        assert_eq!(report.previous_key_version, 1);
+        assert_eq!(report.active_key_version, 2);
+        assert_eq!(report.rotated_secrets, 2);
+        assert_eq!(report.retained_key_versions, vec![1]);
+        assert_eq!(secrets.active_key_version(), 2);
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT key_version FROM secure_secrets ORDER BY owner_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read rotated versions");
+        assert_eq!(versions, vec![2, 2]);
+        assert_eq!(
+            repository
+                .get_channel(&first.id)
+                .await
+                .expect("decrypt first channel")
+                .api_key,
+            "sk-first-secret",
+        );
+
+        let third = repository
+            .create_channel(&rotation_channel_input("third", "sk-third-secret"))
+            .await
+            .expect("create channel after rotation");
+        let third_version: i64 = sqlx::query_scalar(
+            "SELECT key_version FROM secure_secrets WHERE owner_id = ?",
+        )
+        .bind(&third.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read new secret version");
+        assert_eq!(third_version, 2);
+
+        let restarted_secrets = Arc::new(TestSecretStore::default());
+        restarted_secrets
+            .set_active_key_version(2)
+            .expect("restore active version");
+        let restarted = Repository::with_secret_store(pool, restarted_secrets);
+        assert_eq!(
+            restarted
+                .get_channel(&second.id)
+                .await
+                .expect("decrypt after simulated restart")
+                .api_key,
+            "sk-second-secret",
+        );
+    }
+
+    #[tokio::test]
+    async fn master_key_rotation_rolls_back_every_row_when_one_ciphertext_is_corrupt() {
+        let pool = migrated_pool().await;
+        let secrets = Arc::new(TestSecretStore::default());
+        let repository = Repository::with_secret_store(pool.clone(), secrets.clone());
+        let first = repository
+            .create_channel(&rotation_channel_input("first", "sk-first-secret"))
+            .await
+            .expect("create first channel");
+        let second = repository
+            .create_channel(&rotation_channel_input("second", "sk-second-secret"))
+            .await
+            .expect("create second channel");
+        sqlx::query(
+            "UPDATE secure_secrets SET ciphertext = X'00010203' WHERE owner_id = ?",
+        )
+        .bind(&second.id)
+        .execute(&pool)
+        .await
+        .expect("corrupt second ciphertext");
+        let before: Vec<(String, i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT owner_id, key_version, ciphertext FROM secure_secrets ORDER BY owner_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("snapshot secrets before rotation");
+
+        assert!(repository.rotate_master_key().await.is_err());
+
+        let after: Vec<(String, i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT owner_id, key_version, ciphertext FROM secure_secrets ORDER BY owner_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read rolled back secrets");
+        assert_eq!(after, before);
+        let active: i64 = sqlx::query_scalar(
+            "SELECT active_key_version FROM secret_store_metadata WHERE singleton = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read rolled back active version");
+        assert_eq!(active, 1);
+        assert_eq!(secrets.active_key_version(), 1);
+        assert_eq!(
+            repository
+                .get_channel(&first.id)
+                .await
+                .expect("first ciphertext remains readable")
+                .api_key,
+            "sk-first-secret",
+        );
     }
 }

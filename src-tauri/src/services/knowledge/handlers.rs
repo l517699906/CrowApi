@@ -15,6 +15,7 @@ use super::processor;
 use super::rag;
 use super::embedder;
 use super::retriever;
+use super::lifecycle::{self, DeleteKnowledgeBaseError};
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -80,8 +81,26 @@ pub async fn update_knowledge_base(
     Json(input): Json<UpdateKbInput>,
 ) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
-    match repo.update_kb(&id, &input).await {
-        Ok(kb) => Json(kb).into_response(),
+    match repo.update_kb_with_effects(&id, &input).await {
+        Ok(outcome) => {
+            if let Some(task_id) = outcome.reprocess_task_id.as_deref() {
+                if let Err(error) = crate::services::tasks::dispatcher::dispatch_existing(
+                    &shared.state.db.pool,
+                    &shared.app,
+                    task_id,
+                )
+                .await
+                {
+                    return HttpError::internal(
+                        "KNOWLEDGE_BASE_REPROCESS_START_FAILED",
+                        "知识库配置已保存，但自动重处理启动失败",
+                        error,
+                    )
+                    .into_response();
+                }
+            }
+            Json(outcome.knowledge_base).into_response()
+        }
         Err(sqlx::Error::RowNotFound) => HttpError::not_found(
             "KNOWLEDGE_BASE_NOT_FOUND",
             "知识库不存在",
@@ -98,14 +117,19 @@ pub async fn delete_knowledge_base(
     State(shared): State<SharedState>,
     Path(id): Path<String>,
 ) -> Response {
-    let repo = KbRepository::new(shared.state.db.pool.clone());
-    match repo.delete_kb(&id).await {
+    match lifecycle::delete_knowledge_base(&shared.state.db.pool, &shared.app, &id).await {
         Ok(_) => (StatusCode::NO_CONTENT, "").into_response(),
+        Err(DeleteKnowledgeBaseError::NotFound) => HttpError::not_found(
+            "KNOWLEDGE_BASE_NOT_FOUND",
+            "知识库不存在",
+        )
+        .into_response(),
         Err(error) => HttpError::internal(
             "KNOWLEDGE_BASE_DELETE_FAILED",
             "删除知识库失败",
             error,
-        ).into_response(),
+        )
+        .into_response(),
     }
 }
 
@@ -218,27 +242,27 @@ pub async fn upload_document(
         ).into_response(),
     };
 
-    let pool = shared.state.db.pool.clone();
-    let app = shared.app.clone();
-    let doc_id_clone = doc.id.clone();
-    let filename_clone = input.filename.clone();
-    let emb_model = kb.embedding_model.clone();
-
-    tokio::spawn(async move {
-        if let Err(e) = processor::process_document(
-            &pool,
-            &app,
-            &kb_id,
-            &doc_id_clone,
-            &filename_clone,
-            &content,
-            emb_model.as_deref(),
-        ).await {
-            tracing::error!("Document processing failed: {}", e);
-        }
-    });
-
-    Json(doc).into_response()
+    match processor::start_document_processing(
+        &shared.state.db.pool,
+        &shared.app,
+        &kb_id,
+        &doc.id,
+        input.filename,
+        content,
+        kb.embedding_model,
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(task_id) => Json(StartedDocumentTask { document: doc, task_id }).into_response(),
+        Err(error) => HttpError::internal(
+            "DOCUMENT_PROCESS_START_FAILED",
+            "启动文档处理失败",
+            error,
+        )
+        .into_response(),
+    }
 }
 
 pub async fn get_document(
@@ -279,28 +303,21 @@ pub async fn delete_document(
         ).into_response(),
     };
 
-    if doc.source_type == "upload" {
-        if let Some(path) = &doc.file_path {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return HttpError::internal(
-                    "DOCUMENT_FILE_DELETE_FAILED",
-                    "删除文档文件失败",
-                    error,
-                ).into_response(),
-            }
-        }
-    }
-
     match repo.delete_document(&doc_id).await {
         Ok(_) => {
-            if let Err(error) = repo.update_kb_counts(&kb_id).await {
-                return HttpError::internal(
-                    "KNOWLEDGE_BASE_COUNT_UPDATE_FAILED",
-                    "文档已删除，但更新知识库统计失败",
-                    error,
-                ).into_response();
+            super::storage::cleanup_document_files(
+                &shared.app,
+                std::slice::from_ref(&doc),
+            )
+            .await;
+            if let Err(error) = retriever::schedule_index_build(
+                &shared.state.db.pool,
+                &kb_id,
+                &shared.app,
+            )
+            .await
+            {
+                tracing::warn!(%error, %kb_id, "failed to schedule index after document deletion");
             }
             (StatusCode::NO_CONTENT, "").into_response()
         }
@@ -630,13 +647,16 @@ pub async fn delete_source(
 ) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.delete_source_with_documents(&kb_id, &source_id).await {
-        Ok(_) => {
-            if let Err(error) = repo.update_kb_counts(&kb_id).await {
-                return HttpError::internal(
-                    "KNOWLEDGE_BASE_COUNT_UPDATE_FAILED",
-                    "来源已删除，但更新知识库统计失败",
-                    error,
-                ).into_response();
+        Ok(documents) => {
+            super::storage::cleanup_document_files(&shared.app, &documents).await;
+            if let Err(error) = retriever::schedule_index_build(
+                &shared.state.db.pool,
+                &kb_id,
+                &shared.app,
+            )
+            .await
+            {
+                tracing::warn!(%error, %kb_id, "failed to schedule index after source deletion");
             }
             (StatusCode::NO_CONTENT, "").into_response()
         }
@@ -678,43 +698,15 @@ pub async fn import_source(
         ).into_response(),
     };
 
-    let source_id = source.id.clone();
-    let source_type = input.source_type.clone();
-
-    tokio::spawn(async move {
-        let result = if source_type == "git" {
-            super::importer::import_git_repo(
-                &pool, &app, &kb_id, &source_id, &input,
-            ).await
-        } else if source_type == "url" {
-            super::importer::import_url(
-                &pool, &app, &kb_id, &source_id, &input,
-            ).await
-        } else if source_type == "local_dir" {
-            super::importer::import_local_dir(
-                &pool, &app, &kb_id, &source_id, &input,
-            ).await
-        } else {
-            Err(format!("Unknown source type: {}", source_type))
-        };
-
-        let repo = KbRepository::new(pool.clone());
-        match result {
-            Ok(count) => {
-                if let Err(error) = repo.update_source_status(&source_id, "done", count as i64, None).await {
-                    tracing::warn!(%error, source_id = %source_id, "failed to persist knowledge source completion");
-                }
-            }
-            Err(e) => {
-                if let Err(error) = repo.update_source_status(&source_id, "error", 0, Some(&e)).await {
-                    tracing::warn!(%error, source_id = %source_id, "failed to persist knowledge source failure");
-                }
-                tracing::error!("Import failed: {}", e);
-            }
-        }
-    });
-
-    Json(source).into_response()
+    match super::importer::start_import_source(&pool, &app, &kb_id, source.clone(), input).await {
+        Ok(task_id) => Json(StartedSourceTask { source, task_id }).into_response(),
+        Err(error) => HttpError::internal(
+            "KNOWLEDGE_SOURCE_IMPORT_START_FAILED",
+            "启动知识来源导入失败",
+            error,
+        )
+        .into_response(),
+    }
 }
 
 // ─── Index Management ─────────────────────────────────────────────

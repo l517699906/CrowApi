@@ -10,7 +10,7 @@ mod protocol;
 pub mod services;
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -24,6 +24,7 @@ pub struct AppState {
     pub server_running: Arc<std::sync::atomic::AtomicBool>,
     pub server_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     pub log_events: Arc<core::log_events::LogEventState>,
+    pub maintenance_lock: Arc<Mutex<()>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -111,14 +112,41 @@ pub fn run() {
                     server_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     server_handle: Arc::new(RwLock::new(None)),
                     log_events: Arc::new(core::log_events::LogEventState::default()),
+                    maintenance_lock: Arc::new(Mutex::new(())),
                 });
                 app_handle.manage(state.clone());
                 state.log_events.clone().spawn(app_handle.clone());
 
+                match services::tasks::dispatcher::recover_interrupted(
+                    &state.db.pool,
+                    &app_handle,
+                )
+                .await
+                {
+                    Ok(summary) if summary.eligible > 0 => {
+                        log::warn!(
+                            "后台任务恢复完成: 可恢复 {}, 已启动 {}, 失败 {}",
+                            summary.eligible,
+                            summary.resumed,
+                            summary.failed,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => log::error!("读取可恢复后台任务失败: {}", error),
+                }
+                services::tasks::dispatcher::spawn_maintenance(
+                    state.db.pool.clone(),
+                    app_handle.clone(),
+                );
+
                 let handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = server::start_server(handle, state).await;
+                let server_state = state.clone();
+                let server_task = tokio::spawn(async move {
+                    if let Err(error) = server::start_server(handle, server_state).await {
+                        tracing::error!(%error, "CrowAPI server startup failed");
+                    }
                 });
+                *state.server_handle.write().await = Some(server_task);
             });
 
             Ok(())
@@ -171,6 +199,12 @@ pub fn run() {
             commands::backup::create_full_backup,
             commands::backup::inspect_full_backup,
             commands::backup::schedule_full_restore,
+            commands::secrets::get_master_key_status,
+            commands::secrets::rotate_master_key,
+            commands::tasks::get_background_tasks,
+            commands::tasks::get_background_task,
+            commands::tasks::cancel_background_task,
+            commands::tasks::retry_background_task,
             commands::services::get_service_statuses,
             // Wiki
             commands::wiki::get_wiki_projects,
@@ -185,6 +219,7 @@ pub fn run() {
             commands::wiki::add_wiki_source,
             commands::wiki::delete_wiki_source,
             commands::wiki::search_wiki,
+            commands::wiki::search_wiki_page,
             commands::wiki::get_wiki_graph,
             commands::wiki::get_wiki_stats,
             commands::wiki::ingest_wiki_source,

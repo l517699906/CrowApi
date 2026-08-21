@@ -18,7 +18,12 @@ import { apiKeyApi, channelApi, settingsApi, statsApi } from "../lib/api";
 import { MAX_QUOTA, normalizeQuota } from "../lib/quota";
 import { errorMessage, queryKeys } from "../lib/query";
 import { localDayStatsInput } from "../lib/statistics";
-import type { ApiKey } from "../types";
+import {
+    ACCESS_SCOPE_LABELS,
+    ACCESS_SCOPE_OPTIONS,
+    updateAccessScopes,
+} from "../lib/accessScopes";
+import type { ApiAccessScope, ApiKey } from "../types";
 import { IconButton, Modal, PageTitle, StatusBadge, Toast, Toggle } from "../components/ui";
 
 interface KeyFormState {
@@ -27,6 +32,7 @@ interface KeyFormState {
     modelScope: string;
     channelScope: string;
     expiresAt: string;
+    accessScopes: ApiAccessScope[];
 }
 
 function createInitialForm(quotaLimit = DEFAULT_SETTINGS.default_key_quota): KeyFormState {
@@ -36,6 +42,7 @@ function createInitialForm(quotaLimit = DEFAULT_SETTINGS.default_key_quota): Key
         modelScope: "",
         channelScope: "",
         expiresAt: "",
+        accessScopes: ["gateway"],
     };
 }
 
@@ -63,6 +70,7 @@ export function ApiKeysPage() {
     const [editingKey, setEditingKey] = useState<ApiKey | null>(null);
     const [quotaDraft, setQuotaDraft] = useState(0);
     const [expiresAtDraft, setExpiresAtDraft] = useState("");
+    const [accessScopesDraft, setAccessScopesDraft] = useState<ApiAccessScope[]>(["gateway"]);
     const [deletingKey, setDeletingKey] = useState<ApiKey | null>(null);
     const [copiedKey, setCopiedKey] = useState<string | null>(null);
     const [toast, setToast] = useState("");
@@ -118,9 +126,15 @@ export function ApiKeysPage() {
         onError: (mutationError) => showToast(errorMessage(mutationError)),
     });
     const updateQuotaMutation = useMutation({
-        mutationFn: ({ id, quotaLimit, expiresAt }: { id: string; quotaLimit: number; expiresAt: string }) => apiKeyApi.update({
+        mutationFn: ({ id, quotaLimit, expiresAt, accessScopes }: {
+            id: string;
+            quotaLimit: number;
+            expiresAt: string;
+            accessScopes: ApiAccessScope[];
+        }) => apiKeyApi.update({
             id,
             quota_limit: quotaLimit,
+            access_scopes: accessScopes,
             ...(expiresAt
                 ? { expires_at: new Date(`${expiresAt}T23:59:59`).toISOString() }
                 : { clear_expires_at: true }),
@@ -158,12 +172,17 @@ export function ApiKeysPage() {
     const openQuotaDialog = (apiKey: ApiKey) => {
         setQuotaDraft(normalizeQuota(apiKey.quota_limit));
         setExpiresAtDraft(apiKey.expires_at ? new Date(apiKey.expires_at).toISOString().slice(0, 10) : "");
+        setAccessScopesDraft(apiKey.access_scopes);
         setEditingKey(apiKey);
     };
 
     const submitCreate = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
         if (!form.name.trim()) {
+            return;
+        }
+        if (form.accessScopes.length === 0) {
+            showToast("请至少选择一个访问权限");
             return;
         }
 
@@ -173,6 +192,7 @@ export function ApiKeysPage() {
                 quota_limit: Number(form.quotaLimit),
                 allowed_models: form.modelScope ? [form.modelScope] : [],
                 allowed_channels: form.channelScope ? [form.channelScope] : [],
+                access_scopes: form.accessScopes,
                 expires_at: form.expiresAt ? new Date(`${form.expiresAt}T23:59:59`).toISOString() : null,
             });
         } catch (mutationError) {
@@ -185,10 +205,15 @@ export function ApiKeysPage() {
         if (!editingKey) {
             return;
         }
+        if (accessScopesDraft.length === 0) {
+            showToast("请至少选择一个访问权限");
+            return;
+        }
         updateQuotaMutation.mutate({
             id: editingKey.id,
             quotaLimit: normalizeQuota(quotaDraft),
             expiresAt: expiresAtDraft,
+            accessScopes: accessScopesDraft,
         });
     };
 
@@ -284,6 +309,9 @@ export function ApiKeysPage() {
                                             </div>
                                         </td>
                                         <td>
+                                            <p className="text-xs font-medium text-ink">
+                                                {apiKey.access_scopes.map((scope) => ACCESS_SCOPE_LABELS[scope]).join(" · ")}
+                                            </p>
                                             <p className="text-xs text-ink">{apiKey.allowed_models.length > 0 ? apiKey.allowed_models.join(", ") : "全部模型"}</p>
                                             <p className="mt-0.5 text-[11px] text-subtle">
                                                 {apiKey.allowed_channels.length > 0
@@ -405,6 +433,35 @@ export function ApiKeysPage() {
                                 />
                                 <small>设置为 0 表示不限制</small>
                             </label>
+                            <fieldset>
+                                <legend className="field-label mb-2">访问权限</legend>
+                                <div className="grid gap-2 sm:grid-cols-2">
+                                    {ACCESS_SCOPE_OPTIONS.map((option) => (
+                                        <label
+                                            key={option.value}
+                                            className="flex cursor-pointer items-start gap-3 rounded-md border border-line bg-canvas px-3 py-2.5"
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                className="mt-1"
+                                                checked={form.accessScopes.includes(option.value)}
+                                                onChange={(event) => setForm((current) => ({
+                                                    ...current,
+                                                    accessScopes: updateAccessScopes(
+                                                        current.accessScopes,
+                                                        option.value,
+                                                        event.target.checked,
+                                                    ),
+                                                }))}
+                                            />
+                                            <span>
+                                                <strong className="block text-sm text-ink">{option.label}</strong>
+                                                <small>{option.description}</small>
+                                            </span>
+                                        </label>
+                                    ))}
+                                </div>
+                            </fieldset>
                             <div className="form-grid">
                                 <label className="field-label">
                                     <span>允许的模型</span>
@@ -461,6 +518,30 @@ export function ApiKeysPage() {
                     )}
                 >
                     <form id="quota-form" onSubmit={submitQuota}>
+                        <fieldset className="mb-4">
+                            <legend className="field-label mb-2">访问权限</legend>
+                            <div className="grid gap-2">
+                                {ACCESS_SCOPE_OPTIONS.map((option) => (
+                                    <label
+                                        key={option.value}
+                                        className="flex cursor-pointer items-start gap-3 rounded-md border border-line bg-canvas px-3 py-2.5"
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            className="mt-1"
+                                            checked={accessScopesDraft.includes(option.value)}
+                                            onChange={(event) => setAccessScopesDraft((current) => (
+                                                updateAccessScopes(current, option.value, event.target.checked)
+                                            ))}
+                                        />
+                                        <span>
+                                            <strong className="block text-sm text-ink">{option.label}</strong>
+                                            <small>{option.description}</small>
+                                        </span>
+                                    </label>
+                                ))}
+                            </div>
+                        </fieldset>
                         <label className="field-label">
                             <span>Token 配额</span>
                             <input

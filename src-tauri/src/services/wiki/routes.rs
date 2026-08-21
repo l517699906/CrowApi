@@ -1,6 +1,6 @@
 use crate::server::router::SharedState;
 use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::{extract::DefaultBodyLimit, Router};
 use std::sync::Arc;
 use crate::AppState;
 use super::handlers;
@@ -50,4 +50,5 @@ pub fn create_router(_state: Arc<AppState>) -> Router<SharedState> {
         // ── Queue ──
         .route("/api/wiki/projects/{id}/queue",
             get(handlers::get_queue_status))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
 }

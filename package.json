@@ -10,6 +10,7 @@
     "test:watch": "vitest",
     "preview": "vite preview",
     "release:check": "node scripts/check-release-version.mjs",
+    "e2e:preflight": "node scripts/tauri-e2e-preflight.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

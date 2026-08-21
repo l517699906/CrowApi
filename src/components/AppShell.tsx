@@ -9,6 +9,7 @@ import {
     Copy,
     KeyRound,
     LayoutDashboard,
+    ListTodo,
     Menu,
     Radio,
     ScrollText,
@@ -22,6 +23,7 @@ import { serviceViewForPath } from "../config/serviceViews";
 import { channelApi, serverApi, settingsApi } from "../lib/api";
 import { queryKeys } from "../lib/query";
 import { applyUiTheme, DARK_THEME_MEDIA_QUERY } from "../lib/theme";
+import { RouteErrorBoundary } from "./ErrorBoundary";
 import { IconButton, Toast } from "./ui";
 
 const ApiKeysPage = lazy(() => import("../pages/ApiKeysPage").then((module) => ({ default: module.ApiKeysPage })));
@@ -32,12 +34,14 @@ const SettingsPage = lazy(() => import("../pages/SettingsPage").then((module) =>
 const UsagePage = lazy(() => import("../pages/UsagePage").then((module) => ({ default: module.UsagePage })));
 const KnowledgeBasePage = lazy(() => import("../pages/KnowledgeBasePage").then((module) => ({ default: module.KnowledgeBasePage })));
 const WikiPage = lazy(() => import("../pages/WikiPage").then((module) => ({ default: module.WikiPage })));
+const TasksPage = lazy(() => import("../pages/TasksPage").then((module) => ({ default: module.TasksPage })));
 
 const navItems = [
     { to: "/dashboard", label: "仪表盘", icon: LayoutDashboard },
     { to: "/usage", label: "用量", icon: BarChart3 },
     { to: "/channels", label: "渠道", icon: Radio },
     { to: "/services", label: "知识库", icon: Database },
+    { to: "/tasks", label: "任务", icon: ListTodo },
     { to: "/keys", label: "密钥", icon: KeyRound },
     { to: "/logs", label: "日志", icon: ScrollText },
     { to: "/settings", label: "设置", icon: Settings2 },
@@ -238,19 +242,22 @@ export function AppShell() {
                 </header>
 
                 <main className="app-content">
-                    <Suspense fallback={<RouteFallback />}>
-                        <Routes>
-                            <Route path="/dashboard" element={<DashboardPage />} />
-                            <Route path="/usage" element={<UsagePage />} />
-                            <Route path="/channels" element={<ChannelsPage />} />
-                            <Route path="/services/wiki" element={<WikiPage />} />
-                            <Route path="/services/*" element={<KnowledgeBasePage />} />
-                            <Route path="/keys" element={<ApiKeysPage />} />
-                            <Route path="/logs" element={<LogsPage />} />
-                            <Route path="/settings" element={<SettingsPage />} />
-                            <Route path="*" element={<Navigate to="/dashboard" replace />} />
-                        </Routes>
-                    </Suspense>
+                    <RouteErrorBoundary>
+                        <Suspense fallback={<RouteFallback />}>
+                            <Routes>
+                                <Route path="/dashboard" element={<DashboardPage />} />
+                                <Route path="/usage" element={<UsagePage />} />
+                                <Route path="/channels" element={<ChannelsPage />} />
+                                <Route path="/services/wiki" element={<WikiPage />} />
+                                <Route path="/services/*" element={<KnowledgeBasePage />} />
+                                <Route path="/tasks" element={<TasksPage />} />
+                                <Route path="/keys" element={<ApiKeysPage />} />
+                                <Route path="/logs" element={<LogsPage />} />
+                                <Route path="/settings" element={<SettingsPage />} />
+                                <Route path="*" element={<Navigate to="/dashboard" replace />} />
+                            </Routes>
+                        </Suspense>
+                    </RouteErrorBoundary>
                 </main>
             </div>
             {toastMessage ? <Toast message={toastMessage} /> : null}

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const KB_INDEX_FORMAT_VERSION: i64 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct KbKnowledgeBase {
     pub id: String,
@@ -19,6 +21,8 @@ pub struct KbKnowledgeBase {
     pub included_files: String,
     pub embedding_dim: i64,
     pub index_status: String,
+    pub content_revision: i64,
+    pub config_revision: i64,
     pub embedding_batch_size: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -66,8 +70,15 @@ pub struct KbDocument {
     pub source_url: Option<String>,
     pub source_path: Option<String>,
     pub doc_meta: String,
+    pub processed_config_revision: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartedDocumentTask {
+    pub document: KbDocument,
+    pub task_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +222,17 @@ pub struct KbSource {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StartedSourceTask {
+    pub source: KbSource,
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartedTask {
+    pub task_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportSourceInput {
     pub source_type: String, // git | url | local_dir
@@ -233,4 +255,9 @@ pub struct KbIndexMeta {
     pub index_path: Option<String>,
     pub built_at: Option<String>,
     pub status: String,
+    pub indexed_revision: i64,
+    pub format_version: i64,
+    pub config_revision: i64,
+    pub content_fingerprint: Option<String>,
+    pub index_checksum: Option<String>,
 }

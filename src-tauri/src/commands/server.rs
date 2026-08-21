@@ -18,7 +18,7 @@ pub async fn get_server_status(app: tauri::AppHandle, state: tauri::State<'_, Ar
     Ok(ServerStatus {
         running,
         port,
-        url: format!("http://{}:{}", host, port),
+        url: crate::config::server_url(&host, port),
     })
 }
 

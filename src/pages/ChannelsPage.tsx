@@ -19,7 +19,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PROVIDERS, PROVIDER_DEFAULTS, providerLabel } from "../config/providers";
 import { formatDateTime, formatDuration } from "../lib/format";
 import { channelApi, fileApi, importExportApi, statsApi } from "../lib/api";
-import { errorMessage, queryKeys } from "../lib/query";
+import { errorMessage, normalizeAppError, queryKeys } from "../lib/query";
 import { localDayStatsInput } from "../lib/statistics";
 import type { Channel, ChannelType, CreateChannelInput, ScannedSource, UpdateChannelInput } from "../types";
 import {
@@ -318,9 +318,30 @@ export function ChannelsPage() {
                 throw new Error("无法解析 JSON 文件");
             }
 
-            const result = parsed.type === "crowapi-export"
-                ? await importExportApi.importCrowapiExport(content)
-                : await importExportApi.importCrowcodeBackup(content);
+            let result;
+            if (parsed.type === "crowapi-export") {
+                result = await importExportApi.importCrowapiExport(content);
+            } else {
+                try {
+                    result = await importExportApi.importCrowcodeBackup(content);
+                } catch (error) {
+                    const normalized = normalizeAppError(error);
+                    if (normalized.code !== "IMPORT_PLAINTEXT_KEY_CONFIRMATION_REQUIRED") {
+                        throw error;
+                    }
+                    const count = typeof normalized.details === "object"
+                        && normalized.details !== null
+                        && "plaintext_keys" in normalized.details
+                        && typeof normalized.details.plaintext_keys === "number"
+                        ? normalized.details.plaintext_keys
+                        : 1;
+                    if (!window.confirm(`该旧版 Crowcode 备份包含 ${count} 个明文 API Key。确认后会写入本地密钥存储，是否继续？`)) {
+                        setTransferMessage("已取消明文密钥导入");
+                        return;
+                    }
+                    result = await importExportApi.importCrowcodeBackup(content, true);
+                }
+            }
             await refreshChannels();
             const suffix = result.errors.length > 0 ? `，${result.errors.length} 项失败` : "";
             setTransferMessage(`已导入 ${result.imported} 个渠道，跳过 ${result.skipped} 个${suffix}`);

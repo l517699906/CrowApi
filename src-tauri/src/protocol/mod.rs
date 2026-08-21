@@ -7,11 +7,11 @@ use serde_json::Value;
 pub fn extract_api_key(headers: &axum::http::HeaderMap) -> Option<String> {
     // Try Authorization: Bearer xxx first
     if let Some(auth) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
-        if let Some(key) = auth.strip_prefix("Bearer ") {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+        let mut parts = auth.splitn(2, char::is_whitespace);
+        let scheme = parts.next().unwrap_or_default();
+        let key = parts.next().unwrap_or_default().trim();
+        if scheme.eq_ignore_ascii_case("bearer") && !key.is_empty() {
+            return Some(key.to_string());
         }
     }
     // Fall back to x-api-key
@@ -22,6 +22,40 @@ pub fn extract_api_key(headers: &axum::http::HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod api_key_tests {
+    use super::extract_api_key;
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_takes_precedence() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bEaReR  sk-crowapi-bearer"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("sk-crowapi-header"));
+        assert_eq!(
+            extract_api_key(&headers).as_deref(),
+            Some("sk-crowapi-bearer")
+        );
+    }
+
+    #[test]
+    fn x_api_key_is_used_when_authorization_is_not_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic credentials"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static(" sk-crowapi-header "));
+        assert_eq!(
+            extract_api_key(&headers).as_deref(),
+            Some("sk-crowapi-header")
+        );
+    }
 }
 
 /// Detect if a request is in Anthropic format by checking headers and body.

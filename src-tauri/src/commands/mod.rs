@@ -10,3 +10,5 @@ pub mod knowledge_base;
 pub mod services;
 pub mod wiki;
 pub mod backup;
+pub mod tasks;
+pub mod secrets;

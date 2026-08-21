@@ -1,4 +1,4 @@
-use axum::{Router, routing::{get, post}};
+use axum::{extract::DefaultBodyLimit, Router, routing::{get, post}};
 #[allow(unused_imports)]
 use axum::routing::{delete as _delete, put as _put};
 use std::sync::Arc;
@@ -26,4 +26,5 @@ pub fn create_router(_state: Arc<AppState>) -> Router<SharedState> {
         .route("/api/kb/{kb_id}/sources/{source_id}", axum::routing::delete(handlers::delete_source))
         // Index Management
         .route("/api/kb/{kb_id}/index", get(handlers::get_index_status).post(handlers::build_index).delete(handlers::drop_index))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
 }

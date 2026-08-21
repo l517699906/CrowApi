@@ -2,32 +2,46 @@ use super::models::*;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 use chrono::Utc;
+use crate::services::tasks::{
+    models::{BackgroundTask, TaskListFilter, TaskSpec},
+    repository::TaskRepository,
+};
 
-fn escape_like_pattern(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
-fn content_snippet(content: &str, query: &str) -> String {
-    let lower_content = content.to_lowercase();
-    let lower_query = query.to_lowercase();
-    let position = if lower_query.is_empty() {
-        None
-    } else {
-        lower_content.find(&lower_query)
-    };
-    let start_hint = position.unwrap_or(0).min(content.len());
-    let start = content.floor_char_boundary(start_hint.saturating_sub(60));
-    let end = content.ceil_char_boundary(start.saturating_add(200).min(content.len()));
-    let snippet = content[start..end].replace('\n', " ");
-    if position.is_some() {
-        format!("...{}...", snippet)
-    } else {
-        snippet
+fn background_to_wiki_task(task: BackgroundTask) -> WikiIngestTask {
+    WikiIngestTask {
+        id: task.id,
+        project_id: task.resource_id,
+        source_id: task.subject_id,
+        task_type: task.task_type,
+        status: if task.status == "succeeded" {
+            "done".to_string()
+        } else {
+            task.status
+        },
+        progress: task.progress,
+        total_steps: task.total_items,
+        done_steps: task.done_items,
+        result_json: task.result_json,
+        error_message: task.error_message,
+        created_at: task.created_at,
+        started_at: task.started_at,
+        completed_at: task.completed_at,
     }
 }
+
+/// Convert user input into a literal FTS5 expression.  Quoting each term
+/// keeps punctuation and operators (`OR`, `NOT`, `*`, etc.) from changing the
+/// query semantics while still allowing multi-word searches to be combined.
+fn fts_query(value: &str) -> Option<String> {
+    let terms: Vec<String> = value
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" AND "))
+}
+
+const MAX_SEARCH_LIMIT: usize = 100;
 
 pub struct WikiRepository {
     pool: SqlitePool,
@@ -140,11 +154,20 @@ impl WikiRepository {
     }
 
     pub async fn delete_project(&self, id: &str) -> Result<(), String> {
-        sqlx::query("DELETE FROM wiki_projects WHERE id = ?")
+        let mut tx = self.pool.begin().await.map_err(|e| format!("DB error: {}", e))?;
+        // FTS5 tables do not participate in the Wiki foreign-key cascade, so
+        // remove their projection explicitly before deleting the project.
+        sqlx::query("DELETE FROM wiki_page_search WHERE project_id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("DB error: {}", e))?;
+        sqlx::query("DELETE FROM wiki_projects WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
+        tx.commit().await.map_err(|e| format!("DB error: {}", e))?;
         Ok(())
     }
 
@@ -182,8 +205,10 @@ impl WikiRepository {
         wikilinks: &str,
         frontmatter: &str,
         tags: &str,
+        content: &str,
     ) -> Result<(), String> {
         let now = Self::now();
+        let mut tx = self.pool.begin().await.map_err(|e| format!("DB error: {}", e))?;
         sqlx::query(
             "INSERT INTO wiki_pages (id, project_id, path, title, page_type, content_hash, token_count, wikilinks, frontmatter, tags, status, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
@@ -205,101 +230,157 @@ impl WikiRepository {
         .bind(tags)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("DB error: {}", e))?;
+
+        let page_id: String = sqlx::query_scalar(
+            "SELECT id FROM wiki_pages WHERE project_id = ? AND path = ?",
+        )
+        .bind(project_id)
+        .bind(path)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+
+        sqlx::query("DELETE FROM wiki_page_search WHERE page_id = ?")
+            .bind(&page_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
+        sqlx::query(
+            "INSERT INTO wiki_page_search (page_id, project_id, path, title, content, tags)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&page_id)
+        .bind(project_id)
+        .bind(path)
+        .bind(title)
+        .bind(content)
+        .bind(tags)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+
+        tx.commit().await.map_err(|e| format!("DB error: {}", e))?;
         Ok(())
     }
 
     pub async fn delete_page(&self, project_id: &str, path: &str) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(|e| format!("DB error: {}", e))?;
+        sqlx::query("DELETE FROM wiki_page_search WHERE project_id = ? AND path = ?")
+            .bind(project_id)
+            .bind(path)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
         sqlx::query("DELETE FROM wiki_pages WHERE project_id = ? AND path = ?")
             .bind(project_id)
             .bind(path)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("DB error: {}", e))?;
+        tx.commit().await.map_err(|e| format!("DB error: {}", e))?;
         Ok(())
     }
 
-    pub async fn search_pages(&self, project_id: &str, query: &str, top_k: usize) -> Result<Vec<WikiSearchResult>, String> {
-        // The current schema has no FTS table. Escape wildcard characters so
-        // literal searches cannot broaden the result set unexpectedly.
-        let pattern = format!("%{}%", escape_like_pattern(query));
+    /// Preserve the original item-only API while using the paged FTS query.
+    pub async fn search_pages(
+        &self,
+        project_id: &str,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<WikiSearchResult>, String> {
+        Ok(self
+            .search_pages_page(project_id, query, 0, top_k)
+            .await?
+            .results)
+    }
 
-        // First try LIKE on title and path for quick matches
-        let like_rows = sqlx::query_as::<_, WikiPage>(
-            "SELECT * FROM wiki_pages WHERE project_id = ? AND status = 'active'
-             AND (title LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')
-             ORDER BY title LIMIT ?"
+    /// Search the materialized Wiki projection with SQLite FTS5/BM25.
+    ///
+    /// The projection keeps page bodies out of the hot query path: page files
+    /// are read once when a page is written, while search only joins indexed
+    /// rows and the small metadata table for status/page type.
+    pub async fn search_pages_page(
+        &self,
+        project_id: &str,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<WikiSearchPage, String> {
+        let query = query.trim();
+        let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
+        let offset = offset.min(usize::MAX.saturating_sub(limit));
+        let Some(match_query) = fts_query(query) else {
+            return Ok(WikiSearchPage {
+                results: Vec::new(),
+                total: 0,
+                offset,
+                limit,
+                query: query.to_string(),
+            });
+        };
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM wiki_page_search
+             JOIN wiki_pages ON wiki_pages.id = wiki_page_search.page_id
+             WHERE wiki_page_search.project_id = ?
+               AND wiki_pages.status = 'active'
+               AND wiki_page_search MATCH ?",
         )
         .bind(project_id)
-        .bind(&pattern)
-        .bind(&pattern)
-        .bind(top_k as i64)
+        .bind(&match_query)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+
+        let rows = sqlx::query_as::<_, (String, String, String, String, f64, String)>(
+            "SELECT wiki_page_search.page_id,
+                    wiki_page_search.path,
+                    wiki_page_search.title,
+                    wiki_pages.page_type,
+                    bm25(wiki_page_search, 0.0, 0.0, 6.0, 8.0, 2.0, 4.0) AS rank,
+                    snippet(wiki_page_search, 4, '', '', '...', 24) AS snippet
+             FROM wiki_page_search
+             JOIN wiki_pages ON wiki_pages.id = wiki_page_search.page_id
+             WHERE wiki_page_search.project_id = ?
+               AND wiki_pages.status = 'active'
+               AND wiki_page_search MATCH ?
+             ORDER BY rank ASC, wiki_page_search.path ASC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(project_id)
+        .bind(&match_query)
+        .bind(limit as i64)
+        .bind(offset as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("DB error: {}", e))?;
 
-        // Also search in file contents on disk for better recall
-        let mut results: Vec<WikiSearchResult> = like_rows.iter().map(|p| {
-            WikiSearchResult {
-                page_id: p.id.clone(),
-                path: p.path.clone(),
-                title: p.title.clone(),
-                score: 1.0,
-                snippet: String::new(),
-                page_type: p.page_type.clone(),
-            }
-        }).collect();
+        let results = rows
+            .into_iter()
+            .map(|(page_id, path, title, page_type, rank, snippet)| WikiSearchResult {
+                page_id,
+                path,
+                title,
+                page_type,
+                // FTS5 BM25 ranks lower (negative) values first. The logistic
+                // transform preserves that ordering while keeping the public
+                // display score in the familiar 0..1 interval.
+                score: 1.0 / (1.0 + rank.exp()),
+                snippet,
+            })
+            .collect();
 
-        // If we have fewer results than top_k, try reading page files and searching content
-        if results.len() < top_k {
-            let all_pages = sqlx::query_as::<_, WikiPage>(
-                "SELECT * FROM wiki_pages WHERE project_id = ? AND status = 'active' ORDER BY title"
-            )
-            .bind(project_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-
-            let existing_paths: std::collections::HashSet<String> = results.iter().map(|r| r.path.clone()).collect();
-
-            for page in &all_pages {
-                if existing_paths.contains(&page.path) {
-                    continue;
-                }
-                // Read content from disk and search
-                if let Ok(content) = crate::services::wiki::project::read_page(project_id, &page.path).await {
-                    let content_lower = content.to_lowercase();
-                    let query_lower = query.to_lowercase();
-                    if content_lower.contains(&query_lower) {
-                        let snippet = content_snippet(&content, query);
-
-                        results.push(WikiSearchResult {
-                            page_id: page.id.clone(),
-                            path: page.path.clone(),
-                            title: page.title.clone(),
-                            score: 0.8,
-                            snippet,
-                            page_type: page.page_type.clone(),
-                        });
-
-                        if results.len() >= top_k {
-                            break;
-                        }
-                    }
-                }
-            }
-        } else {
-            // Add snippets for LIKE matches too
-            for r in &mut results {
-                if let Ok(content) = crate::services::wiki::project::read_page(project_id, &r.path).await {
-                    r.snippet = content_snippet(&content, query);
-                }
-            }
-        }
-
-        Ok(results)
+        Ok(WikiSearchPage {
+            results,
+            total,
+            offset,
+            limit,
+            query: query.to_string(),
+        })
     }
 
     // ── Sources ──
@@ -394,62 +475,70 @@ impl WikiRepository {
         source_id: &str,
         task_type: &str,
     ) -> Result<Option<String>, String> {
-        let id = Self::uuid();
-        let now = Self::now();
-        let inserted = sqlx::query(
-            "INSERT INTO wiki_ingest_queue
-             (id, project_id, source_id, task_type, status, progress, total_steps, done_steps, created_at)
-             SELECT ?, ?, ?, ?, 'pending', 0, 0, 0, ?
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM wiki_ingest_queue
-                 WHERE project_id = ? AND source_id = ? AND task_type = ?
-                   AND status IN ('pending', 'running')
-             )",
-        )
-        .bind(&id)
-        .bind(project_id)
-        .bind(source_id)
-        .bind(task_type)
-        .bind(&now)
-        .bind(project_id)
-        .bind(source_id)
-        .bind(task_type)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
-        Ok((inserted.rows_affected() == 1).then_some(id))
+        let spec = TaskSpec::new("wiki", task_type, "wiki_project", project_id)
+            .subject_id(Some(source_id.to_string()))
+            .idempotency_key(format!("wiki:{}:{}:{}", task_type, project_id, source_id))
+            .payload(serde_json::json!({
+                "payload_version": 1,
+                "project_id": project_id,
+                "source_id": source_id,
+            }))
+            .auto_resume(true)
+            .total_items(3);
+        TaskRepository::new(self.pool.clone())
+            .create_if_idle(&spec)
+            .await
+            .map(|task| task.map(|task| task.id))
+            .map_err(|e| format!("DB error: {}", e))
     }
 
     pub async fn update_task_status(&self, task_id: &str, status: &str, progress: i64, done_steps: i64, total_steps: i64, result: Option<&str>, error: Option<&str>) -> Result<(), String> {
-        let now = Self::now();
-        let started = if status == "running" { Some(now.clone()) } else { None };
-        let completed = if status == "done" || status == "failed" { Some(now.clone()) } else { None };
-        sqlx::query(
-            "UPDATE wiki_ingest_queue SET status=?, progress=?, done_steps=?, total_steps=?, result_json=?, error_message=?, started_at=COALESCE(?, started_at), completed_at=COALESCE(?, completed_at) WHERE id=?"
-        )
-        .bind(status)
-        .bind(progress)
-        .bind(done_steps)
-        .bind(total_steps)
-        .bind(result)
-        .bind(error)
-        .bind(started.as_deref())
-        .bind(completed.as_deref())
-        .bind(task_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
-        Ok(())
+        let tasks = TaskRepository::new(self.pool.clone());
+        let operation = async {
+            match status {
+                "running" => {
+                    let task = tasks.get(task_id).await?;
+                    if task.status == "pending" {
+                        tasks.claim(task_id, wiki_stage(progress)).await?;
+                    }
+                    tasks
+                        .update_progress(
+                            task_id,
+                            wiki_stage(progress),
+                            progress,
+                            done_steps,
+                            total_steps,
+                        )
+                        .await
+                }
+                "done" | "completed" | "succeeded" => {
+                    let task = tasks.get(task_id).await?;
+                    if task.status == "pending" {
+                        tasks.claim(task_id, "completed").await?;
+                    }
+                    tasks.succeed(task_id, result).await
+                }
+                "failed" => tasks.fail(task_id, error.unwrap_or("Wiki 来源摄入失败")).await,
+                "cancelled" => tasks.mark_cancelled(task_id).await,
+                _ => Err(sqlx::Error::Protocol(format!("unsupported task status: {}", status))),
+            }
+        }
+        .await;
+        operation.map_err(|e| format!("DB error: {}", e))
     }
 
     pub async fn list_tasks(&self, project_id: &str) -> Result<Vec<WikiIngestTask>, String> {
-        sqlx::query_as::<_, WikiIngestTask>(
-            "SELECT * FROM wiki_ingest_queue WHERE project_id = ? ORDER BY created_at DESC LIMIT 20"
-        )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))
+        TaskRepository::new(self.pool.clone())
+            .list(&TaskListFilter {
+                domain: Some("wiki".to_string()),
+                resource_type: Some("wiki_project".to_string()),
+                resource_id: Some(project_id.to_string()),
+                limit: Some(20),
+                ..TaskListFilter::default()
+            })
+            .await
+            .map(|tasks| tasks.into_iter().map(background_to_wiki_task).collect())
+            .map_err(|e| format!("DB error: {}", e))
     }
 
     // ── Sessions ──
@@ -608,22 +697,91 @@ impl WikiRepository {
     }
 }
 
+/// Reconcile the FTS projection after an upgrade.  Older CrowAPI versions
+/// stored page metadata and bodies separately, so a migration cannot populate
+/// the virtual table by itself.  The count/missing-row check keeps normal
+/// startups cheap while still repairing partially populated indexes.
+pub async fn rebuild_search_index(pool: &SqlitePool) -> Result<(), String> {
+    let missing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM wiki_pages
+         LEFT JOIN wiki_page_search ON wiki_page_search.page_id = wiki_pages.id
+         WHERE wiki_pages.status = 'active' AND wiki_page_search.page_id IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+    let orphaned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM wiki_page_search
+         LEFT JOIN wiki_pages ON wiki_pages.id = wiki_page_search.page_id
+         WHERE wiki_pages.id IS NULL OR wiki_pages.status <> 'active'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+    if missing == 0 && orphaned == 0 {
+        return Ok(());
+    }
+
+    let pages = sqlx::query_as::<_, WikiPage>(
+        "SELECT * FROM wiki_pages WHERE status = 'active' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+
+    let mut documents = Vec::with_capacity(pages.len());
+    for page in pages {
+        let content = match crate::services::wiki::project::read_page(&page.project_id, &page.path).await {
+            Ok(content) => content,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    project_id = %page.project_id,
+                    page_path = %page.path,
+                    "Wiki page body unavailable while rebuilding search index"
+                );
+                String::new()
+            }
+        };
+        documents.push((page, content));
+    }
+
+    let mut tx = pool.begin().await.map_err(|e| format!("DB error: {}", e))?;
+    sqlx::query("DELETE FROM wiki_page_search")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+    for (page, content) in documents {
+        sqlx::query(
+            "INSERT INTO wiki_page_search (page_id, project_id, path, title, content, tags)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(page.id)
+        .bind(page.project_id)
+        .bind(page.path)
+        .bind(page.title)
+        .bind(content)
+        .bind(page.tags)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+    }
+    tx.commit().await.map_err(|e| format!("DB error: {}", e))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{content_snippet, escape_like_pattern, WikiRepository};
+    use super::{fts_query, WikiRepository};
     use sqlx::sqlite::SqlitePoolOptions;
 
     #[test]
-    fn like_patterns_escape_sql_wildcards() {
-        assert_eq!(escape_like_pattern("50%_done\\"), "50\\%\\_done\\\\");
-    }
-
-    #[test]
-    fn snippets_preserve_utf8_boundaries() {
-        let content = "前置内容 ".repeat(40) + "目标词" + &" 后续内容".repeat(40);
-        let snippet = content_snippet(&content, "目标词");
-        assert!(snippet.contains("目标词"));
-        assert!(std::str::from_utf8(snippet.as_bytes()).is_ok());
+    fn fts_query_quotes_operators_and_preserves_terms() {
+        assert_eq!(fts_query("router OR secret"), Some("\"router\" AND \"OR\" AND \"secret\"".to_string()));
+        assert_eq!(fts_query("  "), None);
+        assert_eq!(fts_query("a\"b"), Some("\"a\"\"b\"".to_string()));
     }
 
     #[tokio::test]
@@ -677,6 +835,97 @@ mod tests {
             .await
             .expect("claim retry ingest")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn fts_search_returns_bm25_results_with_pagination() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create Wiki FTS test database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("apply migrations");
+        let now = "2026-08-20T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO wiki_projects
+             (id, name, status, wiki_dir, mcp_enabled, source_count, page_count, created_at, updated_at)
+             VALUES ('fts-project', 'FTS', 1, '/tmp/wiki', 1, 0, 0, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert project");
+
+        let repo = WikiRepository::new(pool.clone());
+        repo.upsert_page(
+            "fts-project",
+            "concepts/router.md",
+            "Router",
+            "concept",
+            "hash-1",
+            3,
+            "[]",
+            "{}",
+            "[\"http\"]",
+            "The router dispatches HTTP requests to handlers.",
+        )
+        .await
+        .expect("index first page");
+        repo.upsert_page(
+            "fts-project",
+            "entities/proxy.md",
+            "Proxy",
+            "entity",
+            "hash-2",
+            3,
+            "[]",
+            "{}",
+            "[\"http\"]",
+            "The proxy forwards requests through the router.",
+        )
+        .await
+        .expect("index second page");
+
+        let first = repo
+            .search_pages_page("fts-project", "router", 0, 1)
+            .await
+            .expect("search pages");
+        assert_eq!(first.total, 2);
+        assert_eq!(first.results.len(), 1);
+        assert!(first.results[0].snippet.contains("router"));
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.limit, 1);
+
+        let second = repo
+            .search_pages_page("fts-project", "router", 1, 1)
+            .await
+            .expect("search second page");
+        assert_eq!(second.total, 2);
+        assert_eq!(second.results.len(), 1);
+        assert_ne!(first.results[0].page_id, second.results[0].page_id);
+
+        repo.delete_page("fts-project", "concepts/router.md")
+            .await
+            .expect("delete indexed page");
+        let after_delete = repo
+            .search_pages_page("fts-project", "router", 0, 10)
+            .await
+            .expect("search after delete");
+        assert_eq!(after_delete.total, 1);
+    }
+}
+
+fn wiki_stage(progress: i64) -> &'static str {
+    match progress {
+        0..=9 => "preparing",
+        10..=29 => "parsing",
+        30..=79 => "generating",
+        80..=99 => "linking",
+        _ => "completed",
     }
 }
 

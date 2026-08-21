@@ -117,6 +117,11 @@ impl HttpError {
         self
     }
 
+    pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.error.trace_id = Some(trace_id.into());
+        self
+    }
+
     pub fn anthropic_type(&self) -> &'static str {
         match self.status {
             StatusCode::BAD_REQUEST => "invalid_request_error",

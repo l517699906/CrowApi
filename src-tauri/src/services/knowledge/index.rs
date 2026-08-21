@@ -46,6 +46,9 @@ pub struct HnswIndex {
     pub entry_point: usize,
     /// Random state for level assignment (simplified: always layer 0)
     pub initialized: bool,
+    /// Stable chunk IDs indexed by each node's external ID.
+    #[serde(default)]
+    pub external_ids: Vec<String>,
 }
 
 /// Priority queue item for greedy search.
@@ -87,6 +90,7 @@ impl HnswIndex {
             dim,
             entry_point: 0,
             initialized: false,
+            external_ids: Vec::new(),
         }
     }
 
@@ -102,6 +106,7 @@ impl HnswIndex {
         items: &[(usize, Vec<f32>)],
         callback: F,
     ) {
+        self.external_ids.clear();
         if items.is_empty() {
             return;
         }
@@ -193,6 +198,22 @@ impl HnswIndex {
                 score: 1.0 - r.distance, // Convert distance to similarity score
             })
             .collect()
+    }
+
+    pub fn set_external_ids(&mut self, external_ids: Vec<String>) -> Result<(), String> {
+        if self
+            .nodes
+            .iter()
+            .any(|node| node.id >= external_ids.len())
+        {
+            return Err("HNSW external ID mapping is incomplete".to_string());
+        }
+        self.external_ids = external_ids;
+        Ok(())
+    }
+
+    pub fn external_id(&self, id: usize) -> Option<&str> {
+        self.external_ids.get(id).map(String::as_str)
     }
 
     /// Internal greedy search starting from the entry point.
@@ -400,12 +421,17 @@ mod tests {
             .map(|i| (i, vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0]))
             .collect();
         index.build(&items);
+        let external_ids: Vec<String> = (0..10).map(|i| format!("chunk-{}", i)).collect();
+        index
+            .set_external_ids(external_ids.clone())
+            .expect("attach stable chunk IDs");
 
         let bytes = index.to_bytes();
         let restored = HnswIndex::from_bytes(&bytes).unwrap();
 
         assert_eq!(restored.len(), 10);
         assert_eq!(restored.dim, 3);
+        assert_eq!(restored.external_id(4), Some(external_ids[4].as_str()));
 
         let query = vec![1.0, 2.0, 3.0];
         let r1 = index.search(&query, 3);
@@ -415,5 +441,12 @@ mod tests {
             assert_eq!(r1[i].id, r2[i].id);
             assert!((r1[i].score - r2[i].score).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn rejects_incomplete_external_id_mapping() {
+        let mut index = HnswIndex::new(2, 4, 20, 10);
+        index.build(&[(0, vec![1.0, 0.0]), (1, vec![0.0, 1.0])]);
+        assert!(index.set_external_ids(vec!["only-one".to_string()]).is_err());
     }
 }
