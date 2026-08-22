@@ -1,0 +1,305 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "与应用版本一致的标签，例如 v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-22.04
+    outputs:
+      release_tag: ${{ steps.release-tag.outputs.release_tag }}
+      release_sha: ${{ steps.release-commit.outputs.release_sha }}
+    steps:
+      - name: Resolve release tag
+        id: release-tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "发布标签必须符合 v<major>.<minor>.<patch>，当前值：$RELEASE_TAG" >&2
+            exit 1
+          fi
+          printf 'release_tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The dispatch input has already been validated; keep the ref in the
+          # tag namespace so a same-named branch can never be built by mistake.
+          ref: refs/tags/${{ steps.release-tag.outputs.release_tag }}
+          persist-credentials: false
+
+      - name: Resolve immutable release commit
+        id: release-commit
+        shell: bash
+        run: printf 'release_sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
+
+      - name: Test Rust and migrations
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Verify application versions
+        env:
+          RELEASE_TAG: ${{ steps.release-tag.outputs.release_tag }}
+        run: npm run release:check -- "$RELEASE_TAG"
+
+      - name: Verify release signing secrets
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: >-
+          node -e "for (const name of ['TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','TAURI_UPDATER_PUBLIC_KEY',
+          'APPLE_CERTIFICATE','APPLE_CERTIFICATE_PASSWORD','APPLE_ID','APPLE_PASSWORD','APPLE_TEAM_ID',
+          'WINDOWS_CERTIFICATE','WINDOWS_CERTIFICATE_PASSWORD'])
+          if (!process.env[name]) { console.error('缺少 GitHub Secret: ' + name); process.exitCode = 1 }"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: validate
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      # tauri-action merges latest.json with the existing draft release. Keep
+      # these uploads serialized so two platform manifests cannot race.
+      max-parallel: 1
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            platform: macos-latest
+            rust_target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - label: macOS Intel
+            platform: macos-latest
+            rust_target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+          - label: Linux x64
+            platform: ubuntu-22.04
+            rust_target: ""
+            args: ""
+          - label: Windows x64
+            platform: windows-latest
+            rust_target: ""
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout validated release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Add Rust target
+        if: matrix.rust_target != ''
+        run: rustup target add "${{ matrix.rust_target }}"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Import Windows code signing certificate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "crowapi-code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password |
+            Select-Object -First 1
+          if (-not $certificate.Thumbprint) {
+            throw "Windows 代码签名证书导入失败"
+          }
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create release-only updater configuration
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: node "scripts/write-tauri-release-config.mjs"
+
+      - name: Build and publish signed updater artifacts
+        uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ needs.validate.outputs.release_tag }}
+          releaseName: CrowAPI ${{ needs.validate.outputs.release_tag }}
+          releaseBody: "安装包与自动更新清单由发布流水线生成。"
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          retryAttempts: 3
+          args: --config src-tauri/tauri.release.conf.json ${{ matrix.args }}
+
+      - name: Verify macOS code signature and notarization
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$(find src-tauri/target -path '*/release/bundle/macos/*.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "未找到 macOS 应用产物" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          codesign -dv --verbose=4 "$app_path" 2>&1 | grep -q 'Authority=Developer ID Application'
+          spctl --assess --type execute --verbose=4 "$app_path"
+
+      - name: Verify Windows Authenticode signature
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem "src-tauri/target" -Recurse -File |
+            Where-Object {
+              $_.FullName -match '[\\/]release[\\/]bundle[\\/]' -and
+              $_.Extension -in @('.exe', '.msi')
+            }
+          if (-not $artifacts) {
+            throw "未找到 Windows 安装产物"
+          }
+          foreach ($artifact in $artifacts) {
+            $signature = Get-AuthenticodeSignature $artifact.FullName
+            if ($signature.Status -ne 'Valid') {
+              throw "Windows 签名验证失败: $($artifact.FullName) ($($signature.Status))"
+            }
+            if ($signature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+              throw "Windows 签名证书不匹配: $($artifact.FullName)"
+            }
+          }
+
+  publish:
+    name: Verify and publish release
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+    steps:
+      - name: Checkout validated release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Download updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-manifest
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > release-list.json
+          release_id="$(jq -r --arg tag "$RELEASE_TAG" '.[] | select(.tag_name == $tag) | .id' release-list.json | head -n 1)"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "找不到发布标签 $RELEASE_TAG" >&2
+            exit 1
+          fi
+          asset_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" --jq '.[] | select(.name == "latest.json") | .id' | head -n 1)"
+          if [[ ! "$asset_id" =~ ^[0-9]+$ ]]; then
+            echo "发布 $RELEASE_TAG 缺少 latest.json" >&2
+            exit 1
+          fi
+          gh api \
+            -H "Accept: application/octet-stream" \
+            "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+            > release-manifest/latest.json
+
+      - name: Verify all updater platforms
+        run: node "scripts/check-updater-manifest.mjs" "release-manifest/latest.json" "$RELEASE_TAG"
+
+      - name: Publish GitHub Release
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
